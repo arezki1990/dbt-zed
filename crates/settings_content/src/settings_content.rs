@@ -232,6 +232,9 @@ pub struct SettingsContent {
     /// Common language server settings.
     pub global_lsp_settings: Option<GlobalLspSettingsContent>,
 
+    /// The settings for dbt integration.
+    pub dbt: Option<DbtSettingsContent>,
+
     /// The settings for the image viewer.
     pub image_viewer: Option<ImageViewerSettingsContent>,
 
@@ -1237,6 +1240,69 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 800
     pub max_width: Option<PixelSetting>,
+}
+
+/// The settings for dbt integration.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct DbtSettingsContent {
+    /// Maximum number of rows fetched by `dbt show` for the dbt results panel.
+    ///
+    /// Default: 500
+    pub show_limit: Option<u64>,
+    /// The dbt executable used by the dbt results panel. Resolved from PATH
+    /// when not an absolute path.
+    ///
+    /// Default: "dbt"
+    pub binary: Option<String>,
+    /// The dbt target passed as `--target` to dbt commands run by the results
+    /// panel. When empty, the profile's default target is used.
+    ///
+    /// Default: ""
+    pub target: Option<String>,
+    /// The profiles directory passed as `--profiles-dir` to dbt commands run
+    /// by the results panel. When empty, dbt's default resolution is used
+    /// (project dir, then ~/.dbt).
+    ///
+    /// Default: ""
+    pub profiles_dir: Option<String>,
+    /// Environment variables set for dbt commands run by the results panel,
+    /// available to `env_var()` in models and profiles.
+    ///
+    /// Default: {}
+    pub env: Option<HashMap<String, String>>,
+    /// The dbt project directory, relative to the worktree root (or absolute).
+    /// When empty, the project is auto-discovered by walking up from the open
+    /// model file to the nearest dbt_project.yml.
+    ///
+    /// Default: ""
+    pub project_dir: Option<String>,
+    /// Whether to run `dbt parse` automatically the first time a dbt project
+    /// is detected in a session, keeping target/manifest.json (and the
+    /// lineage graph) fresh.
+    ///
+    /// Default: true
+    pub parse_on_load: Option<bool>,
+    /// Path to an additional dotenv file loaded for dbt commands, relative to
+    /// the project directory (or absolute). Loaded on top of auto-discovered
+    /// .env files; the `env` map still overrides it.
+    ///
+    /// Default: ""
+    pub env_file: Option<String>,
+    /// How many dependency levels the lineage graph canvas walks in each
+    /// direction from the browsed model.
+    ///
+    /// Default: 4
+    pub lineage_depth: Option<u64>,
+    /// How many dependency levels the lineage tree sidebar walks in each
+    /// direction.
+    ///
+    /// Default: 8
+    pub lineage_tree_depth: Option<u64>,
+    /// Maximum number of nodes gathered per lineage computation.
+    ///
+    /// Default: 500
+    pub lineage_max_nodes: Option<u64>,
 }
 
 /// The settings for the image viewer.

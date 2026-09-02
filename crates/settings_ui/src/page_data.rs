@@ -75,6 +75,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         debugger_page(),
         terminal_page(),
         version_control_page(),
+        dbt_page(),
         collaboration_page(),
         ai_page(cx),
         network_page(),
@@ -8818,6 +8819,218 @@ fn ai_page(cx: &App) -> SettingsPage {
             edit_prediction_display_sub_section(),
         )
         .into(),
+    }
+}
+
+fn dbt_page() -> SettingsPage {
+    fn dbt_section() -> [SettingsPageItem; 11] {
+        [
+            SettingsPageItem::SectionHeader("dbt"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Limit",
+                description: "Maximum number of rows fetched by `dbt show` for the dbt results panel.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.show_limit"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.show_limit.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().show_limit = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "dbt Binary",
+                description: "The dbt executable used by the dbt results panel (resolved from PATH).",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.binary"),
+                    pick: |settings_content| {
+                        settings_content.dbt.as_ref().and_then(|dbt| dbt.binary.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().binary = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("dbt"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Target",
+                description: "The dbt target passed as --target; empty uses the profile's default target.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.target"),
+                    pick: |settings_content| {
+                        settings_content.dbt.as_ref().and_then(|dbt| dbt.target.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().target = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("dev"),
+                    ..Default::default()
+                })),
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Profiles Directory",
+                description: "The profiles directory passed as --profiles-dir; empty uses dbt's default resolution. Environment variables for dbt (env_var()) are configured via the `dbt.env` map in settings.json.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.profiles_dir"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.profiles_dir.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().profiles_dir = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("~/.dbt"),
+                    ..Default::default()
+                })),
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Project Directory",
+                description: "The dbt project directory relative to the worktree root; empty auto-discovers the nearest dbt_project.yml above the open model.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.project_dir"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.project_dir.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().project_dir = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("employees"),
+                    ..Default::default()
+                })),
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Env File",
+                description: "Additional dotenv file loaded for dbt commands, relative to the project directory (or absolute). Auto-discovered .env/.env.local files up to the repo root load first; this file overrides them.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.env_file"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.env_file.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().env_file = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("../.env"),
+                    ..Default::default()
+                })),
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Parse On Load",
+                description: "Run `dbt parse` automatically the first time a dbt project is detected, keeping the lineage graph fresh.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.parse_on_load"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.parse_on_load.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().parse_on_load = value;
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Lineage Graph Depth",
+                description: "Dependency levels the lineage graph canvas walks in each direction from the browsed model.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.lineage_depth"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.lineage_depth.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().lineage_depth = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Lineage Tree Depth",
+                description: "Dependency levels the lineage tree sidebar walks in each direction.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.lineage_tree_depth"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.lineage_tree_depth.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().lineage_tree_depth = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Lineage Max Nodes",
+                description: "Maximum number of nodes gathered per lineage computation.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.lineage_max_nodes"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.lineage_max_nodes.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().lineage_max_nodes = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
+    SettingsPage {
+        title: "dbt",
+        items: concat_sections![dbt_section()],
     }
 }
 
