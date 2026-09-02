@@ -148,9 +148,18 @@ impl ProviderErrorCategory {
             StatusCode::BAD_REQUEST if is_invalid_encrypted_content_message(message) => {
                 Self::InvalidEncryptedContent
             }
-            StatusCode::BAD_REQUEST if is_context_window_exceeded_message(message) => {
-                Self::PromptTooLarge { tokens: None }
-            }
+            // Anthropic reports a context-window overflow as HTTP 400 with a
+            // "prompt is too long" message rather than HTTP 413, so a
+            // bad request must be sniffed for both providers' phrasings.
+            StatusCode::BAD_REQUEST => match parse_prompt_too_long(message) {
+                Some(tokens) => Self::PromptTooLarge {
+                    tokens: Some(tokens),
+                },
+                None if is_context_window_exceeded_message(message) => {
+                    Self::PromptTooLarge { tokens: None }
+                }
+                None => Self::InvalidRequest,
+            },
             StatusCode::UNAUTHORIZED => Self::Authentication,
             StatusCode::FORBIDDEN => Self::Permission,
             StatusCode::NOT_FOUND => Self::EndpointNotFound,
@@ -158,7 +167,6 @@ impl ProviderErrorCategory {
             StatusCode::PAYLOAD_TOO_LARGE => Self::PromptTooLarge {
                 tokens: parse_prompt_too_long(message),
             },
-            StatusCode::BAD_REQUEST => Self::InvalidRequest,
             StatusCode::CONFLICT => Self::Conflict,
             StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => Self::Timeout,
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimit,
@@ -890,6 +898,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_from_http_status_maps_anthropic_prompt_too_long_to_prompt_too_large() {
+        let error = LanguageModelCompletionError::from_http_status(
+            String::from("Anthropic").into(),
+            StatusCode::BAD_REQUEST,
+            "prompt is too long: 1461629 tokens > 1000000 maximum".to_string(),
+            None,
+        );
+
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::PromptTooLarge {
+                    tokens: Some(1461629),
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_from_cloud_failure_maps_anthropic_prompt_too_long_behind_http_400() {
+        let error = LanguageModelCompletionError::from_cloud_failure(
+            String::from("anthropic").into(),
+            "upstream_http_400".to_string(),
+            "prompt is too long: 1461629 tokens > 1000000 maximum".to_string(),
+            None,
+        );
+
+        match error {
+            LanguageModelCompletionError::ProviderRejection {
+                status,
+                code,
+                category,
+                ..
+            } => {
+                assert_eq!(status, Some(StatusCode::BAD_REQUEST));
+                assert_eq!(code.as_deref(), Some("upstream_http_400"));
+                assert_eq!(
+                    category,
+                    ProviderErrorCategory::PromptTooLarge {
+                        tokens: Some(1461629),
+                    }
+                );
+            }
+            _ => panic!(
+                "Expected PromptTooLarge rejection for upstream_http_400, got: {:?}",
+                error
+            ),
+        }
     }
 
     #[test]
