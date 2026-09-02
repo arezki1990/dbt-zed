@@ -1,0 +1,46 @@
+# Clippy configuration for SQLiteGraph
+#
+# This configuration tunes clippy for SQLiteGraph's architecture:
+# - Library + CLI split causes cross-target dead_code false positives
+# - Benchmark utilities trigger complexity warnings
+# - DSL parsing and CLI commands create similar naming patterns
+# - Dual runtime harness creates complex generic types
+#
+# IMPORTANT: dead_code is intentionally NOT silenced - these are
+# documented false positives from cross-target usage patterns.
+
+# MSRV (Minimum Supported Rust Version)
+# Tracks Cargo.toml `rust-version`. AVX-512 intrinsics in inference/simd.rs
+# were stabilised in Rust 1.89.
+msrv = "1.89.0"
+
+# Cognitive complexity - allow for complex graph algorithms and SQL statements
+cognitive-complexity-threshold = 30
+
+# Type complexity - allow for dual runtime harness generics
+type-complexity-threshold = 300
+
+# Too many arguments - CLI commands and pattern engine functions legitimately need many
+too-many-arguments-threshold = 12
+
+# Too many lines - SQL statements and complex graph operations exceed default
+too-many-lines-threshold = 150
+
+# Specific lint configurations
+# Note: Most lint suppressions should be handled via #[allow] attributes in code
+# rather than global configuration to keep the configuration maintainable
+
+# Third-party crates that are allowed to be used
+third-party = []
+
+# Disallowed methods (empty for now)
+disallowed-methods = []
+
+# Disallowed macros (empty for now) 
+disallowed-macros = []
+
+# Disallowed types (empty for now)
+disallowed-types = []
+
+# Disallowed names (empty for now)
+disallowed-names = []

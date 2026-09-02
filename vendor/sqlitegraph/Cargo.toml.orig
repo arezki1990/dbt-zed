@@ -1,0 +1,287 @@
+[package]
+name = "sqlitegraph"
+version = "3.9.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Embedded graph database with explicit SQLite, native-v3, and combined backend modes; HNSW vector search; and graph algorithms"
+license = "GPL-3.0-only"
+repository = "https://github.com/oldnordic/sqlitegraph"
+documentation = "https://docs.rs/sqlitegraph"
+readme = "README.md"
+keywords = ["graph", "database", "sqlite", "embedded", "vector"]
+categories = ["database", "data-structures"]
+exclude = [
+    "benches/*.json",
+    "benches/*.txt",
+    "internal/**",
+    ".claude/**",
+    "**/CLAUDE.md",
+    "**/AGENTS.md",
+]
+
+[lib]
+name = "sqlitegraph"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+ahash = "0.8"
+parking_lot = "0.12"
+rand = "0.8"
+arc-swap = "1"
+bytemuck = { version = "1.13", features = ["derive"] }
+binrw = "0.13"
+memmap2 = "0.9"
+log = "0.4"
+rayon = "1.10"
+petgraph = "0.6"
+sha2 = "0.10"
+regex = "1"
+turbovec = { version = "0.9", optional = true }
+tokio = { version = "1", features = ["fs", "rt", "rt-multi-thread", "sync", "macros"] }
+futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rio = "0.9"
+
+[dependencies.lru]
+version = "0.16.3"
+
+[dependencies.sysinfo]
+version = "0.30"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+assert_cmd = "2"
+tempfile = "3"
+rand = "0.8"
+rustc_version = "0.4"
+nix = { version = "0.27", features = ["fs", "process"] }
+
+
+[features]
+default = ["sqlite-backend"]
+
+# Backend selection
+sqlite-backend = []          # SQLite backend (mature, ACID transactions)
+native-v3 = []               # Native V3 backend (experimental, edge-store/B+Tree traversal path)
+
+# Optimization features
+turbovec = ["dep:turbovec"]   # Turbovec SIMD search for large-scale embeddings (requires OpenBLAS)
+
+# Development/debug features
+debug = []                   # Enable debug/info logging (disabled in release for zero overhead)
+bench-ci = []                # CI benchmarking
+v3-bench = ["native-v3"]     # Enable V3 backend benchmarks
+dependency-monitoring = []   # Enable dependency health monitoring
+v3-forensics = []            # Enable forensic instrumentation for V3 backend performance analysis
+v3-page-overflow-debug = []  # Enable detailed page overflow diagnostics in node page packing
+memory_profiling = []        # Enable memory profiling for benchmarks
+
+# Legacy compatibility
+
+# Note: Profile configurations moved to workspace root Cargo.toml for proper workspace behavior
+
+# Phase 8 Backend Comparison Benchmarks
+[[bench]]
+name = "bfs"
+harness = false
+
+[[bench]]
+name = "k_hop"
+harness = false
+
+[[bench]]
+name = "insert"
+harness = false
+
+[[bench]]
+name = "hnsw"
+harness = false
+
+# Phase 7 Performance Optimization
+[[bench]]
+name = "comprehensive_performance"
+harness = false
+
+# Phase 7.01: Parallel WAL Recovery
+[[bench]]
+name = "wal_recovery_benchmarks"
+harness = false
+
+# Phase 15: Multi-layer HNSW benchmarks
+[[bench]]
+name = "hnsw_multilayer"
+harness = false
+
+# Phase 19: Connection pool performance benchmarks
+[[bench]]
+name = "connection_pool"
+harness = false
+
+# Phase 36: IO-12 Validation benchmarks
+
+# Backend comparison: SQLite vs V3
+[[bench]]
+name = "backend_comparison"
+harness = false
+
+# Phase 1: SQLite vs V3 Minimal Benchmark Suite
+[[bench]]
+name = "sqlite_v3_comparison"
+harness = false
+
+# Curated SQLite vs V3 comparison suite
+[[bench]]
+name = "sqlite_v3_curated"
+harness = false
+
+# Phase 45: Graph Theory algorithms benchmarks
+[[bench]]
+name = "graph_theory_benchmarks"
+harness = false
+
+# V3 Backend benchmarks (requires native-v3 feature)
+[[bench]]
+name = "v3_backend_benchmarks"
+harness = false
+required-features = ["native-v3"]
+
+# V3 Algorithm benchmarks (requires native-v3 feature)
+[[bench]]
+name = "v3_algorithm_benchmarks"
+harness = false
+required-features = ["native-v3"]
+
+# Performance improvements benchmarks (Task 1)
+[[bench]]
+name = "concurrent_access"
+harness = false
+required-features = ["native-v3"]
+
+[[bench]]
+name = "cold_cache"
+harness = false
+required-features = ["native-v3"]
+
+[[bench]]
+name = "memory_profiling"
+harness = false
+required-features = ["native-v3", "memory_profiling"]
+
+[[bench]]
+name = "real_datasets"
+harness = false
+required-features = ["native-v3"]
+
+# Parallel BFS benchmarks (requires native-v3 feature)
+[[bench]]
+name = "readpath_probe"
+harness = false
+required-features = ["native-v3"]
+[[bench]]
+name = "parallel_bfs"
+harness = false
+required-features = ["native-v3"]
+
+# Adaptive page sizing benchmarks (requires native-v3 feature)
+[[bench]]
+name = "adaptive_page_simple"
+harness = false
+required-features = ["native-v3"]
+
+# Substrate read-path profile (Phase 0.0) — consumer sqlite path, no feature gate.
+[[bench]]
+name = "substrate_readpath"
+harness = false
+
+# Temporal version-chain benchmarks (Phase 0.3, Exp B) — as_of + sweep latency.
+[[bench]]
+name = "temporal_benchmarks"
+harness = false
+
+# Criterion benchmarks that were auto-discovered without harness = false — they
+# compiled but never executed their criterion_main! (libtest took over and ran
+# 0 tests). Wiring them explicitly fixes that silent no-op. All compile cleanly
+# against the current API (verified 2026-06-19).
+[[bench]]
+name = "adjlist_benchmark"
+harness = false
+
+[[bench]]
+name = "algo_benchmarks"
+harness = false
+
+[[bench]]
+name = "comparative_benchmark"
+harness = false
+
+[[bench]]
+name = "compression_benchmark"
+harness = false
+
+[[bench]]
+name = "mvcc_benchmarks"
+harness = false
+
+[[bench]]
+name = "native_disk_io"
+harness = false
+
+[[bench]]
+name = "read_path_benchmarks"
+harness = false
+
+[[bench]]
+name = "backend_mode_materialization"
+harness = false
+required-features = ["native-v3"]
+
+[[bench]]
+name = "regression_memory"
+harness = false
+
+[[bench]]
+name = "regression_non_chain_patterns"
+harness = false
+
+[[bench]]
+name = "regression_pubsub_memory"
+harness = false
+
+[[bench]]
+name = "regression_pubsub_non_chain"
+harness = false
+
+[[bench]]
+name = "regression_pubsub_write_cost"
+harness = false
+
+[[bench]]
+name = "regression_write_cost"
+
+# CSR sharding benchmarks
+[[bench]]
+name = "csr_sharding_benchmark"
+harness = false
+
+# Native-v3 scale testing
+[[bench]]
+name = "native_v3_scale_benchmark"
+harness = false
+
+# Native-v3 comprehensive feature benchmarks
+[[bench]]
+name = "native_v3_features_bench"
+harness = false
+
+[[bench]]
+name = "native_v3_diagnostic_bench"
+harness = false

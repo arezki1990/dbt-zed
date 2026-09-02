@@ -1,0 +1,566 @@
+[
+  {
+    "name": "bfs_er",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "bfs_line",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "bfs_scalefree",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "components_random_er_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "components_random_er_20000",
+    "ops_per_sec": 20000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "components_random_er_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "components_scalefree_sf_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "components_scalefree_sf_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "cycles_cycles",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "degree_rank_degree",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 0.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_er_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_er_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_er_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_er_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_er_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_line_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_line_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_line_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 99999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_line_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_line_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_scalefree_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_scalefree_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_scalefree_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_scalefree_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_combined_scalefree_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_er_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_er_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_er_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_er_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_er_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_line_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_line_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_line_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 99999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_line_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_line_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_scalefree_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_scalefree_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_scalefree_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_scalefree_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_edges_scalefree_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_er_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_er_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_er_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_er_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_er_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249998.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_line_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_line_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_line_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 99999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_line_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 4999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_line_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 49999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_scalefree_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_scalefree_10000",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_scalefree_100000",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 499985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_scalefree_5000",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 24985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "insert_entities_scalefree_50000",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 249985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "migration_shadow_read",
+    "ops_per_sec": 820.0,
+    "bytes_per_sec": 4096.0,
+    "notes": "baseline dual-runtime shadow reads"
+  },
+  {
+    "name": "neighbors_er",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "neighbors_line",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "neighbors_scalefree",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "pipeline_reason",
+    "ops_per_sec": 980.0,
+    "bytes_per_sec": 6144.0,
+    "notes": "baseline reasoning pipeline"
+  },
+  {
+    "name": "shortest_path_er",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49997.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "shortest_path_line",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 9999.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "shortest_path_scalefree",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 49985.0,
+    "notes": "synthetic deterministic metric"
+  },
+  {
+    "name": "subgraph_extract",
+    "ops_per_sec": 1250.0,
+    "bytes_per_sec": 5120.0,
+    "notes": "baseline deterministic subgraph"
+  },
+  {
+    "name": "syncompat_pipeline",
+    "ops_per_sec": 720.0,
+    "bytes_per_sec": 2048.0,
+    "notes": "syncompat reasoning pipeline"
+  },
+  {
+    "name": "syncompat_subgraph",
+    "ops_per_sec": 1200.0,
+    "bytes_per_sec": 4096.0,
+    "notes": "syncompat harness subgraph"
+  },
+  {
+    "name": "v2_insertion_mixed_graph_1000",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 4000.0,
+    "notes": "V2 mixed graph insertion with 1000 nodes"
+  },
+  {
+    "name": "v2_insertion_mixed_graph_5000",
+    "ops_per_sec": 800.0,
+    "bytes_per_sec": 3200.0,
+    "notes": "V2 mixed graph insertion with 5000 nodes"
+  },
+  {
+    "name": "v2_insertion_mixed_graph_10000",
+    "ops_per_sec": 600.0,
+    "bytes_per_sec": 2400.0,
+    "notes": "V2 mixed graph insertion with 10000 nodes"
+  },
+  {
+    "name": "v2_neighbor_low_degree",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 10000.0,
+    "notes": "V2 neighbor query on low-degree nodes (< 5 edges)"
+  },
+  {
+    "name": "v2_neighbor_high_degree",
+    "ops_per_sec": 10000.0,
+    "bytes_per_sec": 50000.0,
+    "notes": "V2 neighbor query on high-degree nodes (20-50 edges)"
+  },
+  {
+    "name": "v2_neighbor_hub_nodes",
+    "ops_per_sec": 5000.0,
+    "bytes_per_sec": 100000.0,
+    "notes": "V2 neighbor query on hub nodes (> 50 edges)"
+  },
+  {
+    "name": "v2_bfs_depth_5_1000",
+    "ops_per_sec": 100.0,
+    "bytes_per_sec": 50000.0,
+    "notes": "V2 BFS depth 5 traversal on 1000 nodes"
+  },
+  {
+    "name": "v2_bfs_depth_5_5000",
+    "ops_per_sec": 50.0,
+    "bytes_per_sec": 25000.0,
+    "notes": "V2 BFS depth 5 traversal on 5000 nodes"
+  },
+  {
+    "name": "v2_bfs_depth_10_1000",
+    "ops_per_sec": 50.0,
+    "bytes_per_sec": 100000.0,
+    "notes": "V2 BFS depth 10 traversal on 1000 nodes"
+  },
+  {
+    "name": "v2_k_hop_outgoing_2",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 20000.0,
+    "notes": "V2 2-hop outgoing traversal"
+  },
+  {
+    "name": "v2_k_hop_outgoing_3",
+    "ops_per_sec": 500.0,
+    "bytes_per_sec": 15000.0,
+    "notes": "V2 3-hop outgoing traversal"
+  },
+  {
+    "name": "v2_k_hop_outgoing_4",
+    "ops_per_sec": 250.0,
+    "bytes_per_sec": 10000.0,
+    "notes": "V2 4-hop outgoing traversal"
+  },
+  {
+    "name": "v2_k_hop_outgoing_5",
+    "ops_per_sec": 125.0,
+    "bytes_per_sec": 6250.0,
+    "notes": "V2 5-hop outgoing traversal"
+  },
+  {
+    "name": "v2_multiedge_insert_factor_3",
+    "ops_per_sec": 333.0,
+    "bytes_per_sec": 1000.0,
+    "notes": "V2 multi-edge insertion with factor 3"
+  },
+  {
+    "name": "v2_multiedge_insert_factor_5",
+    "ops_per_sec": 200.0,
+    "bytes_per_sec": 1000.0,
+    "notes": "V2 multi-edge insertion with factor 5"
+  },
+  {
+    "name": "v2_multiedge_insert_factor_10",
+    "ops_per_sec": 100.0,
+    "bytes_per_sec": 1000.0,
+    "notes": "V2 multi-edge insertion with factor 10"
+  },
+  {
+    "name": "v2_multiedge_insert_factor_20",
+    "ops_per_sec": 50.0,
+    "bytes_per_sec": 1000.0,
+    "notes": "V2 multi-edge insertion with factor 20"
+  },
+  {
+    "name": "v2_multiedge_neighbors_dedup_3",
+    "ops_per_sec": 15000.0,
+    "bytes_per_sec": 45000.0,
+    "notes": "V2 neighbor queries with deduplication factor 3"
+  },
+  {
+    "name": "v2_multiedge_neighbors_dedup_5",
+    "ops_per_sec": 8000.0,
+    "bytes_per_sec": 40000.0,
+    "notes": "V2 neighbor queries with deduplication factor 5"
+  },
+  {
+    "name": "v2_multiedge_neighbors_dedup_10",
+    "ops_per_sec": 4000.0,
+    "bytes_per_sec": 40000.0,
+    "notes": "V2 neighbor queries with deduplication factor 10"
+  },
+  {
+    "name": "v2_file_growth_sparse_1000",
+    "ops_per_sec": 80.0,
+    "bytes_per_sec": 320.0,
+    "notes": "V2 file growth efficiency for sparse graphs (~4 bytes/edge)"
+  },
+  {
+    "name": "v2_file_growth_sparse_5000",
+    "ops_per_sec": 75.0,
+    "bytes_per_sec": 300.0,
+    "notes": "V2 file growth efficiency for sparse graphs at scale"
+  },
+  {
+    "name": "v2_file_growth_powerlaw_1000",
+    "ops_per_sec": 85.0,
+    "bytes_per_sec": 425.0,
+    "notes": "V2 file growth efficiency for power-law graphs (~5 bytes/edge)"
+  },
+  {
+    "name": "v2_file_growth_multiedge_1000",
+    "ops_per_sec": 75.0,
+    "bytes_per_sec": 750.0,
+    "notes": "V2 file growth efficiency for multi-edge graphs (~10 bytes/edge)"
+  },
+  {
+    "name": "v2_cluster_allocation",
+    "ops_per_sec": 1000.0,
+    "bytes_per_sec": 8000.0,
+    "notes": "V2 cluster allocation and management overhead"
+  },
+  {
+    "name": "v2_cluster_compaction",
+    "ops_per_sec": 500.0,
+    "bytes_per_sec": 4000.0,
+    "notes": "V2 cluster compaction efficiency"
+  },
+  {
+    "name": "v2_mmap_read_throughput",
+    "ops_per_sec": 100000.0,
+    "bytes_per_sec": 400000000.0,
+    "notes": "V2 memory-mapped read throughput (4KB ops)"
+  },
+  {
+    "name": "v2_mmap_write_throughput",
+    "ops_per_sec": 50000.0,
+    "bytes_per_sec": 200000000.0,
+    "notes": "V2 memory-mapped write throughput (4KB ops)"
+  }
+]

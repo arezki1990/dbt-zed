@@ -1,0 +1,6 @@
+/target
+.cargo/
+flamegraph*.svg
+flamegraph_summary.txt
+perf.data*
+/sqlitegraph
