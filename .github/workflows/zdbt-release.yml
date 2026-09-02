@@ -44,6 +44,10 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+    env:
+      # webrtc-sys needs clang 17+; the 22.04 image only ships clang 14.
+      CC: clang-18
+      CXX: clang++-18
     steps:
       - name: Free disk space
         run: |
@@ -51,6 +55,12 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - uses: actions/checkout@v4
+      - name: Install clang 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18
       - name: Install dependencies
         run: ./script/linux
       - name: Download WASI SDK
