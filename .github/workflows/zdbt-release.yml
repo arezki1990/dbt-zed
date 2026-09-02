@@ -7,8 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing zdbt-v* tag to build and upload assets for"
+        description: "Existing zdbt-v* tag (release) to upload assets to; the dispatched ref is what gets built"
         required: true
+      only:
+        description: "Which platform to build"
+        type: choice
+        default: all
+        options: [all, macos, linux, windows]
 
 permissions:
   contents: write
@@ -20,12 +25,11 @@ env:
 
 jobs:
   macos-aarch64:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'macos'
     runs-on: macos-15
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       - name: Bundle
         run: ./script/bundle-mac aarch64-apple-darwin
       - name: Upload to release
@@ -37,6 +41,7 @@ jobs:
           gh release upload "$ZDBT_TAG" zdbt-macos-aarch64.dmg --clobber
 
   linux-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
@@ -46,8 +51,6 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       - name: Install dependencies
         run: ./script/linux
       - name: Download WASI SDK
@@ -63,6 +66,7 @@ jobs:
           gh release upload "$ZDBT_TAG" zdbt-linux-x86_64.tar.gz --clobber
 
   windows-x86_64:
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-2022
     timeout-minutes: 360
     env:
@@ -71,8 +75,6 @@ jobs:
       - name: Enable long paths
         run: git config --system core.longpaths true
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       - name: Bundle
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture x86_64
