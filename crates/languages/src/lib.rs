@@ -19,6 +19,7 @@ mod bash;
 mod c;
 mod cpp;
 mod css;
+mod dbt;
 mod eslint;
 mod go;
 mod json;
@@ -292,6 +293,8 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     for language in eslint_languages {
         languages.register_lsp_adapter(language.into(), eslint_adapter.clone());
     }
+
+    dbt::register(&languages, cx);
 
     let mut subscription = languages.subscribe();
     let mut prev_language_settings = languages.language_settings();

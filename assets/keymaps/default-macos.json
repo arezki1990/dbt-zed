@@ -647,6 +647,20 @@
     },
   },
   {
+    "context": "Workspace",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-k d": "dbt::ShowModelData",
+    },
+  },
+  {
+    "context": "Editor && dbt_model",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "dbt::ShowModelData",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {

@@ -2738,6 +2738,14 @@ impl Editor {
             }) {
                 key_context.set("extension", extension);
             }
+            // Fork: lets the keymap target dbt models (e.g. cmd-enter runs dbt show).
+            if singleton_buffer
+                .read(cx)
+                .language()
+                .is_some_and(|language| language.name().as_ref() == "dbt SQL")
+            {
+                key_context.add("dbt_model");
+            }
         } else {
             key_context.add("multibuffer");
         }

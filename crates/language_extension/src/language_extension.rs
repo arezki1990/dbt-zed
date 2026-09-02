@@ -52,6 +52,14 @@ impl ExtensionLanguageProxy for LanguageServerRegistryProxy {
         hidden: bool,
         load: Arc<dyn Fn() -> Result<LoadedLanguage> + Send + Sync + 'static>,
     ) {
+        // Fork: the native "dbt SQL" language owns the `sql` suffix by
+        // default; don't let an extension-provided SQL language contest it.
+        if language.as_ref() == "SQL" {
+            log::info!(
+                "dbt fork: skipping extension language \"SQL\" in favor of native dbt SQL"
+            );
+            return;
+        }
         self.language_registry
             .register_language(language, grammar, matcher, hidden, None, load);
     }

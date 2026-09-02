@@ -75,8 +75,10 @@ tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true
 tree-sitter-css.workspace = true
 tree-sitter-go.workspace = true
+tree-sitter-jinja2.workspace = true
 tree-sitter-python.workspace = true
 tree-sitter-rust.workspace = true
+tree-sitter-sequel.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter = { workspace = true, features = ["wasm"] }
 unindent.workspace = true
