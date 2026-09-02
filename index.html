@@ -4,315 +4,378 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>zdbt — the dbt IDE, forged from Zed</title>
-<meta name="description" content="zdbt is a dbt IDE built as a fork of Zed: Jinja-aware dbt SQL, dbt LSP, cmd+enter query results, compiled SQL, and an interactive column-level lineage canvas — all native GPUI.">
+<meta name="description" content="zdbt is a dbt IDE built as a fork of Zed: Jinja-aware dbt SQL, dbt LSP, ⌘⏎ query results, compiled SQL, and an interactive column-level lineage canvas — all native, no webviews.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style type="text/tailwindcss">
+  @theme {
+    --color-ink: #08060f;
+    --color-ink-soft: #0e0b18;
+    --color-panel: #14101f;
+    --color-panel-2: #1a1528;
+    --color-line: #272040;
+    --color-line-soft: #1e1934;
+    --color-fog: #9a94ae;
+    --color-faint: #6d6785;
+    --color-vio: #8b5cf6;
+    --color-vio-soft: #a78bfa;
+    --color-ember: #ff694b;
+    --color-ember-soft: #ff8a6b;
+    --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+    --font-display: "Space Grotesk", "Inter", ui-sans-serif, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+</style>
 <style>
-  :root {
-    --bg: #0d0b14;
-    --bg-soft: #14111f;
-    --card: #191527;
-    --border: #2a2440;
-    --text: #e8e6f0;
-    --muted: #9a94ad;
-    --violet: #8b5cf6;
-    --violet-soft: #a78bfa;
-    --orange: #ff694b;
-    --orange-soft: #ff8a6b;
-    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  html { scroll-behavior: smooth; }
+  .edge-anim { stroke-dasharray: 320; stroke-dashoffset: 320; animation: draw 1.6s ease forwards; }
+  .edge-anim.d2 { animation-delay: .35s; }
+  .edge-anim.d3 { animation-delay: .7s; }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  .node-pulse { animation: pulse 3s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+  .reveal { opacity: 0; transform: translateY(22px); transition: opacity .6s ease, transform .6s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .edge-anim { animation: none; stroke-dashoffset: 0; }
+    .node-pulse { animation: none; }
+    .reveal { opacity: 1 !important; transform: none !important; transition: none !important; }
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    line-height: 1.6;
-    -webkit-font-smoothing: antialiased;
+  kbd {
+    font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px;
+    background: #262040; color: #eceaf4; border: 1px solid #352d55;
+    border-radius: 6px; padding: 2.5px 9px; box-shadow: 0 2px 0 #352d55;
   }
-  a { color: var(--violet-soft); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-
-  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
-
-  nav {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 20px 0;
-  }
-  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
-  nav .brand svg { display: block; }
-  nav .links { display: flex; gap: 22px; font-size: 14px; }
-  nav .links a { color: var(--muted); }
-  nav .links a:hover { color: var(--text); text-decoration: none; }
-
-  header.hero {
-    position: relative;
-    text-align: center;
-    padding: 72px 0 84px;
-    overflow: hidden;
-  }
-  .hero-glow {
-    position: absolute; inset: 0; pointer-events: none;
-    background:
-      radial-gradient(600px 320px at 30% 10%, rgba(139,92,246,.16), transparent 70%),
-      radial-gradient(600px 320px at 70% 30%, rgba(255,105,75,.12), transparent 70%);
-  }
-  .hero .mark { margin-bottom: 8px; }
-  .hero h1 {
-    font-size: clamp(52px, 9vw, 88px);
-    font-weight: 800; letter-spacing: .01em; line-height: 1.1;
-  }
-  .hero h1 .z { color: var(--violet); }
-  .hero h1 .dbt { color: var(--orange); }
-  .hero p.tag {
-    font-size: clamp(17px, 2.6vw, 22px);
-    color: var(--muted); margin: 10px auto 8px; max-width: 640px;
-  }
-  .hero p.sub { font-size: 15px; color: var(--muted); opacity: .8; }
-  .hero p.sub code { font-family: var(--mono); color: var(--violet-soft); font-size: 14px; }
-
-  .dl-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 34px; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 9px;
-    padding: 12px 22px; border-radius: 10px; font-size: 15px; font-weight: 600;
-    border: 1px solid var(--border); color: var(--text); background: var(--card);
-    transition: transform .12s ease, border-color .12s ease;
-  }
-  .btn:hover { text-decoration: none; transform: translateY(-1px); border-color: var(--violet); }
-  .btn.primary {
-    background: linear-gradient(135deg, var(--violet), #7c3aed);
-    border-color: transparent; color: #fff;
-  }
-  .btn.primary:hover { border-color: transparent; filter: brightness(1.08); }
-  .btn .os { opacity: .75; font-weight: 500; font-size: 13px; }
-  .dl-note { margin-top: 14px; font-size: 13px; color: var(--muted); }
-  .dl-note a { color: var(--muted); text-decoration: underline; }
-
-  section { padding: 56px 0; }
-  section h2 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
-  section p.lead { color: var(--muted); max-width: 700px; margin-bottom: 32px; }
-
-  .grid {
-    display: grid; gap: 16px;
-    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
-  }
-  .card {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 14px; padding: 22px;
-  }
-  .card .icon {
-    width: 38px; height: 38px; border-radius: 9px; margin-bottom: 14px;
-    display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(135deg, rgba(139,92,246,.18), rgba(255,105,75,.18));
-    border: 1px solid var(--border);
-    font-size: 18px;
-  }
-  .card h3 { font-size: 16px; font-weight: 650; margin-bottom: 6px; }
-  .card p { font-size: 14px; color: var(--muted); }
-  .card p code, kbd {
-    font-family: var(--mono); font-size: 12.5px;
-    background: var(--bg-soft); border: 1px solid var(--border);
-    border-radius: 5px; padding: 1px 6px; color: var(--violet-soft);
-  }
-
-  .band {
-    background: var(--bg-soft); border-block: 1px solid var(--border);
-  }
-  .band .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 40px; padding-block: 48px; }
-  .band .copy { flex: 1 1 320px; }
-  .band .copy h2 { margin-bottom: 10px; }
-  .band .copy p { color: var(--muted); font-size: 15px; }
-  .band svg.diagram { flex: 1 1 380px; max-width: 480px; height: auto; }
-
-  pre.code {
-    background: #0a0812; border: 1px solid var(--border); border-radius: 12px;
-    padding: 20px 24px; overflow-x: auto;
-    font-family: var(--mono); font-size: 13.5px; line-height: 1.8; color: #d8d4e8;
-  }
-  pre.code .c { color: #6f6a85; }
-  pre.code .v { color: var(--orange-soft); }
-
-  footer {
-    border-top: 1px solid var(--border);
-    padding: 36px 0 48px; font-size: 13px; color: var(--muted);
-  }
-  footer p { max-width: 820px; margin-bottom: 8px; }
 </style>
 </head>
-<body>
+<body class="bg-ink text-[#eceaf4] font-sans antialiased overflow-x-hidden leading-relaxed">
 
-<div class="wrap">
-  <nav>
-    <span class="brand">
-      <svg width="30" height="30" viewBox="0 0 200 200" aria-hidden="true">
+<!-- ambient background -->
+<div class="fixed inset-0 -z-10 pointer-events-none
+  [background:radial-gradient(900px_500px_at_15%_-5%,rgba(139,92,246,.14),transparent_65%),radial-gradient(800px_480px_at_90%_10%,rgba(255,105,75,.09),transparent_65%),radial-gradient(1000px_700px_at_50%_120%,rgba(139,92,246,.07),transparent_60%)]"></div>
+<div class="fixed inset-0 -z-10 pointer-events-none opacity-50
+  [background-image:radial-gradient(rgba(255,255,255,.022)_1px,transparent_1px)] [background-size:22px_22px]"></div>
+
+<!-- nav -->
+<nav class="sticky top-0 z-50 backdrop-blur-xl bg-ink/70 border-b border-line-soft">
+  <div class="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+    <span class="flex items-center gap-2.5 font-display font-bold text-lg">
+      <svg width="28" height="28" viewBox="0 0 200 200" aria-hidden="true">
+        <rect width="200" height="200" rx="45" fill="#14101F"/>
         <g stroke-linecap="round" fill="none">
-          <path d="M 66 46 H 134" stroke="#A78BFA" stroke-width="10"/>
-          <path d="M 140 58 C 120 84, 80 116, 60 142" stroke="#C4785F" stroke-width="10"/>
-          <path d="M 66 154 H 134" stroke="#FF694B" stroke-width="10"/>
+          <path d="M 66 52 H 134" stroke="#A78BFA" stroke-width="12"/>
+          <path d="M 138 64 C 120 88, 82 114, 62 138" stroke="#C4785F" stroke-width="12"/>
+          <path d="M 66 148 H 134" stroke="#FF694B" stroke-width="12"/>
         </g>
-        <g stroke-width="9">
-          <rect x="18" y="26" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#A78BFA"/>
-          <rect x="130" y="26" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#8B5CF6"/>
-          <rect x="18" y="136" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#FF8A6B"/>
-          <rect x="130" y="136" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#FF694B"/>
+        <g stroke-width="11">
+          <rect x="20" y="32" width="50" height="38" rx="11" fill="#1E1B2E" stroke="#A78BFA"/>
+          <rect x="130" y="32" width="50" height="38" rx="11" fill="#1E1B2E" stroke="#8B5CF6"/>
+          <rect x="20" y="130" width="50" height="38" rx="11" fill="#1E1B2E" stroke="#FF8A6B"/>
+          <rect x="130" y="130" width="50" height="38" rx="11" fill="#1E1B2E" stroke="#FF694B"/>
         </g>
       </svg>
       zdbt
     </span>
-    <span class="links">
-      <a href="#features">Features</a>
-      <a href="#build">Build from source</a>
-      <a href="https://github.com/arezki1990/dbt-zed">GitHub</a>
-    </span>
-  </nav>
-</div>
+    <div class="flex items-center gap-6 text-sm font-medium">
+      <a href="#features" class="max-md:hidden text-fog hover:text-white transition-colors">Features</a>
+      <a href="#workflow" class="max-md:hidden text-fog hover:text-white transition-colors">Workflow</a>
+      <a href="#download" class="max-md:hidden text-fog hover:text-white transition-colors">Download</a>
+      <a href="https://github.com/arezki1990/dbt-zed" class="max-md:hidden text-fog hover:text-white transition-colors">GitHub</a>
+      <a href="#download" class="rounded-full px-4 py-2 font-semibold text-white bg-gradient-to-br from-vio to-[#6d3df0]
+        shadow-[0_0_0_1px_rgba(139,92,246,.35),0_4px_18px_rgba(139,92,246,.25)]
+        hover:-translate-y-px hover:shadow-[0_0_0_1px_rgba(139,92,246,.5),0_6px_24px_rgba(139,92,246,.35)] transition-all">Get zdbt</a>
+    </div>
+  </div>
+</nav>
 
-<header class="hero">
-  <div class="hero-glow"></div>
-  <div class="wrap">
-    <div class="mark">
-      <svg width="150" height="150" viewBox="0 0 200 200" aria-hidden="true">
-        <defs>
-          <linearGradient id="edge" x1="30" y1="40" x2="170" y2="160" gradientUnits="userSpaceOnUse">
-            <stop offset="0" stop-color="#A78BFA"/>
-            <stop offset="1" stop-color="#FF694B"/>
-          </linearGradient>
-        </defs>
-        <g stroke="url(#edge)" stroke-width="7" stroke-linecap="round" fill="none">
-          <path d="M 66 46 H 134"/>
-          <path d="M 140 58 C 120 84, 80 116, 60 142"/>
-          <path d="M 66 154 H 134"/>
-        </g>
-        <path d="M 70 130 L 58 146 L 76 144 Z" fill="#FF694B"/>
-        <g stroke-width="5">
-          <rect x="22" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#A78BFA"/>
-          <rect x="134" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#8B5CF6"/>
-          <rect x="22" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF8A6B"/>
-          <rect x="134" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF694B"/>
-        </g>
-        <g stroke="#FF694B" stroke-width="3" stroke-linecap="round" opacity="0.7">
-          <path d="M 143 150 H 169"/>
-          <path d="M 143 158 H 161"/>
-        </g>
-      </svg>
+<!-- hero -->
+<header class="relative pt-24 pb-10 text-center">
+  <div class="max-w-6xl mx-auto px-6">
+    <div class="inline-flex items-center gap-2 text-[13px] font-medium text-fog border border-line rounded-full px-3.5 py-1.5 bg-panel/60 mb-7">
+      <span class="w-[7px] h-[7px] rounded-full bg-green-400 shadow-[0_0_8px_#4ade80]"></span>
+      v0.1.0 out now &nbsp;·&nbsp; built on Zed <code class="font-mono text-xs text-vio-soft">v1.17.2</code>
     </div>
-    <h1><span class="z">z</span><span class="dbt">dbt</span></h1>
-    <p class="tag">The dbt IDE, forged from Zed. Native Jinja-SQL, dbt LSP, instant query results, and an interactive column-level lineage canvas — no webviews, all GPUI.</p>
-    <p class="sub">A fork of <a href="https://github.com/zed-industries/zed">Zed</a> <code>v1.17.2</code> · GPL-3.0 · macOS / Linux / Windows</p>
-    <div class="dl-row">
-      <a class="btn primary" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-macos-aarch64.dmg">
-        Download <span class="os">macOS · Apple Silicon</span>
-      </a>
-      <a class="btn" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-linux-x86_64.tar.gz">
-        Download <span class="os">Linux · x86_64</span>
-      </a>
-      <a class="btn" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-windows-x86_64-setup.exe">
-        Download <span class="os">Windows · x86_64</span>
-      </a>
+    <h1 class="font-display font-bold tracking-tight leading-[1.04] text-[clamp(42px,7.4vw,84px)] max-w-4xl mx-auto mb-5 [text-wrap:balance]">
+      The <span class="bg-gradient-to-r from-vio-soft via-vio to-ember bg-clip-text text-transparent">dbt IDE</span> your models deserve.
+    </h1>
+    <p class="text-fog text-[clamp(16px,2.2vw,19px)] max-w-2xl mx-auto mb-9">
+      <strong class="text-white font-semibold">zdbt</strong> is a fork of Zed with dbt built into its bones — Jinja-aware SQL, a dbt language server, one-keystroke query results, and an interactive column-level lineage canvas. Native GPUI. Zero webviews.
+    </p>
+    <div class="flex flex-wrap gap-3.5 justify-center items-center">
+      <a href="#download" class="inline-flex items-center gap-2 rounded-xl px-6 py-3 font-semibold text-white bg-gradient-to-br from-vio to-[#6d3df0]
+        shadow-[inset_0_1px_0_rgba(255,255,255,.15),0_8px_28px_rgba(139,92,246,.35)]
+        hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_rgba(255,255,255,.15),0_12px_36px_rgba(139,92,246,.45)] transition-all">Download free</a>
+      <a href="https://github.com/arezki1990/dbt-zed" class="inline-flex items-center gap-2 rounded-xl px-6 py-3 font-semibold border border-line bg-panel/50
+        hover:-translate-y-0.5 hover:border-vio transition-all">★ Star on GitHub</a>
     </div>
-    <p class="dl-note">Unsigned dev-channel builds — they install alongside official Zed and never auto-update over it. All builds on the <a href="https://github.com/arezki1990/dbt-zed/releases">releases page</a>.</p>
+    <p class="mt-4 text-[13px] text-faint">macOS · Linux · Windows &nbsp;—&nbsp; free &amp; open source,
+      <a href="https://github.com/arezki1990/dbt-zed/blob/dbt/LICENSE-GPL" class="underline underline-offset-4">GPL-3.0</a></p>
+  </div>
+
+  <!-- editor mockup -->
+  <div class="max-w-6xl mx-auto px-6 pt-14 pb-8">
+    <div class="reveal max-w-[980px] mx-auto rounded-2xl overflow-hidden bg-panel border border-line font-mono text-xs
+      shadow-[0_0_0_1px_rgba(139,92,246,.08),0_30px_90px_rgba(0,0,0,.55),0_0_120px_rgba(139,92,246,.07)]">
+      <div class="flex items-center gap-2 px-3.5 py-2.5 border-b border-line-soft bg-ink-soft">
+        <span class="size-[11px] rounded-full bg-[#ff5f57]"></span>
+        <span class="size-[11px] rounded-full bg-[#febc2e]"></span>
+        <span class="size-[11px] rounded-full bg-[#28c840]"></span>
+        <span class="ml-3 text-faint text-[11.5px]">fct_orders.sql — zdbt</span>
+      </div>
+      <div class="grid md:grid-cols-[1.15fr_1fr] min-h-[330px] *:min-w-0">
+        <div class="max-md:hidden border-r border-line-soft p-4 text-left overflow-x-auto leading-[1.85]">
+<pre><span class="text-[#3f3a58] inline-block w-6 select-none">1</span><span class="text-[#575170]">-- fct_orders · materialized: table</span>
+<span class="text-[#3f3a58] inline-block w-6 select-none">2</span><span class="text-ember-soft">{{ config(materialized='table') }}</span>
+<span class="text-[#3f3a58] inline-block w-6 select-none">3</span>
+<span class="text-[#3f3a58] inline-block w-6 select-none">4</span><span class="text-vio-soft">select</span>
+<span class="text-[#3f3a58] inline-block w-6 select-none">5</span>  o.order_id,
+<span class="text-[#3f3a58] inline-block w-6 select-none">6</span>  c.customer_name,
+<span class="text-[#3f3a58] inline-block w-6 select-none">7</span>  <span class="text-[#7cc7ff]">sum</span>(p.amount) <span class="text-vio-soft">as</span> amount
+<span class="text-[#3f3a58] inline-block w-6 select-none">8</span><span class="text-vio-soft">from</span> <span class="text-ember-soft">{{ ref('stg_orders') }}</span> o
+<span class="text-[#3f3a58] inline-block w-6 select-none">9</span><span class="text-vio-soft">join</span> <span class="text-ember-soft">{{ ref('stg_payments') }}</span> p
+<span class="text-[#3f3a58] inline-block w-6 select-none">10</span>  <span class="text-vio-soft">on</span> o.order_id = p.order_id
+<span class="text-[#3f3a58] inline-block w-6 select-none">11</span><span class="text-vio-soft">group by</span> <span class="text-[#7ee0a3]">1, 2</span></pre>
+        </div>
+        <div class="flex flex-col text-left">
+          <div class="flex gap-0.5 px-2.5 pt-2 border-b border-line-soft bg-ink-soft text-[11.5px]">
+            <span class="px-3 py-1.5 rounded-t-lg bg-panel text-white border border-line-soft border-b-panel">▦ Results</span>
+            <span class="px-3 py-1.5 text-faint">⟨/⟩ Compiled</span>
+            <span class="px-3 py-1.5 text-faint">◇ Lineage</span>
+          </div>
+          <div class="flex-1 p-3 overflow-x-auto">
+            <table class="w-full border-collapse text-[11px]">
+              <tr class="text-vio-soft font-semibold *:text-left *:px-2 *:py-1.5 *:border-b *:border-line">
+                <th>#</th><th>order_id</th><th>customer</th><th>amount ▼</th></tr>
+              <tr class="text-fog *:px-2 *:py-[5.5px] *:border-b *:border-line-soft">
+                <td class="text-faint">1</td><td>10482</td><td>Acme Corp</td><td class="text-ember-soft">4,120.50</td></tr>
+              <tr class="text-fog *:px-2 *:py-[5.5px] *:border-b *:border-line-soft">
+                <td class="text-faint">2</td><td>10391</td><td>Globex</td><td class="text-ember-soft">3,987.00</td></tr>
+              <tr class="text-fog *:px-2 *:py-[5.5px] *:border-b *:border-line-soft">
+                <td class="text-faint">3</td><td>10057</td><td>Initech</td><td class="text-ember-soft">2,340.75</td></tr>
+              <tr class="text-fog *:px-2 *:py-[5.5px] *:border-b *:border-line-soft">
+                <td class="text-faint">4</td><td>10210</td><td>Umbrella</td><td class="text-ember-soft">1,876.20</td></tr>
+            </table>
+          </div>
+          <div class="max-md:hidden p-3 border-t border-line-soft">
+            <svg viewBox="0 0 430 96" fill="none" class="w-full h-auto block">
+              <path class="edge-anim" d="M 96 26 C 130 26, 140 48, 172 48" stroke="#524a75" stroke-width="2"/>
+              <path class="edge-anim d2" d="M 96 74 C 130 74, 140 52, 172 52" stroke="#524a75" stroke-width="2"/>
+              <path class="edge-anim d3" d="M 282 50 C 312 50, 318 50, 344 50" stroke="#FF694B" stroke-width="2"/>
+              <rect x="8" y="12" width="88" height="28" rx="7" fill="#191527" stroke="#4ade80" stroke-width="1.6"/>
+              <text x="52" y="30" fill="#eceaf4" font-size="10.5" text-anchor="middle" font-family="JetBrains Mono,monospace">stg_orders</text>
+              <rect x="8" y="60" width="88" height="28" rx="7" fill="#191527" stroke="#4ade80" stroke-width="1.6"/>
+              <text x="52" y="78" fill="#eceaf4" font-size="10.5" text-anchor="middle" font-family="JetBrains Mono,monospace">stg_payments</text>
+              <g class="node-pulse">
+                <rect x="172" y="34" width="110" height="32" rx="7" fill="#191527" stroke="#8B5CF6" stroke-width="2"/>
+                <text x="227" y="54" fill="#eceaf4" font-size="10.5" text-anchor="middle" font-family="JetBrains Mono,monospace">fct_orders</text>
+              </g>
+              <rect x="344" y="36" width="80" height="28" rx="7" fill="#191527" stroke="#FF694B" stroke-width="1.6"/>
+              <text x="384" y="54" fill="#eceaf4" font-size="10.5" text-anchor="middle" font-family="JetBrains Mono,monospace">mart_fin</text>
+            </svg>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 </header>
 
-<section id="features">
-  <div class="wrap">
-    <h2>Everything dbt, inside the editor</h2>
-    <p class="lead">Open a model and zdbt already knows your project: profiles, environment, lineage, and compiled SQL — with results one keystroke away.</p>
-    <div class="grid">
-      <div class="card">
-        <div class="icon">⚡</div>
-        <h3>Run a model with <kbd>⌘⏎</kbd></h3>
-        <p>Execute the current model — or just the SQL you selected — through <code>dbt show</code>. Results land in a data grid with sorting, live search, a column picker, resizable columns, pinned row numbers, and CSV export.</p>
+<!-- features -->
+<section id="features" class="py-24">
+  <div class="max-w-6xl mx-auto px-6">
+    <p class="reveal font-mono text-[12.5px] tracking-[.14em] uppercase text-ember-soft mb-3.5">Features</p>
+    <h2 class="reveal font-display font-bold tracking-tight leading-tight text-[clamp(30px,4.4vw,44px)] mb-3.5">Everything dbt,<br>zero context switching.</h2>
+    <p class="reveal text-fog text-[16.5px] max-w-xl">Open a model and zdbt already knows your project — profiles, environment, lineage, compiled SQL. Results are one keystroke away.</p>
+
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4 mt-11">
+      <div class="reveal lg:col-span-3 relative overflow-hidden rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
+        <div class="absolute -top-16 -right-16 w-44 h-44 rounded-full bg-vio blur-[60px] opacity-50 pointer-events-none"></div>
+        <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">⚡</div>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Run anything with <kbd>⌘</kbd> <kbd>⏎</kbd></h3>
+        <p class="text-sm text-fog">Execute the current model — or just the SQL you selected — through <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt show</code>. Results land in a grid with sorting, live search, a column picker, resizable columns, pinned row numbers, and CSV export.</p>
       </div>
-      <div class="card">
-        <div class="icon">🕸</div>
-        <h3>Interactive lineage canvas</h3>
-        <p>A React-Flow-style graph with layered auto-layout, materialization colors, per-node collapse handles, node drag, whole-graph pan, and semantic zoom. Click a column to light up its transformation path.</p>
+      <div class="reveal lg:col-span-3 relative overflow-hidden rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
+        <div class="absolute -top-16 -right-16 w-44 h-44 rounded-full bg-ember blur-[60px] opacity-40 pointer-events-none"></div>
+        <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🕸</div>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Column-level lineage canvas</h3>
+        <p class="text-sm text-fog">Layered auto-layout with crossing reduction, materialization colors, per-node collapse, drag &amp; pan, semantic zoom. Click a column to light up its transformation path across the DAG.</p>
       </div>
-      <div class="card">
-        <div class="icon">🧭</div>
-        <h3>Browse-driven navigation</h3>
-        <p>Opening any model recenters the lineage on it; clicking a node in the graph opens the file. The graph and the file tree are two views of the same project.</p>
+      <div class="reveal lg:col-span-2 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
+        <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🧬</div>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Jinja-aware dbt SQL</h3>
+        <p class="text-sm text-fog">Native tree-sitter grammar with combined SQL injection — statements survive <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">{{ ref(…) }}</code> interruptions. Default for every <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.sql</code> file.</p>
       </div>
-      <div class="card">
-        <div class="icon">🧬</div>
-        <h3>Jinja-aware dbt SQL</h3>
-        <p>A native tree-sitter Jinja grammar with combined SQL injection — statements survive being interrupted by <code>{{ ref(…) }}</code>. Default for every <code>.sql</code> file, no configuration.</p>
+      <div class="reveal lg:col-span-2 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
+        <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🛰</div>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">dbt language server</h3>
+        <p class="text-sm text-fog">dbt Fusion's <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt lsp</code> first — completions, hover, go-to-definition, diagnostics — with an automatic community-LSP fallback.</p>
       </div>
-      <div class="card">
-        <div class="icon">🛰</div>
-        <h3>dbt language server</h3>
-        <p>Prefers dbt Fusion's <code>dbt lsp</code> (go-to-definition, hover, completions, diagnostics) with a built-in workaround for its config-notification crash; falls back to the community Go LSP automatically.</p>
+      <div class="reveal lg:col-span-2 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
+        <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🧭</div>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Browse-driven navigation</h3>
+        <p class="text-sm text-fog">Opening a model recenters the lineage on it; clicking a node opens the file. Two views of one project, always in sync.</p>
       </div>
-      <div class="card">
-        <div class="icon">🔩</div>
-        <h3>Project automation</h3>
-        <p>Finds nested <code>dbt_project.yml</code> files, in-repo profiles (<code>local_profiles/</code>, <code>.dbt/</code>), loads <code>.env</code> up to the repo root, and runs <code>dbt parse</code> + catalog builds on open. Eleven settings on a dedicated page.</p>
+      <div class="reveal lg:col-span-6 grid md:grid-cols-[1.1fr_1fr] gap-7 items-center rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:border-[#3b3260] transition-all *:min-w-0">
+        <div>
+          <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🔩</div>
+          <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Your project, auto-wired</h3>
+          <p class="text-sm text-fog">zdbt discovers nested <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt_project.yml</code> files, in-repo profiles (<code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">local_profiles/</code>, <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.dbt/</code>), loads <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.env</code> secrets up to the repo root — into the dbt process only — and keeps the manifest &amp; catalog fresh with automatic <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt parse</code>. Eleven settings on a dedicated page when you want control.</p>
+        </div>
+        <div class="rounded-2xl overflow-hidden border border-line bg-[#0a0714] shadow-[0_20px_60px_rgba(0,0,0,.4)]">
+          <div class="flex items-center gap-[7px] px-3.5 py-2.5 bg-ink-soft border-b border-line-soft">
+            <span class="size-[11px] rounded-full bg-[#ff5f57]"></span>
+            <span class="size-[11px] rounded-full bg-[#febc2e]"></span>
+            <span class="size-[11px] rounded-full bg-[#28c840]"></span>
+          </div>
+          <pre class="p-5 overflow-x-auto font-mono text-[13px] leading-[1.9] text-[#d9d5ea]"><span class="text-[#575170]"># on open</span>
+<span class="text-ember-soft select-none">✓</span> project: employees/dbt_project.yml
+<span class="text-ember-soft select-none">✓</span> profiles: local_profiles/
+<span class="text-ember-soft select-none">✓</span> env: 8 vars from .env
+<span class="text-ember-soft select-none">✓</span> dbt parse · catalog fresh</pre>
+        </div>
       </div>
     </div>
   </div>
 </section>
 
-<div class="band">
-  <div class="wrap">
-    <div class="copy">
-      <h2>Compiled SQL &amp; column-level lineage</h2>
-      <p>Flip the results panel to the compiled view to read the exact SQL dbt will run, syntax-highlighted and copyable. Or open the lineage view and trace one column from source to mart — ephemeral models included, with columns inferred from compiled select lists when the catalog can't see them.</p>
+<!-- workflow -->
+<section id="workflow" class="py-24 border-y border-line-soft bg-gradient-to-b from-transparent via-panel/50 to-transparent">
+  <div class="max-w-6xl mx-auto px-6">
+    <p class="reveal font-mono text-[12.5px] tracking-[.14em] uppercase text-ember-soft mb-3.5">Workflow</p>
+    <h2 class="reveal font-display font-bold tracking-tight text-[clamp(30px,4.4vw,44px)]">Three steps to insight.</h2>
+    <div class="grid md:grid-cols-3 gap-4 mt-11">
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-7">
+        <p class="font-display font-bold text-[15px] text-ember mb-3">01</p>
+        <h3 class="font-display font-semibold text-[17px] mb-2">Open a model</h3>
+        <p class="text-sm text-fog">The lineage panel recenters instantly. Upstream sources on the left, downstream marts on the right — collapse what you don't need.</p>
+      </div>
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-7">
+        <p class="font-display font-bold text-[15px] text-ember mb-3">02</p>
+        <h3 class="font-display font-semibold text-[17px] mb-2">Hit <kbd>⌘</kbd> <kbd>⏎</kbd></h3>
+        <p class="text-sm text-fog">The model — or your selection — compiles and runs against your warehouse. Jinja resolved, limits applied, secrets from <code class="font-mono text-xs text-vio-soft">.env</code>.</p>
+      </div>
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-7">
+        <p class="font-display font-bold text-[15px] text-ember mb-3">03</p>
+        <h3 class="font-display font-semibold text-[17px] mb-2">Explore results</h3>
+        <p class="text-sm text-fog">Sort, search, hide columns, export CSV. Flip to Compiled to read the exact SQL, or trace a column across the DAG.</p>
+      </div>
     </div>
-    <svg class="diagram" viewBox="0 0 480 220" fill="none" aria-hidden="true">
-      <g stroke="#524a75" stroke-width="2" fill="none">
-        <path d="M 118 50 C 150 50, 160 74, 192 74"/>
-        <path d="M 118 110 C 150 110, 160 86, 192 86"/>
-        <path d="M 118 170 C 150 170, 160 96, 192 96"/>
-        <path d="M 308 85 C 336 85, 340 110, 366 110"/>
-      </g>
-      <path d="M 186 70 L 196 75 L 186 80 Z" fill="#8B5CF6"/>
-      <path d="M 360 106 L 370 111 L 360 116 Z" fill="#FF694B"/>
-      <g>
-        <rect x="18" y="30" width="100" height="40" rx="8" fill="#191527" stroke="#4ade80" stroke-width="2"/>
-        <text x="68" y="48" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">stg_orders</text>
-        <text x="68" y="62" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">view</text>
-        <rect x="18" y="90" width="100" height="40" rx="8" fill="#191527" stroke="#4ade80" stroke-width="2"/>
-        <text x="68" y="108" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">stg_payments</text>
-        <text x="68" y="122" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">view</text>
-        <rect x="18" y="150" width="100" height="40" rx="8" fill="#191527" stroke="#94a3b8" stroke-width="2" stroke-dasharray="4 3"/>
-        <text x="68" y="168" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">eph_valid</text>
-        <text x="68" y="182" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">ephemeral</text>
-      </g>
-      <g>
-        <rect x="192" y="55" width="116" height="60" rx="8" fill="#191527" stroke="#8B5CF6" stroke-width="2.5"/>
-        <text x="250" y="75" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">fct_orders</text>
-        <line x1="200" y1="83" x2="300" y2="83" stroke="#2a2440" stroke-width="1"/>
-        <text x="206" y="96" fill="#FF8A6B" font-size="9" font-family="ui-monospace,Menlo,monospace">▸ amount</text>
-        <text x="206" y="108" fill="#6f6a85" font-size="9" font-family="ui-monospace,Menlo,monospace">order_id</text>
-      </g>
-      <g>
-        <rect x="366" y="90" width="100" height="40" rx="8" fill="#191527" stroke="#FF694B" stroke-width="2"/>
-        <text x="416" y="108" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">mart_finance</text>
-        <text x="416" y="122" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">table</text>
-      </g>
-    </svg>
   </div>
-</div>
+</section>
 
-<section id="build">
-  <div class="wrap">
-    <h2>Build from source</h2>
-    <p class="lead">zdbt builds like Zed. You'll need Rust (rustup) and <code>cmake</code>; bring your own dbt (<a href="https://docs.getdbt.com">dbt Fusion</a> recommended — it's never bundled).</p>
-    <pre class="code"><span class="c"># clone and build</span>
+<!-- download -->
+<section id="download" class="py-24">
+  <div class="max-w-6xl mx-auto px-6">
+    <p class="reveal font-mono text-[12.5px] tracking-[.14em] uppercase text-ember-soft mb-3.5">Download</p>
+    <h2 class="reveal font-display font-bold tracking-tight text-[clamp(30px,4.4vw,44px)] mb-3.5">Free. Open source. Yours.</h2>
+    <p class="reveal text-fog text-[16.5px] max-w-xl">Prebuilt binaries for all three platforms. Installs alongside official Zed and never auto-updates over it.</p>
+
+    <div class="grid md:grid-cols-3 gap-4 mt-11">
+      <a class="reveal flex flex-col gap-1 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-vio hover:shadow-[0_16px_44px_rgba(139,92,246,.15)] transition-all"
+        href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-macos-aarch64.dmg">
+        <span class="text-vio-soft text-2xl mb-2.5">⌘</span>
+        <span class="font-display font-semibold text-[17px]">macOS</span>
+        <span class="text-[13px] text-fog">Apple Silicon</span>
+        <span class="mt-3.5 font-mono text-[11.5px] text-faint">zdbt-macos-aarch64.dmg</span>
+        <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
+      </a>
+      <a class="reveal flex flex-col gap-1 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-vio hover:shadow-[0_16px_44px_rgba(139,92,246,.15)] transition-all"
+        href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-linux-x86_64.tar.gz">
+        <span class="text-2xl mb-2.5">🐧</span>
+        <span class="font-display font-semibold text-[17px]">Linux</span>
+        <span class="text-[13px] text-fog">x86_64</span>
+        <span class="mt-3.5 font-mono text-[11.5px] text-faint">zdbt-linux-x86_64.tar.gz</span>
+        <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
+      </a>
+      <a class="reveal flex flex-col gap-1 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
+        hover:-translate-y-1 hover:border-vio hover:shadow-[0_16px_44px_rgba(139,92,246,.15)] transition-all"
+        href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-windows-x86_64-setup.exe">
+        <span class="text-vio-soft text-2xl mb-2.5">⊞</span>
+        <span class="font-display font-semibold text-[17px]">Windows</span>
+        <span class="text-[13px] text-fog">x86_64 installer</span>
+        <span class="mt-3.5 font-mono text-[11.5px] text-faint">zdbt-windows-x86_64-setup.exe</span>
+        <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
+      </a>
+    </div>
+    <p class="reveal mt-5 text-[13px] text-faint">Builds are unsigned for now — on macOS: right-click → Open the first time. Verify integrity with
+      <a class="underline underline-offset-4 text-faint" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a> ·
+      all versions on the <a class="underline underline-offset-4 text-faint" href="https://github.com/arezki1990/dbt-zed/releases">releases page</a> ·
+      bring your own dbt (<a class="underline underline-offset-4 text-faint" href="https://docs.getdbt.com">dbt Fusion</a> recommended).</p>
+
+    <div class="reveal mt-10 rounded-2xl overflow-hidden border border-line bg-[#0a0714] shadow-[0_20px_60px_rgba(0,0,0,.4)]">
+      <div class="flex items-center justify-between px-3.5 py-2.5 bg-ink-soft border-b border-line-soft">
+        <div class="flex gap-[7px]">
+          <span class="size-[11px] rounded-full bg-[#ff5f57]"></span>
+          <span class="size-[11px] rounded-full bg-[#febc2e]"></span>
+          <span class="size-[11px] rounded-full bg-[#28c840]"></span>
+        </div>
+        <button class="copy-btn text-xs font-semibold text-fog bg-panel-2 border border-line rounded-lg px-3 py-1 cursor-pointer hover:text-white hover:border-vio transition-colors"
+          data-copy="git clone https://github.com/arezki1990/dbt-zed && cd dbt-zed && cargo build --release -p zed --features gpui_platform/runtime_shaders">Copy</button>
+      </div>
+      <pre class="p-6 overflow-x-auto font-mono text-[13.5px] leading-[1.9] text-[#d9d5ea]"><span class="text-[#575170]"># or build from source (Rust + cmake)</span>
 git clone https://github.com/arezki1990/dbt-zed
 cd dbt-zed
 cargo build --release -p zed --features gpui_platform/runtime_shaders
-
-<span class="c"># open your dbt project</span>
-./target/release/zed <span class="v">/path/to/your/dbt/project</span></pre>
+./target/release/zed <span class="text-[#575170]">/path/to/your/dbt/project</span></pre>
+    </div>
   </div>
 </section>
 
-<footer>
-  <div class="wrap">
-    <p><strong>zdbt</strong> is free software, licensed <a href="https://github.com/arezki1990/dbt-zed/blob/dbt/LICENSE-GPL">GPL-3.0</a>. It is a fork of <a href="https://github.com/zed-industries/zed">Zed</a> (forked at v1.17.2) and vendors <code>sqlitegraph</code> (GPL-3.0) and <code>tree-sitter-jinja2</code> (MIT).</p>
-    <p>Not affiliated with or endorsed by Zed Industries or dbt Labs. "Zed" and "dbt" are trademarks of their respective owners.</p>
+<!-- footer -->
+<footer class="border-t border-line-soft py-11">
+  <div class="max-w-6xl mx-auto px-6 flex flex-wrap gap-7 justify-between items-start">
+    <div class="max-w-xl">
+      <span class="flex items-center gap-2.5 font-display font-bold text-[17px]">
+        <svg width="24" height="24" viewBox="0 0 200 200" aria-hidden="true">
+          <rect width="200" height="200" rx="45" fill="#14101F"/>
+          <g stroke-linecap="round" fill="none">
+            <path d="M 66 52 H 134" stroke="#A78BFA" stroke-width="12"/>
+            <path d="M 138 64 C 120 88, 82 114, 62 138" stroke="#C4785F" stroke-width="12"/>
+            <path d="M 66 148 H 134" stroke="#FF694B" stroke-width="12"/>
+          </g>
+        </svg>
+        zdbt
+      </span>
+      <p class="mt-2.5 text-[13px] text-faint"><strong class="text-fog">zdbt</strong> is free software, licensed
+        <a class="text-vio-soft" href="https://github.com/arezki1990/dbt-zed/blob/dbt/LICENSE-GPL">GPL-3.0</a>. A fork of
+        <a class="text-vio-soft" href="https://github.com/zed-industries/zed">Zed</a> (v1.17.2), vendoring
+        <code class="font-mono text-[11px]">sqlitegraph</code> (GPL-3.0) and <code class="font-mono text-[11px]">tree-sitter-jinja2</code> (MIT).
+        Not affiliated with or endorsed by Zed Industries or dbt Labs — "Zed" and "dbt" are trademarks of their respective owners.</p>
+    </div>
+    <div class="flex flex-col gap-2 text-[13.5px]">
+      <a class="text-fog hover:text-white transition-colors" href="https://github.com/arezki1990/dbt-zed">GitHub repository</a>
+      <a class="text-fog hover:text-white transition-colors" href="https://github.com/arezki1990/dbt-zed/releases">Releases</a>
+      <a class="text-fog hover:text-white transition-colors" href="https://github.com/arezki1990/dbt-zed/issues">Issues</a>
+      <a class="text-fog hover:text-white transition-colors" href="https://github.com/arezki1990/dbt-zed/blob/dbt/README.md">Documentation</a>
+    </div>
   </div>
 </footer>
 
+<script>
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+  }, { threshold: 0.12 });
+  document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copy);
+        const t = btn.textContent; btn.textContent = 'Copied ✓';
+        setTimeout(() => btn.textContent = t, 1600);
+      } catch {}
+    });
+  });
+</script>
 </body>
 </html>
