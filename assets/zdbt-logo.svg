@@ -1,0 +1,41 @@
+<svg width="640" height="200" viewBox="0 0 640 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- zdbt: lineage nodes tracing a Z -->
+  <defs>
+    <linearGradient id="edge" x1="30" y1="40" x2="170" y2="160" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#FF694B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- edges forming the Z -->
+  <g stroke="url(#edge)" stroke-width="7" stroke-linecap="round" fill="none">
+    <path d="M 66 46 H 134"/>
+    <path d="M 140 58 C 120 84, 80 116, 60 142"/>
+    <path d="M 66 154 H 134"/>
+  </g>
+  <!-- arrowhead on the diagonal, pointing to the lower-left node -->
+  <path d="M 70 130 L 58 146 L 76 144 Z" fill="#FF694B"/>
+
+  <!-- four lineage nodes -->
+  <g stroke-width="5">
+    <rect x="22" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#A78BFA"/>
+    <rect x="134" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#8B5CF6"/>
+    <rect x="22" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF8A6B"/>
+    <rect x="134" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF694B"/>
+  </g>
+  <!-- column rows hinted inside the final node -->
+  <g stroke="#FF694B" stroke-width="3" stroke-linecap="round" opacity="0.7">
+    <path d="M 143 150 H 169"/>
+    <path d="M 143 158 H 161"/>
+  </g>
+
+  <!-- wordmark -->
+  <text x="230" y="123" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="96" font-weight="700" letter-spacing="2">
+    <tspan fill="#8B5CF6">z</tspan><tspan fill="#FF694B">dbt</tspan>
+  </text>
+  <text x="236" y="158" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="21" font-weight="500" fill="#8A8F98" letter-spacing="1">
+    the dbt IDE, forged from Zed
+  </text>
+</svg>

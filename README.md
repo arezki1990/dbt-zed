@@ -1,12 +1,25 @@
-# dbt-zed
+<p align="center">
+  <img src="assets/zdbt-logo.svg" alt="zdbt — the dbt IDE, forged from Zed" width="440">
+</p>
 
-A personal **dbt IDE** built as a fork of [Zed](https://zed.dev)
+**zdbt** is a personal **dbt IDE** built as a fork of [Zed](https://zed.dev)
 ([zed-industries/zed](https://github.com/zed-industries/zed), forked at tag
 `v1.17.2`). It adds first-class, native dbt support directly into the editor —
 no webviews, all GPUI.
 
 > This project is not affiliated with or endorsed by Zed Industries or dbt
 > Labs. "Zed" and "dbt" are trademarks of their respective owners.
+
+## Download
+
+Prebuilt, unsigned binaries are on the
+[releases page](https://github.com/arezki1990/dbt-zed/releases/latest) —
+macOS Apple Silicon `.dmg`, Linux x86_64 `.tar.gz`, Windows x86_64 installer —
+and the project site is at
+[arezki1990.github.io/dbt-zed](https://arezki1990.github.io/dbt-zed/).
+Builds use the `dev` release channel, so they install alongside official Zed
+and never auto-update over it. On macOS, right-click → Open the first time
+(the build is unsigned).
 
 ## Features
 
