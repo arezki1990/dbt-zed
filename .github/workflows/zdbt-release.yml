@@ -1,0 +1,86 @@
+name: zdbt-release
+
+on:
+  push:
+    tags:
+      - "zdbt-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing zdbt-v* tag to build and upload assets for"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  ZDBT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  macos-aarch64:
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Bundle
+        run: ./script/bundle-mac aarch64-apple-darwin
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg=$(ls target/aarch64-apple-darwin/release/*.dmg | head -1)
+          cp "$dmg" zdbt-macos-aarch64.dmg
+          gh release upload "$ZDBT_TAG" zdbt-macos-aarch64.dmg --clobber
+
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Install dependencies
+        run: ./script/linux
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+      - name: Bundle
+        run: ./script/bundle-linux
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball=$(ls target/release/*linux*.tar.gz | head -1)
+          cp "$tarball" zdbt-linux-x86_64.tar.gz
+          gh release upload "$ZDBT_TAG" zdbt-linux-x86_64.tar.gz --clobber
+
+  windows-x86_64:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      ZED_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Enable long paths
+        run: git config --system core.longpaths true
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      - name: Bundle
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+      - name: Upload to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = Get-ChildItem target\*.exe | Select-Object -First 1
+          Copy-Item $exe.FullName zdbt-windows-x86_64-setup.exe
+          gh release upload $env:ZDBT_TAG zdbt-windows-x86_64-setup.exe --clobber
