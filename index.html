@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zdbt — the dbt IDE, forged from Zed</title>
+<meta name="description" content="zdbt is a dbt IDE built as a fork of Zed: Jinja-aware dbt SQL, dbt LSP, cmd+enter query results, compiled SQL, and an interactive column-level lineage canvas — all native GPUI.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #0d0b14;
+    --bg-soft: #14111f;
+    --card: #191527;
+    --border: #2a2440;
+    --text: #e8e6f0;
+    --muted: #9a94ad;
+    --violet: #8b5cf6;
+    --violet-soft: #a78bfa;
+    --orange: #ff694b;
+    --orange-soft: #ff8a6b;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--violet-soft); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px; }
+
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 0;
+  }
+  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
+  nav .brand svg { display: block; }
+  nav .links { display: flex; gap: 22px; font-size: 14px; }
+  nav .links a { color: var(--muted); }
+  nav .links a:hover { color: var(--text); text-decoration: none; }
+
+  header.hero {
+    position: relative;
+    text-align: center;
+    padding: 72px 0 84px;
+    overflow: hidden;
+  }
+  .hero-glow {
+    position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(600px 320px at 30% 10%, rgba(139,92,246,.16), transparent 70%),
+      radial-gradient(600px 320px at 70% 30%, rgba(255,105,75,.12), transparent 70%);
+  }
+  .hero .mark { margin-bottom: 8px; }
+  .hero h1 {
+    font-size: clamp(52px, 9vw, 88px);
+    font-weight: 800; letter-spacing: .01em; line-height: 1.1;
+  }
+  .hero h1 .z { color: var(--violet); }
+  .hero h1 .dbt { color: var(--orange); }
+  .hero p.tag {
+    font-size: clamp(17px, 2.6vw, 22px);
+    color: var(--muted); margin: 10px auto 8px; max-width: 640px;
+  }
+  .hero p.sub { font-size: 15px; color: var(--muted); opacity: .8; }
+  .hero p.sub code { font-family: var(--mono); color: var(--violet-soft); font-size: 14px; }
+
+  .dl-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 34px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 12px 22px; border-radius: 10px; font-size: 15px; font-weight: 600;
+    border: 1px solid var(--border); color: var(--text); background: var(--card);
+    transition: transform .12s ease, border-color .12s ease;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); border-color: var(--violet); }
+  .btn.primary {
+    background: linear-gradient(135deg, var(--violet), #7c3aed);
+    border-color: transparent; color: #fff;
+  }
+  .btn.primary:hover { border-color: transparent; filter: brightness(1.08); }
+  .btn .os { opacity: .75; font-weight: 500; font-size: 13px; }
+  .dl-note { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  .dl-note a { color: var(--muted); text-decoration: underline; }
+
+  section { padding: 56px 0; }
+  section h2 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+  section p.lead { color: var(--muted); max-width: 700px; margin-bottom: 32px; }
+
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 22px;
+  }
+  .card .icon {
+    width: 38px; height: 38px; border-radius: 9px; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, rgba(139,92,246,.18), rgba(255,105,75,.18));
+    border: 1px solid var(--border);
+    font-size: 18px;
+  }
+  .card h3 { font-size: 16px; font-weight: 650; margin-bottom: 6px; }
+  .card p { font-size: 14px; color: var(--muted); }
+  .card p code, kbd {
+    font-family: var(--mono); font-size: 12.5px;
+    background: var(--bg-soft); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; color: var(--violet-soft);
+  }
+
+  .band {
+    background: var(--bg-soft); border-block: 1px solid var(--border);
+  }
+  .band .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 40px; padding-block: 48px; }
+  .band .copy { flex: 1 1 320px; }
+  .band .copy h2 { margin-bottom: 10px; }
+  .band .copy p { color: var(--muted); font-size: 15px; }
+  .band svg.diagram { flex: 1 1 380px; max-width: 480px; height: auto; }
+
+  pre.code {
+    background: #0a0812; border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; overflow-x: auto;
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.8; color: #d8d4e8;
+  }
+  pre.code .c { color: #6f6a85; }
+  pre.code .v { color: var(--orange-soft); }
+
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 36px 0 48px; font-size: 13px; color: var(--muted);
+  }
+  footer p { max-width: 820px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <span class="brand">
+      <svg width="30" height="30" viewBox="0 0 200 200" aria-hidden="true">
+        <g stroke-linecap="round" fill="none">
+          <path d="M 66 46 H 134" stroke="#A78BFA" stroke-width="10"/>
+          <path d="M 140 58 C 120 84, 80 116, 60 142" stroke="#C4785F" stroke-width="10"/>
+          <path d="M 66 154 H 134" stroke="#FF694B" stroke-width="10"/>
+        </g>
+        <g stroke-width="9">
+          <rect x="18" y="26" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#A78BFA"/>
+          <rect x="130" y="26" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#8B5CF6"/>
+          <rect x="18" y="136" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#FF8A6B"/>
+          <rect x="130" y="136" width="52" height="38" rx="11" fill="#1E1B2E" stroke="#FF694B"/>
+        </g>
+      </svg>
+      zdbt
+    </span>
+    <span class="links">
+      <a href="#features">Features</a>
+      <a href="#build">Build from source</a>
+      <a href="https://github.com/arezki1990/dbt-zed">GitHub</a>
+    </span>
+  </nav>
+</div>
+
+<header class="hero">
+  <div class="hero-glow"></div>
+  <div class="wrap">
+    <div class="mark">
+      <svg width="150" height="150" viewBox="0 0 200 200" aria-hidden="true">
+        <defs>
+          <linearGradient id="edge" x1="30" y1="40" x2="170" y2="160" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#A78BFA"/>
+            <stop offset="1" stop-color="#FF694B"/>
+          </linearGradient>
+        </defs>
+        <g stroke="url(#edge)" stroke-width="7" stroke-linecap="round" fill="none">
+          <path d="M 66 46 H 134"/>
+          <path d="M 140 58 C 120 84, 80 116, 60 142"/>
+          <path d="M 66 154 H 134"/>
+        </g>
+        <path d="M 70 130 L 58 146 L 76 144 Z" fill="#FF694B"/>
+        <g stroke-width="5">
+          <rect x="22" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#A78BFA"/>
+          <rect x="134" y="30" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#8B5CF6"/>
+          <rect x="22" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF8A6B"/>
+          <rect x="134" y="140" width="44" height="30" rx="9" fill="#1E1B2E" stroke="#FF694B"/>
+        </g>
+        <g stroke="#FF694B" stroke-width="3" stroke-linecap="round" opacity="0.7">
+          <path d="M 143 150 H 169"/>
+          <path d="M 143 158 H 161"/>
+        </g>
+      </svg>
+    </div>
+    <h1><span class="z">z</span><span class="dbt">dbt</span></h1>
+    <p class="tag">The dbt IDE, forged from Zed. Native Jinja-SQL, dbt LSP, instant query results, and an interactive column-level lineage canvas — no webviews, all GPUI.</p>
+    <p class="sub">A fork of <a href="https://github.com/zed-industries/zed">Zed</a> <code>v1.17.2</code> · GPL-3.0 · macOS / Linux / Windows</p>
+    <div class="dl-row">
+      <a class="btn primary" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-macos-aarch64.dmg">
+        Download <span class="os">macOS · Apple Silicon</span>
+      </a>
+      <a class="btn" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-linux-x86_64.tar.gz">
+        Download <span class="os">Linux · x86_64</span>
+      </a>
+      <a class="btn" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-windows-x86_64-setup.exe">
+        Download <span class="os">Windows · x86_64</span>
+      </a>
+    </div>
+    <p class="dl-note">Unsigned dev-channel builds — they install alongside official Zed and never auto-update over it. All builds on the <a href="https://github.com/arezki1990/dbt-zed/releases">releases page</a>.</p>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Everything dbt, inside the editor</h2>
+    <p class="lead">Open a model and zdbt already knows your project: profiles, environment, lineage, and compiled SQL — with results one keystroke away.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon">⚡</div>
+        <h3>Run a model with <kbd>⌘⏎</kbd></h3>
+        <p>Execute the current model — or just the SQL you selected — through <code>dbt show</code>. Results land in a data grid with sorting, live search, a column picker, resizable columns, pinned row numbers, and CSV export.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🕸</div>
+        <h3>Interactive lineage canvas</h3>
+        <p>A React-Flow-style graph with layered auto-layout, materialization colors, per-node collapse handles, node drag, whole-graph pan, and semantic zoom. Click a column to light up its transformation path.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🧭</div>
+        <h3>Browse-driven navigation</h3>
+        <p>Opening any model recenters the lineage on it; clicking a node in the graph opens the file. The graph and the file tree are two views of the same project.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🧬</div>
+        <h3>Jinja-aware dbt SQL</h3>
+        <p>A native tree-sitter Jinja grammar with combined SQL injection — statements survive being interrupted by <code>{{ ref(…) }}</code>. Default for every <code>.sql</code> file, no configuration.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🛰</div>
+        <h3>dbt language server</h3>
+        <p>Prefers dbt Fusion's <code>dbt lsp</code> (go-to-definition, hover, completions, diagnostics) with a built-in workaround for its config-notification crash; falls back to the community Go LSP automatically.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔩</div>
+        <h3>Project automation</h3>
+        <p>Finds nested <code>dbt_project.yml</code> files, in-repo profiles (<code>local_profiles/</code>, <code>.dbt/</code>), loads <code>.env</code> up to the repo root, and runs <code>dbt parse</code> + catalog builds on open. Eleven settings on a dedicated page.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="band">
+  <div class="wrap">
+    <div class="copy">
+      <h2>Compiled SQL &amp; column-level lineage</h2>
+      <p>Flip the results panel to the compiled view to read the exact SQL dbt will run, syntax-highlighted and copyable. Or open the lineage view and trace one column from source to mart — ephemeral models included, with columns inferred from compiled select lists when the catalog can't see them.</p>
+    </div>
+    <svg class="diagram" viewBox="0 0 480 220" fill="none" aria-hidden="true">
+      <g stroke="#524a75" stroke-width="2" fill="none">
+        <path d="M 118 50 C 150 50, 160 74, 192 74"/>
+        <path d="M 118 110 C 150 110, 160 86, 192 86"/>
+        <path d="M 118 170 C 150 170, 160 96, 192 96"/>
+        <path d="M 308 85 C 336 85, 340 110, 366 110"/>
+      </g>
+      <path d="M 186 70 L 196 75 L 186 80 Z" fill="#8B5CF6"/>
+      <path d="M 360 106 L 370 111 L 360 116 Z" fill="#FF694B"/>
+      <g>
+        <rect x="18" y="30" width="100" height="40" rx="8" fill="#191527" stroke="#4ade80" stroke-width="2"/>
+        <text x="68" y="48" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">stg_orders</text>
+        <text x="68" y="62" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">view</text>
+        <rect x="18" y="90" width="100" height="40" rx="8" fill="#191527" stroke="#4ade80" stroke-width="2"/>
+        <text x="68" y="108" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">stg_payments</text>
+        <text x="68" y="122" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">view</text>
+        <rect x="18" y="150" width="100" height="40" rx="8" fill="#191527" stroke="#94a3b8" stroke-width="2" stroke-dasharray="4 3"/>
+        <text x="68" y="168" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">eph_valid</text>
+        <text x="68" y="182" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">ephemeral</text>
+      </g>
+      <g>
+        <rect x="192" y="55" width="116" height="60" rx="8" fill="#191527" stroke="#8B5CF6" stroke-width="2.5"/>
+        <text x="250" y="75" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">fct_orders</text>
+        <line x1="200" y1="83" x2="300" y2="83" stroke="#2a2440" stroke-width="1"/>
+        <text x="206" y="96" fill="#FF8A6B" font-size="9" font-family="ui-monospace,Menlo,monospace">▸ amount</text>
+        <text x="206" y="108" fill="#6f6a85" font-size="9" font-family="ui-monospace,Menlo,monospace">order_id</text>
+      </g>
+      <g>
+        <rect x="366" y="90" width="100" height="40" rx="8" fill="#191527" stroke="#FF694B" stroke-width="2"/>
+        <text x="416" y="108" fill="#e8e6f0" font-size="11" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">mart_finance</text>
+        <text x="416" y="122" fill="#6f6a85" font-size="9" text-anchor="middle" font-family="ui-monospace,Menlo,monospace">table</text>
+      </g>
+    </svg>
+  </div>
+</div>
+
+<section id="build">
+  <div class="wrap">
+    <h2>Build from source</h2>
+    <p class="lead">zdbt builds like Zed. You'll need Rust (rustup) and <code>cmake</code>; bring your own dbt (<a href="https://docs.getdbt.com">dbt Fusion</a> recommended — it's never bundled).</p>
+    <pre class="code"><span class="c"># clone and build</span>
+git clone https://github.com/arezki1990/dbt-zed
+cd dbt-zed
+cargo build --release -p zed --features gpui_platform/runtime_shaders
+
+<span class="c"># open your dbt project</span>
+./target/release/zed <span class="v">/path/to/your/dbt/project</span></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p><strong>zdbt</strong> is free software, licensed <a href="https://github.com/arezki1990/dbt-zed/blob/dbt/LICENSE-GPL">GPL-3.0</a>. It is a fork of <a href="https://github.com/zed-industries/zed">Zed</a> (forked at v1.17.2) and vendors <code>sqlitegraph</code> (GPL-3.0) and <code>tree-sitter-jinja2</code> (MIT).</p>
+    <p>Not affiliated with or endorsed by Zed Industries or dbt Labs. "Zed" and "dbt" are trademarks of their respective owners.</p>
+  </div>
+</footer>
+
+</body>
+</html>
