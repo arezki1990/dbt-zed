@@ -126,6 +126,34 @@
     // limit_content_width is enabled.
     "max_width": 800,
   },
+  // dbt integration settings
+  "dbt": {
+    // Maximum number of rows fetched by `dbt show` for the dbt results panel.
+    "show_limit": 500,
+    // The dbt executable used by the dbt results panel (resolved from PATH).
+    "binary": "dbt",
+    // The dbt target passed as --target; empty uses the profile's default target.
+    "target": "",
+    // The profiles directory passed as --profiles-dir; empty uses dbt's default resolution.
+    "profiles_dir": "",
+    // Environment variables set for dbt commands (available to env_var() in models and profiles).
+    "env": {},
+    // The dbt project directory relative to the worktree root (or absolute);
+    // empty auto-discovers the nearest dbt_project.yml above the open model.
+    "project_dir": "",
+    // Run `dbt parse` automatically the first time a dbt project is detected,
+    // keeping target/manifest.json (and the lineage graph) fresh.
+    "parse_on_load": true,
+    // Path to an additional dotenv file loaded for dbt commands, relative to
+    // the project directory (or absolute); empty relies on auto-discovery.
+    "env_file": "",
+    // How many dependency levels the lineage graph canvas walks in each direction.
+    "lineage_depth": 4,
+    // How many dependency levels the lineage tree sidebar walks in each direction.
+    "lineage_tree_depth": 8,
+    // Maximum number of nodes gathered per lineage computation.
+    "lineage_max_nodes": 500,
+  },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //
   // 1. Maps to `Alt` on Linux and Windows and to `Option` on MacOS:

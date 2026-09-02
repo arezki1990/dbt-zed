@@ -1,0 +1,2253 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use editor::{Editor, ToOffset as _};
+use gpui::{
+    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
+    PathBuilder, Pixels, Point, ScrollHandle, Task, WeakEntity, Window, canvas, point, px,
+};
+use language::LanguageRegistry;
+use settings::Settings as _;
+use ui::{
+    ColumnWidthConfig, ResizableColumnsState, Table, TableInteractionState,
+    TableResizeBehavior, prelude::*,
+};
+use util::command::new_command;
+use workspace::{
+    Workspace,
+    dock::{DockPosition, Panel, PanelEvent},
+};
+
+use crate::{
+    ShowModelData, ToggleFocus,
+    dbt_settings::DbtSettings,
+    lineage::{
+        GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_MAX_COLUMNS, GRAPH_NODE_HEIGHT,
+        GRAPH_PADDING, GRAPH_ROW_GAP, LayoutGraph, LineageStore, LineageTree, LineageTreeNode,
+    },
+};
+
+pub struct DbtResultsPanel {
+    focus_handle: FocusHandle,
+    table_interaction: Entity<TableInteractionState>,
+    languages: Arc<LanguageRegistry>,
+    workspace: WeakEntity<Workspace>,
+    lineage_store: Arc<LineageStore>,
+    state: ResultsState,
+    view: ResultsView,
+    compiled_editor: Option<Entity<Editor>>,
+    lineage_layout: Option<Arc<LayoutGraph>>,
+    lineage_tree: Option<Arc<LineageTree>>,
+    expanded: HashSet<SharedString>,
+    show_upstream: bool,
+    show_downstream: bool,
+    show_columns: bool,
+    show_tree: bool,
+    collapsed_up: HashSet<String>,
+    collapsed_down: HashSet<String>,
+    selected_column: Option<String>,
+    pan: (f32, f32),
+    zoom: f32,
+    node_offsets: HashMap<String, (f32, f32)>,
+    graph_drag: Option<GraphDrag>,
+    drag_moved: bool,
+    canvas_scroll: ScrollHandle,
+    /// The model the current lineage graph is centered on.
+    lineage_model: Option<String>,
+    search_editor: Entity<Editor>,
+    /// Active sort: (column index, ascending).
+    sort: Option<(usize, bool)>,
+    column_widths: Option<Entity<ResizableColumnsState>>,
+    hidden_columns: HashSet<usize>,
+    show_column_picker: bool,
+    last_root: Option<PathBuf>,
+    /// Project roots already auto-parsed this session.
+    parsed_roots: HashSet<PathBuf>,
+    _run: Task<()>,
+    _lineage_refresh: Task<()>,
+}
+
+enum GraphDrag {
+    Node(String, Point<Pixels>),
+    Canvas(Point<Pixels>),
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum ResultsView {
+    Table,
+    Compiled,
+    Lineage,
+}
+
+/// What `dbt show` should execute: a whole model, or an ad-hoc SQL chunk
+/// (editor selection) compiled with `--inline`.
+pub enum ShowTarget {
+    Model {
+        name: SharedString,
+        rel_path: PathBuf,
+    },
+    Inline(String),
+}
+
+impl ShowTarget {
+    fn label(&self) -> SharedString {
+        match self {
+            ShowTarget::Model { name, .. } => name.clone(),
+            ShowTarget::Inline(_) => "selection".into(),
+        }
+    }
+}
+
+enum ResultsState {
+    Empty,
+    Running {
+        model: SharedString,
+    },
+    Failed {
+        model: SharedString,
+        message: SharedString,
+    },
+    Loaded {
+        model: SharedString,
+        columns: Arc<Vec<SharedString>>,
+        rows: Arc<Vec<Vec<SharedString>>>,
+        compiled: Option<SharedString>,
+    },
+}
+
+/// Finds the dbt project root for a model file: the configured `project_dir`
+/// setting when valid, otherwise the nearest ancestor of the file (within the
+/// worktree) containing dbt_project.yml — so nested layouts like
+/// `<repo>/employees/dbt_project.yml` load automatically.
+fn discover_project_root(
+    file_abs: &std::path::Path,
+    worktree_root: &std::path::Path,
+    configured: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(configured) = configured {
+        let candidate = if std::path::Path::new(configured).is_absolute() {
+            PathBuf::from(configured)
+        } else {
+            worktree_root.join(configured)
+        };
+        if candidate.join("dbt_project.yml").is_file() {
+            return Some(candidate);
+        }
+    }
+    let mut dir = file_abs.parent()?;
+    loop {
+        if dir.join("dbt_project.yml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        if dir == worktree_root || !dir.starts_with(worktree_root) {
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Resolves the dbt model open in the active editor, for lineage-follows-file
+/// browsing.
+fn active_model_file(workspace: &Workspace, cx: &App) -> Option<(String, PathBuf)> {
+    let editor = workspace.active_item(cx)?.act_as::<Editor>(cx)?;
+    let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+    let buffer = buffer.read(cx);
+    let file = buffer.file()?;
+    let abs_path = file.as_local()?.abs_path(cx);
+    // Any .sql file inside a dbt project counts as a model, regardless of
+    // which language claimed the buffer (the sql extension may win the
+    // suffix in shared configs).
+    if abs_path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+        return None;
+    }
+    let model = abs_path.file_stem()?.to_str()?.to_owned();
+    let worktree_root = workspace
+        .project()
+        .read(cx)
+        .worktree_for_id(file.worktree_id(cx), cx)?
+        .read(cx)
+        .abs_path()
+        .to_path_buf();
+    let settings = DbtSettings::get_global(cx);
+    let root = discover_project_root(
+        &abs_path,
+        &worktree_root,
+        settings.project_dir.as_deref(),
+    )?;
+    Some((model, root))
+}
+
+/// Resolves the model (or selection) under the active editor and runs
+/// `dbt show` for it, revealing the results panel.
+pub fn show_model_data(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<DbtResultsPanel>(cx) else {
+        return;
+    };
+
+    let resolved = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+        .and_then(|editor| {
+            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+            let file = buffer.read(cx).file()?;
+            let abs_path = file.as_local()?.abs_path(cx);
+            let model = abs_path.file_stem()?.to_str()?.to_owned();
+            let worktree = workspace
+                .project()
+                .read(cx)
+                .worktree_for_id(file.worktree_id(cx), cx)?;
+            let worktree_root = worktree.read(cx).abs_path().to_path_buf();
+            let settings = DbtSettings::get_global(cx);
+            let root = discover_project_root(
+                &abs_path,
+                &worktree_root,
+                settings.project_dir.as_deref(),
+            )?;
+            let rel_path = abs_path.strip_prefix(&root).ok()?.to_path_buf();
+
+            // A non-empty selection runs as an ad-hoc query, SQL-IDE style;
+            // otherwise the whole model runs.
+            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+            let selection = editor.read(cx).selections.newest_anchor().clone();
+            let range = selection.start.to_offset(&snapshot)..selection.end.to_offset(&snapshot);
+            let target = if range.is_empty() {
+                ShowTarget::Model {
+                    name: model.into(),
+                    rel_path,
+                }
+            } else {
+                ShowTarget::Inline(snapshot.text_for_range(range).collect::<String>())
+            };
+            Some((target, root))
+        });
+
+    workspace.focus_panel::<DbtResultsPanel>(window, cx);
+    panel.update(cx, |panel, cx| match resolved {
+        Some((target, root)) => panel.run_show(target, root, window, cx),
+        None => {
+            panel.state = ResultsState::Failed {
+                model: "?".into(),
+                message: "Open a dbt model file first, then run dbt: show model data.".into(),
+            };
+            cx.notify();
+        }
+    });
+}
+
+impl DbtResultsPanel {
+    pub async fn load(
+        workspace: WeakEntity<Workspace>,
+        mut cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            Self::new(workspace, window, cx)
+        })
+    }
+
+    pub fn new(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        let languages = workspace.project().read(cx).languages().clone();
+        let workspace_handle = cx.entity().downgrade();
+        let workspace_entity = cx.entity().clone();
+        cx.new(|cx| {
+            let search_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Search results…", window, cx);
+                editor
+            });
+            cx.subscribe(
+                &search_editor,
+                |_, _, event: &editor::EditorEvent, cx| {
+                    if matches!(event, editor::EditorEvent::BufferEdited) {
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+
+            // Browsing model files drives the lineage: whenever the active
+            // editor changes to a dbt model, recenter the graph on it.
+            cx.subscribe(
+                &workspace_entity,
+                |this: &mut Self, workspace, event: &workspace::Event, cx| {
+                    if let workspace::Event::ActiveItemChanged = event {
+                        if let Some((model, root)) = active_model_file(workspace.read(cx), cx)
+                        {
+                            this.refresh_lineage(model, root, cx);
+                        }
+                    }
+                },
+            )
+            .detach();
+            Self {
+            focus_handle: cx.focus_handle(),
+            table_interaction: cx.new(|cx| {
+                TableInteractionState::new(cx).with_custom_scrollbar(
+                    ui::Scrollbars::for_settings::<editor::EditorSettingsScrollbarProxy>(),
+                )
+            }),
+            languages,
+            workspace: workspace_handle,
+            lineage_store: Arc::new(LineageStore::default()),
+            state: ResultsState::Empty,
+            view: ResultsView::Table,
+            compiled_editor: None,
+            lineage_layout: None,
+            lineage_tree: None,
+            expanded: Default::default(),
+            show_upstream: true,
+            show_downstream: true,
+            show_columns: false,
+            show_tree: true,
+            collapsed_up: Default::default(),
+            collapsed_down: Default::default(),
+            selected_column: None,
+            pan: (0., 0.),
+            zoom: 1.0,
+            node_offsets: Default::default(),
+            graph_drag: None,
+            drag_moved: false,
+                canvas_scroll: ScrollHandle::new(),
+                lineage_model: None,
+                search_editor,
+                sort: None,
+                column_widths: None,
+                hidden_columns: Default::default(),
+                show_column_picker: false,
+                last_root: None,
+                parsed_roots: Default::default(),
+                _run: Task::ready(()),
+                _lineage_refresh: Task::ready(()),
+            }
+        })
+    }
+
+    /// Row indices of the loaded results after applying search and sort.
+    fn display_indices(
+        &self,
+        rows: &[Vec<SharedString>],
+        cx: &App,
+    ) -> Vec<usize> {
+        let query = self.search_editor.read(cx).text(cx).trim().to_lowercase();
+        let mut indices: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                query.is_empty()
+                    || row
+                        .iter()
+                        .any(|cell| cell.to_lowercase().contains(query.as_str()))
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        if let Some((column, ascending)) = self.sort {
+            let compare = |a: &str, b: &str| match (a.parse::<f64>(), b.parse::<f64>()) {
+                (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                _ => a.cmp(b),
+            };
+            indices.sort_by(|&a, &b| {
+                let a = rows[a].get(column).map(|c| c.as_ref()).unwrap_or("");
+                let b = rows[b].get(column).map(|c| c.as_ref()).unwrap_or("");
+                let ordering = compare(a, b);
+                if ascending { ordering } else { ordering.reverse() }
+            });
+        }
+        indices
+    }
+
+    fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ResultsState::Loaded {
+            model,
+            columns,
+            rows,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        let Some(root) = self.last_root.clone() else {
+            return;
+        };
+        let quote = |cell: &str| -> String {
+            if cell.contains(',') || cell.contains('"') || cell.contains('\n') {
+                format!("\"{}\"", cell.replace('"', "\"\""))
+            } else {
+                cell.to_owned()
+            }
+        };
+        let mut out = String::new();
+        out.push_str(
+            &columns
+                .iter()
+                .map(|column| quote(column))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+        for ix in self.display_indices(rows, cx) {
+            out.push_str(
+                &rows[ix]
+                    .iter()
+                    .map(|cell| quote(cell))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            out.push('\n');
+        }
+        let path = root.join("target").join(format!("{model}_results.csv"));
+        match std::fs::write(&path, out) {
+            Ok(()) => {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        workspace
+                            .open_abs_path(
+                                path,
+                                workspace::OpenOptions::default(),
+                                window,
+                                cx,
+                            )
+                            .detach();
+                    })
+                    .ok();
+            }
+            Err(error) => log::error!("dbt: csv export failed: {error}"),
+        }
+    }
+
+    /// Recomputes the lineage graph centered on `model` without running any
+    /// query — this is what makes file browsing drive the graph.
+    fn refresh_lineage(&mut self, model: String, root: PathBuf, cx: &mut Context<Self>) {
+        if self.lineage_model.as_deref() == Some(model.as_str()) {
+            return;
+        }
+
+        // First detection of a project this session: refresh its manifest so
+        // the lineage graph reflects the current model files.
+        let settings = DbtSettings::get_global(cx).clone();
+        let graph_depth = settings.lineage_depth as i32;
+        let tree_depth = settings.lineage_tree_depth as usize;
+        let max_nodes = settings.lineage_max_nodes as usize;
+        if settings.parse_on_load && !self.parsed_roots.contains(&root) {
+            self.parsed_roots.insert(root.clone());
+            let command_root = root.clone();
+            let parse_root = root.clone();
+            let parse_model = model.clone();
+            let catalog_settings = settings.clone();
+            let parse = cx.background_spawn(async move {
+                let mut command = new_command(&settings.binary);
+                command.arg("parse");
+                apply_common_args(&mut command, &settings, &command_root);
+                command.current_dir(&command_root).output().await
+            });
+            cx.spawn(async move |this, cx| {
+                match parse.await {
+                    Ok(output) if output.status.success() => {
+                        log::info!("dbt: auto-parse succeeded for {parse_root:?}");
+                        this.update(cx, |this, cx| {
+                            this.lineage_model = None;
+                            this.refresh_lineage(parse_model.clone(), parse_root.clone(), cx);
+                        })
+                        .ok();
+                    }
+                    Ok(output) => {
+                        log::warn!(
+                            "dbt: auto-parse failed for {parse_root:?}:\n{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        log::warn!("dbt: auto-parse spawn failed: {error:#}");
+                        return;
+                    }
+                }
+
+                // Second stage: refresh the catalog so sources (which only get
+                // columns from catalog.json) participate in column lineage.
+                let catalog_root = parse_root.clone();
+                let catalog = cx.background_executor().spawn(async move {
+                    let mut command = new_command(&catalog_settings.binary);
+                    command.args(["compile", "--write-catalog"]);
+                    apply_common_args(&mut command, &catalog_settings, &catalog_root);
+                    command.current_dir(&catalog_root).output().await
+                });
+                match catalog.await {
+                    Ok(output) if output.status.success() => {
+                        log::info!("dbt: catalog refreshed for {parse_root:?}");
+                        this.update(cx, |this, cx| {
+                            this.lineage_model = None;
+                            this.refresh_lineage(parse_model, parse_root, cx);
+                        })
+                        .ok();
+                    }
+                    Ok(output) => log::warn!(
+                        "dbt: catalog refresh failed for {parse_root:?}:\n{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    Err(error) => log::warn!("dbt: catalog spawn failed: {error:#}"),
+                }
+            })
+            .detach();
+        }
+
+        self.lineage_model = Some(model.clone());
+        let store = self.lineage_store.clone();
+        let task = cx.background_spawn(async move {
+            let tree = store.lineage_tree(&root, &model, tree_depth, max_nodes).ok();
+            let layout = store
+                .lineage_layout(&root, &model, graph_depth, max_nodes)
+                .ok();
+            (tree, layout)
+        });
+        self._lineage_refresh = cx.spawn(async move |this, cx| {
+            let (tree, layout) = task.await;
+            this.update(cx, |this, cx| {
+                if tree.is_none() && layout.is_none() {
+                    return;
+                }
+                this.lineage_tree = tree.map(Arc::new);
+                this.lineage_layout = layout.map(Arc::new);
+                this.expanded.clear();
+                this.collapsed_up.clear();
+                this.collapsed_down.clear();
+                this.selected_column = None;
+                this.pan = (0., 0.);
+                this.node_offsets.clear();
+                this.graph_drag = None;
+                this.view = ResultsView::Lineage;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn run_show(
+        &mut self,
+        target: ShowTarget,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = target.label();
+        self.state = ResultsState::Running {
+            model: model.clone(),
+        };
+        cx.notify();
+
+        self.last_root = Some(root.clone());
+        let settings = DbtSettings::get_global(cx).clone();
+        let lineage_store = self.lineage_store.clone();
+        let command = cx.background_spawn(async move {
+            let limit = settings.show_limit.to_string();
+            let mut command = new_command(&settings.binary);
+            command.arg("show");
+            match &target {
+                ShowTarget::Model { name, .. } => {
+                    command.args(["--select", name.as_ref()]);
+                }
+                ShowTarget::Inline(sql) => {
+                    command.args(["--inline", sql]);
+                }
+            }
+            command.args(["--limit", &limit, "--output", "json"]);
+            apply_common_args(&mut command, &settings, &root);
+            let output = command
+                .current_dir(&root)
+                .output()
+                .await
+                .with_context(|| {
+                    format!("spawning `{} show` (is it on PATH?)", settings.binary)
+                })?;
+            let (columns, rows) =
+                parse_show_output(&output.stdout, &output.stderr, output.status.success())?;
+            let compiled = fetch_compiled_sql(&settings, &target, &root).await;
+            let (lineage_tree, lineage_layout) = match &target {
+                ShowTarget::Model { name, .. } => (
+                    lineage_store
+                        .lineage_tree(
+                            &root,
+                            name.as_ref(),
+                            settings.lineage_tree_depth as usize,
+                            settings.lineage_max_nodes as usize,
+                        )
+                        .ok(),
+                    lineage_store
+                        .lineage_layout(
+                            &root,
+                            name.as_ref(),
+                            settings.lineage_depth as i32,
+                            settings.lineage_max_nodes as usize,
+                        )
+                        .ok(),
+                ),
+                ShowTarget::Inline(_) => (None, None),
+            };
+            anyhow::Ok((columns, rows, compiled, lineage_tree, lineage_layout))
+        });
+
+        let languages = self.languages.clone();
+        self._run = cx.spawn_in(window, async move |this, cx| {
+            let result = command.await;
+            let result = result.map(|(columns, rows, compiled, lineage_tree, lineage_layout)| {
+                (
+                    columns,
+                    rows,
+                    compiled,
+                    lineage_tree.map(Arc::new),
+                    lineage_layout.map(Arc::new),
+                )
+            });
+            let sql_language = languages.language_for_name("SQL (dbt)").await.ok();
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok((columns, rows, compiled, lineage_tree, lineage_layout)) => {
+                        this.lineage_layout = lineage_layout;
+                        this.lineage_tree = lineage_tree;
+                        this.expanded.clear();
+                        this.collapsed_up.clear();
+                        this.collapsed_down.clear();
+                        this.selected_column = None;
+                        this.pan = (0., 0.);
+                        this.node_offsets.clear();
+                        this.graph_drag = None;
+                        this.compiled_editor = compiled.as_ref().map(|sql| {
+                            let buffer = cx.new(|cx| {
+                                let mut buffer = language::Buffer::local(sql.clone(), cx);
+                                buffer.set_language(sql_language.clone(), cx);
+                                buffer
+                            });
+                            cx.new(|cx| {
+                                let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                                editor.set_read_only(true);
+                                editor
+                            })
+                        });
+                        this.lineage_model = Some(model.to_string());
+                        this.view = ResultsView::Table;
+                        this.sort = None;
+                        this.hidden_columns.clear();
+                        // Content-aware initial widths; drag handles resize
+                        // like a spreadsheet from there. Column 0 is the
+                        // pinned row-number gutter (pinning also activates
+                        // the table's scroll-aware resize layout).
+                        let mut widths: Vec<Pixels> = vec![px(56.)];
+                        widths.extend(columns.iter().enumerate().map(
+                            |(column_ix, column)| {
+                                let mut chars = column.len();
+                                for row in rows.iter().take(30) {
+                                    if let Some(cell) = row.get(column_ix) {
+                                        chars = chars.max(cell.len());
+                                    }
+                                }
+                                px((chars as f32 * 8.2 + 24.).clamp(90., 340.))
+                            },
+                        ));
+                        this.column_widths = (!columns.is_empty()).then(|| {
+                            let state = cx.new(|_| {
+                                // MinSize is in rems: 3.75rem ≈ 60px columns,
+                                // 2rem ≈ 32px row-number gutter.
+                                let mut behaviors =
+                                    vec![TableResizeBehavior::MinSize(3.75); columns.len() + 1];
+                                behaviors[0] = TableResizeBehavior::MinSize(2.);
+                                ResizableColumnsState::new(
+                                    columns.len() + 1,
+                                    widths,
+                                    behaviors,
+                                )
+                            });
+                            // The table updates this entity on every drag
+                            // frame; observing it makes the resize track the
+                            // pointer smoothly instead of jumping on release.
+                            cx.observe(&state, |_, _, cx| cx.notify()).detach();
+                            state
+                        });
+                        this.search_editor.update(cx, |editor, cx| {
+                            editor.set_text("", window, cx);
+                        });
+                        this.state = ResultsState::Loaded {
+                            model,
+                            columns: Arc::new(columns),
+                            rows: Arc::new(rows),
+                            compiled: compiled.map(SharedString::from),
+                        };
+                    }
+                    Err(error) => {
+                        this.compiled_editor = None;
+                        this.state = ResultsState::Failed {
+                            model,
+                            message: format!("{error:#}").into(),
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title: SharedString = match &self.state {
+            ResultsState::Empty => "dbt results".into(),
+            ResultsState::Running { model } => format!("dbt show {model} — running…").into(),
+            ResultsState::Failed { model, .. } => format!("dbt show {model} — failed").into(),
+            ResultsState::Loaded { model, rows, .. } => {
+                format!("dbt show {model} — {} rows", rows.len()).into()
+            }
+        };
+        h_flex()
+            .w_full()
+            .p_1()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                IconButton::new("dbt-show-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::for_action_title(
+                        "Show data for the active model",
+                        &ShowModelData,
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ShowModelData), cx);
+                    }),
+            )
+            .child(Label::new(title).size(LabelSize::Small))
+            .when(
+                self.view == ResultsView::Table
+                    && matches!(self.state, ResultsState::Loaded { .. }),
+                |this| {
+                    this.child(
+                        div()
+                            .w(px(200.))
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(self.search_editor.clone()),
+                    )
+                    .child(
+                        Button::new("dbt-export-csv", "Export CSV").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.export_csv(window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        Button::new("dbt-column-picker-toggle", "Columns")
+                            .toggle_state(self.show_column_picker)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_column_picker = !this.show_column_picker;
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("dbt-view-results", "Results")
+                            .toggle_state(self.view == ResultsView::Table)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = ResultsView::Table;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("dbt-view-compiled", "Compiled")
+                            .toggle_state(self.view == ResultsView::Compiled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = ResultsView::Compiled;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("dbt-view-lineage", "Lineage")
+                            .toggle_state(self.view == ResultsView::Lineage)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = ResultsView::Lineage;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        IconButton::new("dbt-open-settings", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Open dbt settings"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::OpenSettingsPage {
+                                        page: "dbt".into(),
+                                        target: None,
+                                    }),
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+    }
+
+    fn graph_mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        // Self-heal: if the button was released and something swallowed the
+        // mouse-up, end the drag rather than sticking to the pointer.
+        if self.graph_drag.is_some() && event.pressed_button != Some(MouseButton::Left) {
+            self.graph_drag = None;
+            cx.notify();
+            return;
+        }
+        // (dragged node, delta) — None node = pan.
+        let (node, delta) = match &mut self.graph_drag {
+            None => return,
+            Some(GraphDrag::Node(name, last)) => {
+                let delta = event.position - *last;
+                *last = event.position;
+                (Some(name.clone()), delta)
+            }
+            Some(GraphDrag::Canvas(last)) => {
+                let delta = event.position - *last;
+                *last = event.position;
+                (None, delta)
+            }
+        };
+        match node {
+            Some(name) => {
+                if delta.x != px(0.) || delta.y != px(0.) {
+                    self.drag_moved = true;
+                }
+                let offset = self.node_offsets.entry(name).or_insert((0., 0.));
+                offset.0 += f32::from(delta.x);
+                offset.1 += f32::from(delta.y);
+            }
+            None => {
+                self.pan.0 += f32::from(delta.x);
+                self.pan.1 += f32::from(delta.y);
+            }
+        }
+        cx.notify();
+    }
+
+    fn graph_end_drag(&mut self, cx: &mut Context<Self>) {
+        self.graph_drag = None;
+        cx.notify();
+    }
+
+    /// The interactive lineage graph in a pannable viewport; shared between
+    /// the Results view (side pane) and the Lineage view.
+    fn render_graph_viewport(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let full_layout = self.lineage_layout.clone()?;
+        let mut degrees: HashMap<String, (bool, bool)> = HashMap::new();
+        for &(from, to) in &full_layout.edges {
+            if let Some(node) = full_layout.nodes.get(from) {
+                degrees.entry(node.name.clone()).or_default().1 = true;
+            }
+            if let Some(node) = full_layout.nodes.get(to) {
+                degrees.entry(node.name.clone()).or_default().0 = true;
+            }
+        }
+        let degrees = Arc::new(degrees);
+        let layout = self.filtered_layout(&full_layout);
+        Some(
+            div()
+                .id(SharedString::from(id.to_owned()))
+                .size_full()
+                .overflow_scroll()
+                .track_scroll(&self.canvas_scroll)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &gpui::MouseDownEvent, _, _| {
+                        this.graph_drag = Some(GraphDrag::Canvas(event.position));
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, event, _, cx| {
+                    this.graph_mouse_move(event, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.graph_end_drag(cx)),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.graph_end_drag(cx)),
+                )
+                .child(self.render_lineage_canvas(layout, degrees, cx))
+                .into_any_element(),
+        )
+    }
+
+    fn materialization_color(materialization: &str, cx: &App) -> gpui::Hsla {
+        let index = match materialization {
+            "table" => 0,
+            "view" => 1,
+            "incremental" => 2,
+            "ephemeral" => 3,
+            "seed" => 4,
+            "snapshot" => 5,
+            "source" => 6,
+            _ => 7,
+        };
+        cx.theme().accents().color_for_index(index)
+    }
+
+    /// Applies the global stream toggles and the per-node collapse state:
+    /// a node is visible when reachable from the model without crossing a
+    /// collapsed handle. Remaining columns are re-anchored to the left edge.
+    fn filtered_layout(&self, layout: &LayoutGraph) -> Arc<LayoutGraph> {
+        let node_count = layout.nodes.len();
+        let Some(center_ix) = layout.nodes.iter().position(|node| node.is_center) else {
+            return Arc::new(layout.clone());
+        };
+        let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        for &(from, to) in &layout.edges {
+            outgoing[from].push(to);
+            incoming[to].push(from);
+        }
+
+        let mut visible = vec![false; node_count];
+        visible[center_ix] = true;
+        for upstream in [true, false] {
+            if upstream && !self.show_upstream || !upstream && !self.show_downstream {
+                continue;
+            }
+            let collapsed = if upstream {
+                &self.collapsed_up
+            } else {
+                &self.collapsed_down
+            };
+            let mut stack = vec![center_ix];
+            while let Some(ix) = stack.pop() {
+                if collapsed.contains(layout.nodes[ix].name.as_str()) {
+                    continue;
+                }
+                let links = if upstream { &incoming[ix] } else { &outgoing[ix] };
+                for &linked in links {
+                    if !visible[linked] {
+                        visible[linked] = true;
+                        stack.push(linked);
+                    }
+                }
+            }
+        }
+
+        log::info!(
+            "dbt lineage: visibility {}/{} nodes (show_up={} show_down={} collapsed_up={:?} collapsed_down={:?})",
+            visible.iter().filter(|visible| **visible).count(),
+            node_count,
+            self.show_upstream,
+            self.show_downstream,
+            self.collapsed_up,
+            self.collapsed_down,
+        );
+        let mut index_map = vec![None; node_count];
+        let mut nodes = Vec::new();
+        for (ix, node) in layout.nodes.iter().enumerate() {
+            if visible[ix] {
+                index_map[ix] = Some(nodes.len());
+                let mut node = node.clone();
+                // Semantic zoom: columns collapse away when zoomed out.
+                let columns_visible = self.show_columns && self.zoom >= 0.85;
+                if columns_visible && !node.columns.is_empty() {
+                    let shown = node.columns.len().min(GRAPH_MAX_COLUMNS);
+                    let more = usize::from(node.columns.len() > GRAPH_MAX_COLUMNS);
+                    node.height =
+                        GRAPH_NODE_HEIGHT + 4. + (shown + more) as f32 * GRAPH_COLUMN_ROW_HEIGHT;
+                    // Widen the box to fit its longest visible column name.
+                    let longest = node
+                        .columns
+                        .iter()
+                        .take(GRAPH_MAX_COLUMNS)
+                        .map(|column| column.len())
+                        .max()
+                        .unwrap_or(0);
+                    node.width = node.width.max((28. + 7.2 * longest as f32).min(340.));
+                } else {
+                    node.height = GRAPH_NODE_HEIGHT;
+                }
+                nodes.push(node);
+            }
+        }
+
+        // Re-stack each level vertically (heights vary when columns show).
+        let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+        for (ix, node) in nodes.iter().enumerate() {
+            groups.entry(node.level).or_default().push(ix);
+        }
+        let mut content_height = 0.0_f32;
+        for group in groups.values() {
+            let group_height: f32 = group
+                .iter()
+                .map(|&ix| nodes[ix].height + GRAPH_ROW_GAP)
+                .sum::<f32>()
+                - GRAPH_ROW_GAP;
+            content_height = content_height.max(group_height);
+        }
+        for group in groups.values() {
+            let group_height: f32 = group
+                .iter()
+                .map(|&ix| nodes[ix].height + GRAPH_ROW_GAP)
+                .sum::<f32>()
+                - GRAPH_ROW_GAP;
+            let mut y = GRAPH_PADDING + (content_height - group_height) / 2.;
+            for &ix in group {
+                nodes[ix].y = y;
+                y += nodes[ix].height + GRAPH_ROW_GAP;
+            }
+        }
+
+        // Re-space levels horizontally too — widths vary when columns show,
+        // and hidden levels compact away.
+        let mut x = GRAPH_PADDING;
+        for group in groups.values() {
+            let level_width = group
+                .iter()
+                .map(|&ix| nodes[ix].width)
+                .fold(80.0_f32, f32::max);
+            for &ix in group {
+                nodes[ix].x = x;
+            }
+            x += level_width + GRAPH_COL_GAP;
+        }
+        let width = x - GRAPH_COL_GAP + GRAPH_PADDING;
+
+        let edges = layout
+            .edges
+            .iter()
+            .filter_map(|&(from, to)| Some((index_map[from]?, index_map[to]?)))
+            .collect();
+        Arc::new(LayoutGraph {
+            nodes,
+            edges,
+            width,
+            height: content_height + 2. * GRAPH_PADDING,
+        })
+    }
+
+    fn render_lineage_canvas(
+        &self,
+        layout: Arc<LayoutGraph>,
+        degrees: Arc<HashMap<String, (bool, bool)>>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().colors();
+        let edge_color = theme.text_muted;
+        let node_bg = theme.elevated_surface_background;
+        let center_border = theme.text_accent;
+        let text_color = theme.text;
+        let muted_color = theme.text_muted;
+        let name_text_size = px((13. * self.zoom).clamp(8., 22.));
+        let column_text_size = px((11. * self.zoom).clamp(7., 18.));
+
+        // Single source of truth: drag offsets are baked into node positions
+        // once, and both the edge canvas and the node elements read from the
+        // same positioned set — they can never disagree.
+        let zoom = self.zoom;
+        let header_height = GRAPH_NODE_HEIGHT * zoom;
+        let column_row_height = GRAPH_COLUMN_ROW_HEIGHT * zoom;
+        let mut positioned = (*layout).clone();
+        for node in &mut positioned.nodes {
+            // Zoom scales geometry; pan and drag offsets are screen-space.
+            node.x = node.x * zoom + self.pan.0;
+            node.y = node.y * zoom + self.pan.1;
+            node.width *= zoom;
+            node.height *= zoom;
+            if let Some(&(dx, dy)) = self.node_offsets.get(&node.name) {
+                node.x += dx;
+                node.y += dy;
+            }
+        }
+        let positioned = Arc::new(positioned);
+
+        let edge_nodes = positioned.clone();
+        let show_columns = self.show_columns;
+        let selected_column = self.selected_column.clone();
+        let accent = center_border;
+        let mut column_edge_color = edge_color;
+        column_edge_color.a *= if selected_column.is_some() { 0.2 } else { 0.45 };
+
+        let edges = canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, _| {
+                let draw_curve =
+                    |window: &mut Window, start: Point<Pixels>, end: Point<Pixels>, width: f32, color| {
+                        let mid_x = (start.x + end.x) / 2.;
+                        let mid = point(mid_x, (start.y + end.y) / 2.);
+                        let mut builder = PathBuilder::stroke(px(width));
+                        builder.move_to(start);
+                        builder.curve_to(mid, point(mid_x, start.y));
+                        builder.curve_to(end, point(mid_x, end.y));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, color);
+                        }
+                    };
+                let draw_arrow = |window: &mut Window, end: Point<Pixels>, color| {
+                    let mut arrow = PathBuilder::fill();
+                    arrow.move_to(end);
+                    arrow.line_to(point(end.x - px(7.), end.y - px(4.)));
+                    arrow.line_to(point(end.x - px(7.), end.y + px(4.)));
+                    if let Ok(path) = arrow.build() {
+                        window.paint_path(path, color);
+                    }
+                };
+
+                for &(from_ix, to_ix) in &edge_nodes.edges {
+                    let (Some(from), Some(to)) =
+                        (edge_nodes.nodes.get(from_ix), edge_nodes.nodes.get(to_ix))
+                    else {
+                        continue;
+                    };
+                    // Edges start flush at the source border (emerging from
+                    // behind its handle when present); the arrow end is inset
+                    // only where the target actually shows a collapse handle.
+                    let end_inset = if to.level <= 0 { 12. } else { 2. };
+                    let start = point(
+                        bounds.origin.x + px(from.x + from.width),
+                        bounds.origin.y + px(from.y + header_height / 2.),
+                    );
+                    let end = point(
+                        bounds.origin.x + px(to.x - end_inset),
+                        bounds.origin.y + px(to.y + header_height / 2.),
+                    );
+                    draw_curve(window, start, end, 1.5, edge_color);
+                    draw_arrow(window, end, edge_color);
+
+                    // Column-level lineage: same-named columns on connected
+                    // nodes get a thin edge from row to row.
+                    if show_columns && !from.columns.is_empty() && !to.columns.is_empty() {
+                        let to_rows: HashMap<String, usize> = to
+                            .columns
+                            .iter()
+                            .take(GRAPH_MAX_COLUMNS)
+                            .enumerate()
+                            .map(|(row, name)| (name.to_lowercase(), row))
+                            .collect();
+                        for (from_row, column) in
+                            from.columns.iter().take(GRAPH_MAX_COLUMNS).enumerate()
+                        {
+                            let column_lower = column.to_lowercase();
+                            let Some(&to_row) = to_rows.get(&column_lower) else {
+                                continue;
+                            };
+                            let row_y = |node: &_, row: usize| {
+                                let node: &crate::lineage::GraphLayoutNode = node;
+                                node.y
+                                    + header_height
+                                    + 2. * zoom
+                                    + (row as f32 + 0.5) * column_row_height
+                            };
+                            let start = point(
+                                bounds.origin.x + px(from.x + from.width),
+                                bounds.origin.y + px(row_y(from, from_row)),
+                            );
+                            let end = point(
+                                bounds.origin.x + px(to.x),
+                                bounds.origin.y + px(row_y(to, to_row)),
+                            );
+                            // The selected column's transformation path lights
+                            // up in accent with direction arrows.
+                            let is_selected =
+                                selected_column.as_deref() == Some(column_lower.as_str());
+                            if is_selected {
+                                draw_curve(window, start, end, 2.0, accent);
+                                draw_arrow(window, end, accent);
+                            } else {
+                                draw_curve(window, start, end, 1.0, column_edge_color);
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .size_full();
+
+        let workspace = self.workspace.clone();
+        div()
+            .id("dbt-lineage-content")
+            .relative()
+            .w(px(layout.width * zoom))
+            .h(px(layout.height * zoom))
+            .child(edges)
+            .children(positioned.nodes.clone().into_iter().enumerate().map(|(ix, node)| {
+                let path = node.path.clone();
+                let workspace = workspace.clone();
+                let materialization_color =
+                    Self::materialization_color(&node.materialization, cx);
+                let shown_columns = if self.show_columns && zoom >= 0.85 {
+                    node.columns.len().min(GRAPH_MAX_COLUMNS)
+                } else {
+                    0
+                };
+                let more_columns = node.columns.len().saturating_sub(shown_columns);
+
+                div()
+                    .id(SharedString::from(format!("dbt-graph-node-{ix}")))
+                    .absolute()
+                    .left(px(node.x))
+                    .top(px(node.y))
+                    .w(px(node.width))
+                    .h(px(node.height))
+                    .rounded_md()
+                    .bg(node_bg)
+                    .map(|this| {
+                        if node.is_center {
+                            this.border_2()
+                        } else {
+                            this.border_1()
+                        }
+                    })
+                    .border_color(materialization_color)
+                    // The browsed model glows so it's findable at a glance.
+                    .when(node.is_center, |this| {
+                        let mut glow = center_border;
+                        glow.a = 0.45;
+                        this.shadow(vec![gpui::BoxShadow {
+                            color: glow,
+                            offset: point(px(0.), px(0.)),
+                            blur_radius: px(18.),
+                            spread_radius: px(4.),
+                            inset: false,
+                        }])
+                    })
+                    .hover(|style| style.border_color(center_border))
+                    .cursor_pointer()
+                    .child(
+                        v_flex()
+                            .size_full()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(header_height - 2.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    // Split the table name from the column list.
+                                    .when(shown_columns > 0, |this| {
+                                        this.border_b_1()
+                                            .border_color(cx.theme().colors().border)
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(name_text_size)
+                                            .text_color(if node.is_center {
+                                                center_border
+                                            } else {
+                                                text_color
+                                            })
+                                            .child(SharedString::from(node.name.clone())),
+                                    ),
+                            )
+                            .when(shown_columns > 0, |this| {
+                                this.children(
+                                    node.columns.iter().take(shown_columns).enumerate().map(
+                                        |(row, column)| {
+                                            let column_lower = column.to_lowercase();
+                                            let is_selected = self.selected_column.as_deref()
+                                                == Some(column_lower.as_str());
+                                            let mut selected_bg = center_border;
+                                            selected_bg.a = 0.16;
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "dbt-col-{ix}-{row}"
+                                                )))
+                                                .w_full()
+                                                .h(px(column_row_height))
+                                                .px_2()
+                                                .flex()
+                                                .items_center()
+                                                .cursor_pointer()
+                                                .when(is_selected, |this| this.bg(selected_bg))
+                                                .hover(|style| style.bg(selected_bg))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    |_, _, cx| cx.stop_propagation(),
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if this.selected_column.as_deref()
+                                                        == Some(column_lower.as_str())
+                                                    {
+                                                        this.selected_column = None;
+                                                    } else {
+                                                        this.selected_column =
+                                                            Some(column_lower.clone());
+                                                    }
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .text_size(column_text_size)
+                                                        .text_color(if is_selected {
+                                                            center_border
+                                                        } else {
+                                                            muted_color
+                                                        })
+                                                        .child(SharedString::from(
+                                                            column.clone(),
+                                                        )),
+                                                )
+                                        },
+                                    ),
+                                )
+                                .when(more_columns > 0, |this| {
+                                    this.child(
+                                        div().w_full().h(px(column_row_height)).px_2().child(
+                                            div()
+                                                .text_size(column_text_size)
+                                                .text_color(muted_color)
+                                                .child(SharedString::from(format!(
+                                                    "+{more_columns} more"
+                                                ))),
+                                        ),
+                                    )
+                                })
+                            }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let name = node.name.clone();
+                            move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.drag_moved = false;
+                                this.graph_drag =
+                                    Some(GraphDrag::Node(name.clone(), event.position));
+                                cx.stop_propagation();
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if std::mem::take(&mut this.drag_moved) {
+                            return;
+                        }
+                        let Some(path) = path.clone() else {
+                            return;
+                        };
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path,
+                                        workspace::OpenOptions::default(),
+                                        window,
+                                        cx,
+                                    )
+                                    .detach();
+                            })
+                            .ok();
+                    }))
+            }))
+            // Floating collapse/expand handles: siblings of the nodes, so they
+            // never interfere with node dragging or get clipped by node bounds.
+            .children(positioned.nodes.iter().enumerate().flat_map(|(ix, node)| {
+                let (has_upstream, has_downstream) =
+                    degrees.get(&node.name).copied().unwrap_or((false, false));
+                let materialization_color =
+                    Self::materialization_color(&node.materialization, cx);
+                let mut handles = Vec::new();
+                let mut push_handle = |suffix: &'static str,
+                                       anchor_x: f32,
+                                       collapsed: bool,
+                                       upstream: bool| {
+                    let name = node.name.clone();
+                    handles.push(
+                        div()
+                            .id(SharedString::from(format!("dbt-handle-{suffix}-{ix}")))
+                            .absolute()
+                            .left(px(anchor_x - 9.))
+                            .top(px(node.y + header_height / 2. - 9.))
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(node_bg)
+                            .border_1()
+                            .border_color(materialization_color)
+                            .shadow_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(center_border))
+                            .child(
+                                Label::new(if collapsed { "+" } else { "−" })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            // Handle presses must not start a canvas pan.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let set = if upstream {
+                                    &mut this.collapsed_up
+                                } else {
+                                    &mut this.collapsed_down
+                                };
+                                if !set.remove(&name) {
+                                    set.insert(name.clone());
+                                }
+                                log::info!(
+                                    "dbt lineage: toggled {} collapse for {name}; up={:?} down={:?}",
+                                    if upstream { "upstream" } else { "downstream" },
+                                    this.collapsed_up,
+                                    this.collapsed_down,
+                                );
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                };
+                // Only the handle pointing away from the model is meaningful:
+                // collapsing toward the center can never hide anything.
+                if has_upstream && node.level <= 0 {
+                    push_handle("up", node.x, self.collapsed_up.contains(&node.name), true);
+                }
+                if has_downstream && node.level >= 0 {
+                    push_handle(
+                        "down",
+                        node.x + node.width,
+                        self.collapsed_down.contains(&node.name),
+                        false,
+                    );
+                }
+                handles
+            }))
+            .into_any_element()
+    }
+
+    fn render_tree_rows(
+        &self,
+        id_prefix: &'static str,
+        nodes: &[LineageTreeNode],
+        depth: usize,
+        rows: &mut Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        for tree_node in nodes {
+            let key: SharedString =
+                format!("{id_prefix}:{depth}:{}", tree_node.node.name).into();
+            let is_expanded = self.expanded.contains(&key);
+            let expandable = !tree_node.children.is_empty();
+
+            let workspace = self.workspace.clone();
+            let path = tree_node.node.path.clone();
+            let row = h_flex()
+                .pl(px(depth as f32 * 16.))
+                .gap_1()
+                .when(expandable, |this| {
+                    this.child(
+                        IconButton::new(
+                            key.clone(),
+                            if is_expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener({
+                            let key = key.clone();
+                            move |this, _, _, cx| {
+                                if !this.expanded.remove(&key) {
+                                    this.expanded.insert(key.clone());
+                                }
+                                cx.notify();
+                            }
+                        })),
+                    )
+                })
+                .when(!expandable, |this| this.child(div().w(px(22.))))
+                .child(
+                    Button::new(
+                        SharedString::from(format!("open:{key}")),
+                        format!(
+                            "{} ({}){}",
+                            tree_node.node.name,
+                            tree_node.node.kind,
+                            if tree_node.truncated { " …" } else { "" }
+                        ),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let Some(path) = path.clone() else {
+                            return;
+                        };
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        path,
+                                        workspace::OpenOptions::default(),
+                                        window,
+                                        cx,
+                                    )
+                                    .detach();
+                            })
+                            .ok();
+                    }),
+                );
+            rows.push(row.into_any_element());
+
+            if is_expanded {
+                self.render_tree_rows(id_prefix, &tree_node.children, depth + 1, rows, cx);
+            }
+        }
+    }
+
+    fn render_tree_section(
+        &self,
+        id_prefix: &'static str,
+        title: &'static str,
+        nodes: &[LineageTreeNode],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let section_key: SharedString = format!("{id_prefix}:section").into();
+        let collapsed = self.expanded.contains(&section_key);
+        let mut rows = Vec::new();
+        if !collapsed {
+            self.render_tree_rows(id_prefix, nodes, 0, &mut rows, cx);
+        }
+        v_flex()
+            .flex_1()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new(
+                            section_key.clone(),
+                            if collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener({
+                            let key = section_key.clone();
+                            move |this, _, _, cx| {
+                                if !this.expanded.remove(&key) {
+                                    this.expanded.insert(key.clone());
+                                }
+                                cx.notify();
+                            }
+                        })),
+                    )
+                    .child(
+                        Label::new(format!("{title} ({})", nodes.len()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(!collapsed && nodes.is_empty(), |this| {
+                this.child(Label::new("—").color(Color::Muted).size(LabelSize::Small))
+            })
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.view == ResultsView::Lineage {
+            let lineage_tree = self.lineage_tree.clone();
+            return match lineage_tree {
+                Some(tree) => h_flex()
+                    .size_full()
+                    .items_start()
+                    .when_some(self.lineage_layout.clone(), |this, full_layout| {
+                        let layout = self.filtered_layout(&full_layout);
+                        let mut legend: Vec<SharedString> = Vec::new();
+                        for node in &layout.nodes {
+                            let materialization: SharedString =
+                                node.materialization.clone().into();
+                            if !legend.contains(&materialization) {
+                                legend.push(materialization);
+                            }
+                        }
+                        this.child(
+                            v_flex()
+                                .flex_1()
+                                .h_full()
+                                // Allow shrinking below intrinsic content width
+                                // so the tree sidebar stays on screen and the
+                                // legend wraps instead of clipping.
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(
+                                    h_flex()
+                                        .p_1()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .border_b_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .child(
+                                            Button::new("dbt-toggle-up", "Upstream")
+                                                .toggle_state(self.show_upstream)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_upstream = !this.show_upstream;
+                                                    log::info!(
+                                                        "dbt lineage: global upstream -> {}",
+                                                        this.show_upstream
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("dbt-toggle-down", "Downstream")
+                                                .toggle_state(self.show_downstream)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_downstream =
+                                                        !this.show_downstream;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("dbt-toggle-columns", "Columns")
+                                                .toggle_state(self.show_columns)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.show_columns = !this.show_columns;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("dbt-arrange", "Arrange")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.node_offsets.clear();
+                                                    this.pan = (0., 0.);
+                                                    this.zoom = 1.0;
+                                                    this.graph_drag = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("dbt-zoom-out", "−").on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.zoom =
+                                                        (this.zoom / 1.2).clamp(0.4, 2.0);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            Label::new(format!(
+                                                "{}%",
+                                                (self.zoom * 100.).round() as i32
+                                            ))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Button::new("dbt-zoom-in", "+").on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.zoom =
+                                                        (this.zoom * 1.2).clamp(0.4, 2.0);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            IconButton::new(
+                                                "dbt-toggle-tree",
+                                                if self.show_tree {
+                                                    IconName::ThreadsSidebarRightOpen
+                                                } else {
+                                                    IconName::ThreadsSidebarRightClosed
+                                                },
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .tooltip(ui::Tooltip::text(
+                                                "Show/hide the lineage tree",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_tree = !this.show_tree;
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .children(legend.into_iter().map(|materialization| {
+                                            let color = Self::materialization_color(
+                                                &materialization,
+                                                cx,
+                                            );
+                                            h_flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    div()
+                                                        .w_2()
+                                                        .h_2()
+                                                        .rounded_full()
+                                                        .bg(color),
+                                                )
+                                                .child(
+                                                    Label::new(materialization)
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                        })),
+                                )
+                                .child(
+                                    div().flex_1().w_full().children(
+                                        self.render_graph_viewport("dbt-lineage-canvas", cx),
+                                    ),
+                                ),
+                        )
+                    })
+                    .when(self.show_tree, |this| {
+                        this.child(
+                            div()
+                                .id("dbt-lineage-tree")
+                                .w(px(320.))
+                                .h_full()
+                                .flex_none()
+                                .p_2()
+                                .border_l_1()
+                                .border_color(cx.theme().colors().border)
+                                .overflow_y_scroll()
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .child(self.render_tree_section(
+                                            "dbt-lineage-up",
+                                            "Upstream",
+                                            &tree.up,
+                                            cx,
+                                        ))
+                                        .child(self.render_tree_section(
+                                            "dbt-lineage-down",
+                                            "Downstream",
+                                            &tree.down,
+                                            cx,
+                                        )),
+                                ),
+                        )
+                    })
+                    .into_any_element(),
+                None => v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Label::new(
+                            "Run a model (cmd-enter) to see its lineage — requires target/manifest.json (dbt parse)",
+                        )
+                        .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            };
+        }
+
+        if self.view == ResultsView::Compiled {
+            if let Some(editor) = &self.compiled_editor {
+                return div().size_full().child(editor.clone()).into_any_element();
+            }
+            let text: SharedString = match &self.state {
+                ResultsState::Loaded { compiled: None, .. } => {
+                    "No compiled SQL was captured for this run.".into()
+                }
+                _ => "Run a model or selection first (cmd-enter).".into(),
+            };
+            return div()
+                .id("dbt-compiled-sql")
+                .size_full()
+                .p_2()
+                .overflow_y_scroll()
+                .child(Label::new(text).size(LabelSize::Small).buffer_font(cx))
+                .into_any_element();
+        }
+
+        match &self.state {
+            ResultsState::Empty => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new("Open a dbt model and press cmd-enter to show its data")
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            ResultsState::Running { model } => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(
+                    Label::new(format!("Running dbt show --select {model}…")).color(Color::Muted),
+                )
+                .into_any_element(),
+            ResultsState::Failed { message, .. } => v_flex()
+                .size_full()
+                .p_2()
+                .overflow_hidden()
+                .child(Label::new(message.clone()).color(Color::Error))
+                .into_any_element(),
+            ResultsState::Loaded { columns, rows, .. } => {
+                if columns.is_empty() {
+                    return v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .child(Label::new("Query returned no rows").color(Color::Muted))
+                        .into_any_element();
+                }
+                let indices = Arc::new(self.display_indices(rows, cx));
+                let rows = rows.clone();
+                let display_rows = indices.clone();
+                let mut headers =
+                    vec![Label::new("#").color(Color::Muted).into_any_element()];
+                headers.extend(columns.iter().enumerate().map(|(ix, column)| {
+                        let indicator = match self.sort {
+                            Some((sorted, true)) if sorted == ix => " ▲",
+                            Some((sorted, false)) if sorted == ix => " ▼",
+                            _ => "",
+                        };
+                        // Only the label is clickable, so the resize handles
+                        // on the column boundaries stay easy to grab.
+                        h_flex()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("dbt-sort-{ix}")))
+                                    .cursor_pointer()
+                                    .child(Label::new(format!("{column}{indicator}")))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.sort = match this.sort {
+                                            Some((sorted, true)) if sorted == ix => {
+                                                Some((ix, false))
+                                            }
+                                            Some((sorted, false)) if sorted == ix => None,
+                                            _ => Some((ix, true)),
+                                        };
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element()
+                    }));
+                let column_mask: Vec<bool> = std::iter::once(false)
+                    .chain(
+                        columns
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, _)| self.hidden_columns.contains(&ix)),
+                    )
+                    .collect();
+                let table = div()
+                    .flex_1()
+                    .h_full()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(
+                        Table::new(columns.len() + 1)
+                            .striped()
+                            .pin_cols(1)
+                            .column_filter(ui::table_row::TableRow::from_vec(
+                                column_mask,
+                                columns.len() + 1,
+                            ))
+                            .interactable(&self.table_interaction)
+                            .map(|table| match &self.column_widths {
+                                Some(state)
+                                    if state.read(cx).cols() == columns.len() + 1 =>
+                                {
+                                    table.width_config(ColumnWidthConfig::Resizable(
+                                        state.clone(),
+                                    ))
+                                }
+                                _ => table,
+                            })
+                            .header(headers)
+                            .uniform_list(
+                                "dbt-results-rows",
+                                display_rows.len(),
+                                move |range, _, _| {
+                                    range
+                                        .filter_map(|display_ix| {
+                                            let original = *display_rows.get(display_ix)?;
+                                            let row = rows.get(original)?;
+                                            let mut cells: Vec<gpui::AnyElement> =
+                                                Vec::with_capacity(row.len() + 1);
+                                            cells.push(
+                                                Label::new(format!("{}", original + 1))
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                                    .into_any_element(),
+                                            );
+                                            cells.extend(row.iter().map(|cell| {
+                                                Label::new(cell.clone())
+                                                    .size(LabelSize::Small)
+                                                    .into_any_element()
+                                            }));
+                                            Some(cells)
+                                        })
+                                        .collect()
+                                },
+                            ),
+                    );
+                h_flex()
+                    .size_full()
+                    .child(table)
+                    .when(self.show_column_picker, |this| {
+                        this.child(
+                            div()
+                                .id("dbt-column-picker")
+                                .w(px(220.))
+                                .h_full()
+                                .flex_none()
+                                .p_2()
+                                .border_l_1()
+                                .border_color(cx.theme().colors().border)
+                                .overflow_y_scroll()
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            Label::new("Show columns")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .children(columns.iter().enumerate().map(
+                                            |(ix, column)| {
+                                                let hidden =
+                                                    self.hidden_columns.contains(&ix);
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        ui::Checkbox::new(
+                                                            ("dbt-col-visible", ix),
+                                                            if hidden {
+                                                                ui::ToggleState::Unselected
+                                                            } else {
+                                                                ui::ToggleState::Selected
+                                                            },
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                if !this
+                                                                    .hidden_columns
+                                                                    .remove(&ix)
+                                                                {
+                                                                    this.hidden_columns
+                                                                        .insert(ix);
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                    )
+                                                    .child(
+                                                        Label::new(column.clone())
+                                                            .size(LabelSize::Small),
+                                                    )
+                                            },
+                                        )),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
+    }
+}
+
+/// Resolves the profiles directory: the explicit setting when present,
+/// otherwise auto-detected in-project profile locations (`local_profiles/`,
+/// `profiles/`, `.dbt/`). A root-level profiles.yml needs nothing — dbt finds
+/// it via the working directory.
+fn resolve_profiles_dir(
+    settings: &DbtSettings,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Some(dir) = &settings.profiles_dir {
+        let path = if std::path::Path::new(dir).is_absolute() {
+            PathBuf::from(dir)
+        } else {
+            root.join(dir)
+        };
+        return Some(path);
+    }
+    ["local_profiles", "profiles", ".dbt"]
+        .iter()
+        .map(|candidate| root.join(candidate))
+        .find(|dir| dir.join("profiles.yml").is_file())
+}
+
+/// Loads KEY=VALUE pairs from the project's `.env` / `.env.local` (dotenv
+/// style: `export` prefixes, quoted values, `#` comments). Values are only
+/// ever placed into the spawned dbt process environment — never logged or
+/// persisted — and variables already exported in the real environment are
+/// left untouched.
+fn merge_env_file(path: &std::path::Path, vars: &mut Vec<(String, String)>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        vars.retain(|(existing, _)| existing != key);
+        vars.push((key.to_owned(), value.to_owned()));
+    }
+}
+
+fn load_dotenv(root: &std::path::Path, env_file: Option<&str>) -> Vec<(String, String)> {
+    // Search the project root and its ancestors up to the git repo root (a
+    // dbt project often lives in a subdirectory of the repo, with .env at the
+    // top). Never walk past .git — outer files load first so inner override.
+    let mut dirs = vec![root.to_path_buf()];
+    let mut cursor = root.to_path_buf();
+    let mut found_repo = root.join(".git").exists();
+    for _ in 0..5 {
+        if found_repo {
+            break;
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent.to_path_buf();
+        dirs.push(cursor.clone());
+        found_repo = cursor.join(".git").exists();
+    }
+    if !found_repo {
+        dirs.truncate(1);
+    }
+    dirs.reverse();
+
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for dir in &dirs {
+        merge_env_file(&dir.join(".env"), &mut vars);
+        merge_env_file(&dir.join(".env.local"), &mut vars);
+    }
+    // An explicitly configured env file loads last (overriding discovery).
+    if let Some(env_file) = env_file {
+        let path = if std::path::Path::new(env_file).is_absolute() {
+            PathBuf::from(env_file)
+        } else {
+            root.join(env_file)
+        };
+        if path.is_file() {
+            merge_env_file(&path, &mut vars);
+        } else {
+            log::warn!("dbt: configured env_file not found: {}", path.display());
+        }
+    }
+    vars
+}
+
+/// Applies the settings-driven target, profiles dir, and environment to a dbt
+/// invocation.
+fn apply_common_args(
+    command: &mut util::command::Command,
+    settings: &DbtSettings,
+    root: &std::path::Path,
+) {
+    if let Some(dbt_target) = &settings.target {
+        command.args(["--target", dbt_target]);
+    }
+    if let Some(profiles_dir) = resolve_profiles_dir(settings, root) {
+        command.arg("--profiles-dir");
+        command.arg(profiles_dir);
+    }
+    let dotenv = load_dotenv(root, settings.env_file.as_deref());
+    if !dotenv.is_empty() {
+        // Names only would still leak project structure; log just the count.
+        log::info!("dbt: loaded {} variable(s) from project .env", dotenv.len());
+    }
+    command.envs(dotenv);
+    // Explicit settings override .env.
+    command.envs(settings.env.iter().map(|(key, value)| (key.clone(), value.clone())));
+}
+
+/// Runs `dbt compile` for the same target and returns the compiled SQL:
+/// for models, read from `target/compiled/<project>/<rel_path>`; for inline
+/// queries, parsed from stdout.
+async fn fetch_compiled_sql(
+    settings: &DbtSettings,
+    target: &ShowTarget,
+    root: &std::path::Path,
+) -> Option<String> {
+    let mut command = new_command(&settings.binary);
+    command.arg("compile");
+    match target {
+        ShowTarget::Model { name, .. } => {
+            command.args(["--select", name.as_ref()]);
+        }
+        ShowTarget::Inline(sql) => {
+            command.args(["--inline", sql]);
+        }
+    }
+    apply_common_args(&mut command, settings, root);
+    let output = command.current_dir(root).output().await.ok()?;
+
+    match target {
+        ShowTarget::Model { rel_path, .. } => {
+            let compiled_root = root.join("target").join("compiled");
+            for entry in std::fs::read_dir(&compiled_root).ok()?.flatten() {
+                let candidate = entry.path().join(rel_path);
+                if let Ok(text) = std::fs::read_to_string(&candidate) {
+                    return Some(text.trim().to_owned());
+                }
+            }
+            None
+        }
+        ShowTarget::Inline(_) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut collected = Vec::new();
+            let mut in_sql = false;
+            for line in stdout.lines() {
+                if in_sql {
+                    if line.starts_with("New version")
+                        || line.starts_with("====")
+                        || line.starts_with("Finished")
+                    {
+                        break;
+                    }
+                    collected.push(line);
+                } else if line.trim() == "Compiled inline node is:" {
+                    in_sql = true;
+                }
+            }
+            let compiled = collected.join("\n").trim().to_owned();
+            (!compiled.is_empty()).then_some(compiled)
+        }
+    }
+}
+
+fn parse_show_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    success: bool,
+) -> Result<(Vec<SharedString>, Vec<Vec<SharedString>>)> {
+    let stdout_str = String::from_utf8_lossy(stdout);
+    for line in stdout_str.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+        let Ok(serde_json::Value::Array(json_rows)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        else {
+            continue;
+        };
+        let columns: Vec<SharedString> = json_rows
+            .first()
+            .and_then(|row| row.as_object())
+            .map(|object| object.keys().map(|key| SharedString::from(key.clone())).collect())
+            .unwrap_or_default();
+        let rows = json_rows
+            .iter()
+            .filter_map(|row| row.as_object())
+            .map(|object| {
+                columns
+                    .iter()
+                    .map(|column| match object.get(column.as_ref()) {
+                        None | Some(serde_json::Value::Null) => SharedString::default(),
+                        Some(serde_json::Value::String(value)) => {
+                            SharedString::from(value.clone())
+                        }
+                        Some(other) => SharedString::from(other.to_string()),
+                    })
+                    .collect()
+            })
+            .collect();
+        return Ok((columns, rows));
+    }
+
+    if success {
+        anyhow::bail!("no result rows found in dbt show output:\n{stdout_str}");
+    }
+    anyhow::bail!(
+        "dbt show failed:\n{stdout_str}\n{}",
+        String::from_utf8_lossy(stderr)
+    );
+}
+
+impl EventEmitter<PanelEvent> for DbtResultsPanel {}
+
+impl Focusable for DbtResultsPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for DbtResultsPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("DbtResultsPanel")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .child(self.render_toolbar(cx))
+            .child(self.render_body(cx))
+    }
+}
+
+impl Panel for DbtResultsPanel {
+    fn persistent_name() -> &'static str {
+        "dbt Results Panel"
+    }
+
+    fn panel_key() -> &'static str {
+        "DbtResultsPanel"
+    }
+
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Bottom
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Bottom)
+    }
+
+    fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        px(280.)
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        Some(IconName::Table)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("dbt Results Panel")
+    }
+
+    fn toggle_action(&self) -> Box<dyn gpui::Action> {
+        Box::new(ToggleFocus)
+    }
+
+    fn activation_priority(&self) -> u32 {
+        8
+    }
+}
