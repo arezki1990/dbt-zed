@@ -87,10 +87,17 @@ script/generate-licenses
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
+cargo build ${build_flag} --package zed --package cli --target $target_triple ${ZED_MAC_EXTRA_FEATURES:+--features "$ZED_MAC_EXTRA_FEATURES"}
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
+cargo build ${build_flag} --package remote_server --target $target_triple ${ZED_MAC_EXTRA_FEATURES:+--features "$ZED_MAC_EXTRA_FEATURES"}
+
+# With extra features (e.g. gpui_platform/runtime_shaders on machines without
+# the Metal offline toolchain), cargo-bundle's own featureless rebuild would
+# fail; bundle from the binaries built above instead.
+if [[ -n "${ZED_MAC_EXTRA_FEATURES:-}" ]]; then
+    export CARGO_BUNDLE_SKIP_BUILD=true
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
