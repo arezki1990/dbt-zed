@@ -1,49 +1,80 @@
-# Zed
+# dbt-zed
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+A personal **dbt IDE** built as a fork of [Zed](https://zed.dev)
+([zed-industries/zed](https://github.com/zed-industries/zed), forked at tag
+`v1.17.2`). It adds first-class, native dbt support directly into the editor —
+no webviews, all GPUI.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+> This project is not affiliated with or endorsed by Zed Industries or dbt
+> Labs. "Zed" and "dbt" are trademarks of their respective owners.
 
----
+## Features
 
-### Installation
+- **`dbt SQL` language** — Jinja-aware SQL highlighting via a Jinja host
+  grammar with combined SQL injection; the default for all `.sql` files.
+- **Language server** — prefers dbt Fusion's `dbt lsp` (go-to-definition,
+  hover, completions, diagnostics), falls back to the community Go
+  [`dbt-language-server`](https://github.com/j-clemons/dbt-language-server)
+  with auto-download. Includes a workaround for a Fusion LSP bug where the
+  server exits on `workspace/didChangeConfiguration`.
+- **dbt results panel** (bottom dock):
+  - Run the current model or a **selected SQL chunk** with `cmd+enter`
+    (`dbt show`, Jinja compiled), results in a data grid with sorting,
+    live search, column show/hide, smooth resizable columns, pinned row
+    numbers, horizontal scrolling, and CSV export.
+  - **Compiled SQL** view in a read-only, syntax-highlighted editor.
+  - **Interactive lineage graph** — React-Flow-style canvas: layered layout
+    with crossing reduction, materialization colors, per-node collapse
+    handles, node dragging, whole-graph panning, semantic zoom with scaling
+    text, column-level lineage with click-to-highlight transformation paths,
+    and a collapsible upstream/downstream tree. Backed by a
+    [`sqlitegraph`](https://crates.io/crates/sqlitegraph) database built from
+    `target/manifest.json` + `catalog.json`.
+  - **Browse-driven**: opening any model recenters the lineage; clicking
+    graph nodes opens files.
+- **Project automation** — auto-discovers nested dbt projects
+  (`dbt_project.yml` anywhere in the repo), in-project profiles
+  (`local_profiles/`, `profiles/`, `.dbt/`), `.env`/`.env.local` files up to
+  the repo root (loaded only into the dbt process environment), and runs
+  `dbt parse` + `dbt compile --write-catalog` on first open.
+- **Settings page** — a "dbt" page in Zed's settings UI: show limit, dbt
+  binary, target, profiles dir, project dir, env file, parse-on-load, and
+  lineage depth/node caps.
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+## Requirements
 
-Other platforms are not yet available:
+- macOS (Apple Silicon tested), Rust via rustup, `cmake`.
+- A user-installed **dbt**: [dbt Fusion](https://docs.getdbt.com) (recommended)
+  or dbt Core + the Go language server. dbt is **not** bundled or
+  redistributed by this project; it runs from your `PATH` under dbt Labs'
+  own license.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+## Building
 
-### Developing Zed
+```sh
+cargo build -p zed --features gpui_platform/runtime_shaders
+ZED_RELEASE_CHANNEL=dev ./target/debug/zed /path/to/your/dbt/project
+```
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+(`runtime_shaders` avoids requiring the Xcode Metal offline toolchain.)
 
-### Contributing
+Upstream build docs: [macOS](./docs/src/development/macos.md),
+[Linux](./docs/src/development/linux.md),
+[Windows](./docs/src/development/windows.md).
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+## License
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+Like upstream Zed, this repository is licensed **GPL-3.0** — see
+[LICENSE-GPL](LICENSE-GPL) — with Apache-2.0 components where marked
+(see [LICENSE-APACHE](LICENSE-APACHE)). Vendored third-party code:
 
-### Licensing
+- `vendor/sqlitegraph` — GPL-3.0-only (see its LICENSE and MODIFICATIONS.md);
+  this pins the combined distribution to GPL version 3.
+- `vendor/tree-sitter-jinja2` — MIT (see its LICENSE).
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+Other added dependencies (`layout-rs`, `tree-sitter-sequel`, `rusqlite`) are
+MIT-licensed from crates.io.
 
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
-
+If you distribute binaries of this fork: rename the product and replace the
+icon (the Zed name/logo are trademarks not covered by the GPL), and disable
+auto-update so builds don't replace themselves with official Zed.
