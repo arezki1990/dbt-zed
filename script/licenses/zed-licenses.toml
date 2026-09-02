@@ -5,6 +5,10 @@ private = { ignore = true }
 #
 # * https://opensource.google/documentation/reference/thirdparty/licenses
 accepted = [
+    # This fork (dbt-zed) is distributed under GPL-3.0, so GPL-3.0 dependencies
+    # (vendor/sqlitegraph and its `rio` dependency) are license-compatible.
+    "GPL-3.0",
+    "GPL-3.0-only",
     "Apache-2.0",
     "MIT",
     "MIT-0",
