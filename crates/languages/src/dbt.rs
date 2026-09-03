@@ -75,6 +75,18 @@ impl LspInstaller for DbtLspAdapter {
                 env: None,
             });
         }
+        // dbt Fusion installed by zdbt's dbt.auto_install setting (see
+        // dbt_ui::dbt_install) — the managed binary also serves the LSP.
+        let managed = paths::data_dir()
+            .join("dbt-fusion")
+            .join(format!("dbt{}", std::env::consts::EXE_SUFFIX));
+        if managed.is_file() {
+            return Some(LanguageServerBinary {
+                path: managed,
+                arguments: vec!["lsp".into()],
+                env: None,
+            });
+        }
         // Community Go language server.
         let path = delegate.which(OsStr::new(GO_LSP_BINARY)).await?;
         Some(LanguageServerBinary {

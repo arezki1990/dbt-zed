@@ -128,6 +128,10 @@
   },
   // dbt integration settings
   "dbt": {
+    // Download the official dbt Fusion CLI automatically when no dbt binary is configured or on PATH.
+    "auto_install": true,
+    // Which dbt Fusion build to auto-install: "latest", "dev", "canary", or an explicit version.
+    "fusion_version": "latest",
     // Maximum number of rows fetched by `dbt show` for the dbt results panel.
     "show_limit": 500,
     // The dbt executable used by the dbt results panel (resolved from PATH).

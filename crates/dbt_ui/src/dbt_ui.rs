@@ -1,6 +1,7 @@
 //! Native dbt UI for Zed: a bottom-dock results panel that runs
 //! `dbt show --select <model>` and renders the returned rows as a data table.
 
+pub mod dbt_install;
 pub mod dbt_settings;
 pub mod lineage;
 pub mod results_panel;

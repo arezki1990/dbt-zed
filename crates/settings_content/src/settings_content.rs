@@ -1255,6 +1255,17 @@ pub struct DbtSettingsContent {
     ///
     /// Default: "dbt"
     pub binary: Option<String>,
+    /// Download the official dbt Fusion CLI automatically when no dbt binary
+    /// is configured or found on PATH.
+    ///
+    /// Default: true
+    pub auto_install: Option<bool>,
+    /// Which dbt Fusion build the auto-installer fetches: a release channel
+    /// ("latest", "dev", "canary") or an explicit version such as
+    /// "2.0.0-preview.218".
+    ///
+    /// Default: "latest"
+    pub fusion_version: Option<String>,
     /// The dbt target passed as `--target` to dbt commands run by the results
     /// panel. When empty, the profile's default target is used.
     ///

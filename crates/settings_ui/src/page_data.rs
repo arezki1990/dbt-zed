@@ -8823,7 +8823,7 @@ fn ai_page(cx: &App) -> SettingsPage {
 }
 
 fn dbt_page() -> SettingsPage {
-    fn dbt_section() -> [SettingsPageItem; 11] {
+    fn dbt_section() -> [SettingsPageItem; 13] {
         [
             SettingsPageItem::SectionHeader("dbt"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8860,6 +8860,47 @@ fn dbt_page() -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("dbt"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Auto-Install dbt Fusion",
+                description: "Download the official dbt Fusion CLI automatically when no dbt binary is configured or on PATH.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.auto_install"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.auto_install.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().auto_install = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Fusion Version",
+                description: "Which dbt Fusion build to auto-install: \"latest\", \"dev\", \"canary\", or an explicit version like \"2.0.0-preview.218\".",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.fusion_version"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.fusion_version.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().fusion_version = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("latest"),
                     ..Default::default()
                 })),
                 files: USER,

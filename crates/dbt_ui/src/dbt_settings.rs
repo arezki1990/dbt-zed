@@ -7,6 +7,13 @@ pub struct DbtSettings {
     pub show_limit: u64,
     /// The dbt executable to run.
     pub binary: String,
+    /// Download the official dbt Fusion CLI automatically when no dbt binary
+    /// is configured or on PATH.
+    pub auto_install: bool,
+    /// Which dbt Fusion build the auto-installer fetches: a channel name
+    /// ("latest", "dev", "canary") or an explicit version like
+    /// "2.0.0-preview.218".
+    pub fusion_version: String,
     /// The `--target` to pass, if any.
     pub target: Option<String>,
     /// The `--profiles-dir` to pass, if any.
@@ -36,6 +43,11 @@ impl Settings for DbtSettings {
                 .binary
                 .filter(|binary| !binary.is_empty())
                 .unwrap_or_else(|| "dbt".to_owned()),
+            auto_install: content.auto_install.unwrap_or(true),
+            fusion_version: content
+                .fusion_version
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| "latest".to_owned()),
             target: content.target.filter(|target| !target.is_empty()),
             profiles_dir: content.profiles_dir.filter(|dir| !dir.is_empty()),
             env: content

@@ -13,8 +13,14 @@ path = "src/dbt_ui.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-compression.workspace = true
+async-tar.workspace = true
 editor.workspace = true
+futures.workspace = true
 gpui.workspace = true
+http_client.workspace = true
+paths.workspace = true
+smol.workspace = true
 language.workspace = true
 layout-rs.workspace = true
 project.workspace = true
