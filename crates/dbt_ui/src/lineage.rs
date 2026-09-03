@@ -208,6 +208,9 @@ pub struct GraphLayoutNode {
     pub ops: Option<NodeOps>,
     /// Lowercased column name -> the select-list expression producing it.
     pub col_exprs: std::collections::HashMap<String, String>,
+    /// More parents/children exist beyond the loaded depth or node cap.
+    pub truncated_up: bool,
+    pub truncated_down: bool,
     /// Column names, ordered (from catalog.json when present, else the
     /// documented columns in manifest.json).
     pub columns: Vec<String>,
@@ -312,19 +315,34 @@ impl LineageStore {
         model: &str,
         max_depth: i32,
         max_nodes: usize,
+        expansions: &std::collections::HashSet<String>,
     ) -> Result<LayoutGraph> {
         self.with_loaded(project_root, |loaded| {
             let center = Self::id_for(loaded, model)?;
             let query = GraphQuery::new(&loaded.graph);
+            // Nodes the user expanded past the depth budget get a fresh one.
+            let expansion_ids: std::collections::HashSet<i64> = expansions
+                .iter()
+                .filter_map(|name| Self::id_for(loaded, name).ok())
+                .collect();
 
-            // BFS levels in both directions.
+            // BFS levels in both directions, with a per-node depth budget so
+            // expanded boundary nodes keep growing the graph.
             let mut level_of: HashMap<i64, i32> = HashMap::new();
             level_of.insert(center, 0);
             for upstream in [true, false] {
-                let mut frontier = vec![center];
-                for depth in 1..=max_depth {
+                let mut frontier: Vec<(i64, i32, i32)> = vec![(center, max_depth, 0)];
+                while !frontier.is_empty() {
                     let mut next = Vec::new();
-                    for &id in &frontier {
+                    for &(id, budget, level) in &frontier {
+                        let budget = if expansion_ids.contains(&id) {
+                            budget.max(max_depth)
+                        } else {
+                            budget
+                        };
+                        if budget <= 0 {
+                            continue;
+                        }
                         let linked = if upstream {
                             query.incoming(id)?
                         } else {
@@ -335,15 +353,13 @@ impl LineageStore {
                                 break;
                             }
                             level_of.entry(linked_id).or_insert_with(|| {
-                                next.push(linked_id);
-                                if upstream { -depth } else { depth }
+                                let child_level = if upstream { level - 1 } else { level + 1 };
+                                next.push((linked_id, budget - 1, child_level));
+                                child_level
                             });
                         }
                     }
                     frontier = next;
-                    if frontier.is_empty() {
-                        break;
-                    }
                 }
             }
 
@@ -482,7 +498,17 @@ impl LineageStore {
                     GRAPH_PADDING + (content_height - column.len() as f32 * row_pitch) / 2.;
                 for (row, (id, entity)) in column.iter().enumerate() {
                     index_of.insert(*id, nodes.len());
+                    let truncated_up = query
+                        .incoming(*id)?
+                        .iter()
+                        .any(|parent| !level_of.contains_key(parent));
+                    let truncated_down = query
+                        .outgoing(*id)?
+                        .iter()
+                        .any(|child| !level_of.contains_key(child));
                     nodes.push(GraphLayoutNode {
+                        truncated_up,
+                        truncated_down,
                         name: entity.name.clone(),
                         kind: entity.kind.clone(),
                         materialization: entity

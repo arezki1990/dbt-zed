@@ -157,6 +157,8 @@ pub struct DbtResultsPanel {
     last_root: Option<PathBuf>,
     /// Project roots already auto-parsed this session.
     parsed_roots: HashSet<PathBuf>,
+    /// Nodes expanded past the lineage depth budget via their + handle.
+    depth_expansions: HashSet<String>,
     /// When set, the lineage view shows a DAG focused on this column only.
     column_focus: Option<String>,
     /// Pan/zoom to restore when leaving column focus.
@@ -423,6 +425,7 @@ impl DbtResultsPanel {
                 show_column_picker: false,
                 last_root: None,
                 parsed_roots: Default::default(),
+                depth_expansions: Default::default(),
                 column_focus: None,
                 focus_return: None,
                 context_menu: None,
@@ -609,10 +612,11 @@ impl DbtResultsPanel {
 
         self.lineage_model = Some(model.clone());
         let store = self.lineage_store.clone();
+        let expansions = self.depth_expansions.clone();
         let task = cx.background_spawn(async move {
             let tree = store.lineage_tree(&root, &model, tree_depth, max_nodes).ok();
             let layout = store
-                .lineage_layout(&root, &model, graph_depth, max_nodes)
+                .lineage_layout(&root, &model, graph_depth, max_nodes, &expansions)
                 .ok();
             (tree, layout)
         });
@@ -664,6 +668,7 @@ impl DbtResultsPanel {
         let settings = DbtSettings::get_global(cx).clone();
         let lineage_store = self.lineage_store.clone();
         let http = self.http_client(cx);
+        let depth_expansions = self.depth_expansions.clone();
         let command = cx.background_spawn(async move {
             let limit = settings.show_limit.to_string();
             let binary = crate::dbt_install::ensure_binary(&settings, http).await?;
@@ -703,6 +708,7 @@ impl DbtResultsPanel {
                             name.as_ref(),
                             settings.lineage_depth as i32,
                             settings.lineage_max_nodes as usize,
+                            &depth_expansions,
                         )
                         .ok(),
                 ),
@@ -2027,6 +2033,56 @@ impl DbtResultsPanel {
                         false,
                     );
                 }
+                // Depth-boundary nodes with unloaded neighbors get a +
+                // handle that grows the graph from them.
+                let mut push_expand = |suffix: &'static str, anchor_x: f32| {
+                    let name = node.name.clone();
+                    handles.push(
+                        div()
+                            .id(SharedString::from(format!("dbt-expand-{suffix}-{ix}")))
+                            .absolute()
+                            .left(px(anchor_x - 9.))
+                            .top(px(node.y + header_height / 2. - 9.))
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(node_bg)
+                            .border_1()
+                            .border_color(center_border)
+                            .shadow_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.border_color(center_border))
+                            .child(
+                                Label::new("+")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.depth_expansions.insert(name.clone());
+                                // Force a lineage recompute for the same model.
+                                if let Some(model) = this.lineage_model.take() {
+                                    if let Some(root) = this.last_root.clone() {
+                                        this.refresh_lineage(model, root, cx);
+                                    }
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                };
+                if node.truncated_up && !has_upstream && node.level <= 0 {
+                    push_expand("up", node.x);
+                }
+                if node.truncated_down && !has_downstream && node.level >= 0 {
+                    push_expand("down", node.x + node.width);
+                }
                 handles
             }))
             .into_any_element()
@@ -2236,6 +2292,8 @@ impl DbtResultsPanel {
                                                     this.pan = (0., 0.);
                                                     this.zoom = 1.0;
                                                     this.graph_drag = None;
+                                                    this.depth_expansions.clear();
+                                                    this.lineage_model = None;
                                                     cx.notify();
                                                 })),
                                         )
