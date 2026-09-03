@@ -1038,7 +1038,19 @@ impl Editor {
     ) -> Task<Result<Navigated>> {
         let definition =
             self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, window, cx);
-        let fallback_strategy = EditorSettings::get_global(cx).go_to_definition_fallback;
+        // Fork: no references fallback in dbt SQL buffers — dbt's language
+        // server stalls references behind a full project compilation.
+        let fallback_strategy = if self
+            .buffer
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).language().cloned())
+            .is_some_and(|language| language.name().as_ref() == "dbt SQL")
+        {
+            GoToDefinitionFallback::None
+        } else {
+            EditorSettings::get_global(cx).go_to_definition_fallback
+        };
         cx.spawn_in(window, async move |editor, cx| {
             if definition.await? == Navigated::Yes {
                 return Ok(Navigated::Yes);

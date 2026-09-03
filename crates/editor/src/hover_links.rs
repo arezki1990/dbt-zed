@@ -207,6 +207,15 @@ impl Editor {
         cx: &mut Context<Editor>,
     ) {
         let focus_handle = self.focus_handle(cx);
+        // Fork: dbt's language server stalls references behind a full project
+        // compilation, so a cmd-click that resolves nothing must not fall back
+        // to a minutes-long Find All References in dbt SQL buffers.
+        let suppress_references_fallback = self
+            .buffer
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).language().cloned())
+            .is_some_and(|language| language.name().as_ref() == "dbt SQL");
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
         cx.spawn_in(window, async move |_, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
@@ -216,6 +225,7 @@ impl Editor {
             cx.update(|window, cx| {
                 match EditorSettings::get_global(cx).go_to_definition_fallback {
                     GoToDefinitionFallback::None => {}
+                    GoToDefinitionFallback::FindAllReferences if suppress_references_fallback => {}
                     GoToDefinitionFallback::FindAllReferences => {
                         focus_handle.dispatch_action(&FindAllReferences::default(), window, cx);
                     }
