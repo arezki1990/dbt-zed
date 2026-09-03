@@ -566,9 +566,7 @@ fn is_pinned_layout(pinned_cols: usize, cols: usize) -> bool {
 fn base_cell_style(width: Option<Length>) -> Div {
     div()
         .px_1p5()
-        // The width is a flex basis; without shrink-0 cells compress to fit
-        // the viewport and the row can never overflow (no horizontal scroll).
-        .when_some(width, |this, width| this.w(width).flex_shrink_0())
+        .when_some(width, |this, width| this.w(width))
         .when(width.is_none(), |this| this.flex_1())
         .whitespace_nowrap()
         .text_ellipsis()
@@ -582,7 +580,7 @@ fn base_cell_style_text(width: Option<Length>, use_ui_font: bool, cx: &App) -> D
 fn render_cell(width: Option<Length>, cell: AnyElement, ctx: &TableRenderContext, cx: &App) -> Div {
     if ctx.disable_base_cell_style {
         div()
-            .when_some(width, |this, width| this.w(width).flex_shrink_0())
+            .when_some(width, |this, width| this.w(width))
             .when(width.is_none(), |this| this.flex_1())
             .overflow_hidden()
             .child(cell)
@@ -682,21 +680,6 @@ pub fn render_table_row(
             .collect();
         let scrollable: Vec<(AnyElement, Option<Length>)> = kept.drain(pinned_visible..).collect();
 
-        // Explicit strip width: intrinsic sizing of a scroll container's flex
-        // content does not reliably propagate fixed cell widths (taffy sizes
-        // the strip to the viewport), so sum the definite widths directly —
-        // the same approach the resize-divider overlay uses.
-        let rem_size = window.rem_size();
-        let strip_width: Pixels = scrollable
-            .iter()
-            .filter_map(|(_, width)| match width {
-                Some(Length::Definite(DefiniteLength::Absolute(abs))) => {
-                    Some(abs.to_pixels(rem_size))
-                }
-                _ => None,
-            })
-            .fold(px(0.), |acc, width| acc + width);
-
         let pinned_section = div().flex().flex_row().flex_shrink_0().children(
             kept.into_iter()
                 .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
@@ -712,19 +695,11 @@ pub fn render_table_row(
             .restrict_scroll_to_axis()
             .flex()
             .child(
-                // The strip must keep its intrinsic width (sum of the fixed
-                // cells) — as a shrinkable flex child it would compress to
-                // the viewport and the row could never overflow-scroll.
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_shrink_0()
-                    .when(strip_width > px(0.), |this| this.w(strip_width))
-                    .children(
-                        scrollable
-                            .into_iter()
-                            .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
-                    ),
+                div().flex().flex_row().children(
+                    scrollable
+                        .into_iter()
+                        .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
+                ),
             );
 
         if let Some(ref handle) = table_context.h_scroll_handle {
@@ -956,23 +931,17 @@ fn build_resize_dividers(
     widths: &TableRow<AbsoluteLength>,
     resize_behavior: &TableRow<TableResizeBehavior>,
     range: Range<usize>,
-    column_filter: Option<&TableRow<bool>>,
     interactive: bool,
     rem_size: Pixels,
     window: &mut Window,
     cx: &mut App,
 ) -> Vec<AnyElement> {
     let entity_id = columns_state.entity_id();
-    // Hidden columns render no cells, so they get no width and no divider —
-    // otherwise dividers drift and the scroll range extends into blank space.
-    let visible: Vec<usize> = range
-        .filter(|idx| column_filter.is_none_or(|filter| filter[*idx]))
-        .collect();
-    let last = visible.last().copied().unwrap_or(0);
-    let mut dividers = Vec::with_capacity(visible.len());
+    let last = range.end.saturating_sub(1);
+    let mut dividers = Vec::with_capacity(range.end - range.start);
     let mut accumulated = px(0.);
 
-    for col_idx in visible {
+    for col_idx in range {
         accumulated = accumulated + widths[col_idx].to_pixels(rem_size);
 
         // Add a resize divider after every column, including the last.
@@ -1012,7 +981,6 @@ fn render_resize_handles_resizable(
     columns_state: &Entity<ResizableColumnsState>,
     pinned_cols: usize,
     h_scroll_handle: Option<&ScrollHandle>,
-    column_filter: Option<&TableRow<bool>>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -1030,7 +998,6 @@ fn render_resize_handles_resizable(
             &widths,
             &resize_behavior,
             0..n_cols,
-            column_filter,
             true,
             rem_size,
             window,
@@ -1045,14 +1012,8 @@ fn render_resize_handles_resizable(
             .into_any_element();
     }
 
-    let visible_width = |range: Range<usize>| -> Pixels {
-        range
-            .filter(|idx| column_filter.is_none_or(|filter| filter[*idx]))
-            .map(|idx| widths[idx].to_pixels(rem_size))
-            .fold(px(0.), |acc, width| acc + width)
-    };
-    let pinned_width = visible_width(0..pinned_cols);
-    let total_scrollable_width = visible_width(pinned_cols..n_cols);
+    let pinned_width = state.pinned_width(pinned_cols, rem_size);
+    let total_scrollable_width = state.scrollable_width(pinned_cols, rem_size);
 
     // Non-interactive: pinned columns don't visually shift with scroll, so resizing them would
     // need separate drag-math from the scrollable columns. Header double-click reset still works.
@@ -1061,7 +1022,6 @@ fn render_resize_handles_resizable(
         &widths,
         &resize_behavior,
         0..pinned_cols,
-        column_filter,
         false,
         rem_size,
         window,
@@ -1081,7 +1041,6 @@ fn render_resize_handles_resizable(
         &widths,
         &resize_behavior,
         pinned_cols..n_cols,
-        column_filter,
         true,
         rem_size,
         window,
@@ -1197,7 +1156,6 @@ impl RenderOnce for Table {
                             entity,
                             pinned_cols,
                             h_scroll_handle.as_ref(),
-                            self.column_filter.as_ref(),
                             window,
                             cx,
                         )),
@@ -1360,7 +1318,6 @@ impl RenderOnce for Table {
                 .custom_scrollbar
                 .clone()
                 .unwrap_or_else(|| Scrollbars::new(ScrollAxes::Both));
-            let h_scrollbars = scrollbars.visibility_for_axes(ScrollAxes::Horizontal);
             let mut content = if let Some(list_state) = variable_list_state {
                 content.custom_scrollbars(scrollbars.tracked_scroll_handle(&list_state), window, cx)
             } else {
@@ -1383,9 +1340,7 @@ impl RenderOnce for Table {
                     // right+left) without needing to hardcode the scrollbar thickness.
                     let h_scrollbar = div().absolute().inset_0().left(pinned_width);
                     let h_scrollbar = h_scrollbar.custom_scrollbars(
-                        // Inherit the configured visibility (e.g. always
-                        // visible) instead of hardcoding the default policy.
-                        h_scrollbars
+                        Scrollbars::new(ScrollAxes::Horizontal)
                             .tracked_scroll_handle(&state.read(cx).horizontal_scroll_handle),
                         window,
                         cx,
