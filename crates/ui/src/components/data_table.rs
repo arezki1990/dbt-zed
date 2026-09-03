@@ -566,7 +566,9 @@ fn is_pinned_layout(pinned_cols: usize, cols: usize) -> bool {
 fn base_cell_style(width: Option<Length>) -> Div {
     div()
         .px_1p5()
-        .when_some(width, |this, width| this.w(width))
+        // The width is a flex basis; without shrink-0 cells compress to fit
+        // the viewport and the row can never overflow (no horizontal scroll).
+        .when_some(width, |this, width| this.w(width).flex_shrink_0())
         .when(width.is_none(), |this| this.flex_1())
         .whitespace_nowrap()
         .text_ellipsis()
@@ -580,7 +582,7 @@ fn base_cell_style_text(width: Option<Length>, use_ui_font: bool, cx: &App) -> D
 fn render_cell(width: Option<Length>, cell: AnyElement, ctx: &TableRenderContext, cx: &App) -> Div {
     if ctx.disable_base_cell_style {
         div()
-            .when_some(width, |this, width| this.w(width))
+            .when_some(width, |this, width| this.w(width).flex_shrink_0())
             .when(width.is_none(), |this| this.flex_1())
             .overflow_hidden()
             .child(cell)
@@ -695,7 +697,10 @@ pub fn render_table_row(
             .restrict_scroll_to_axis()
             .flex()
             .child(
-                div().flex().flex_row().children(
+                // The strip must keep its intrinsic width (sum of the fixed
+                // cells) — as a shrinkable flex child it would compress to
+                // the viewport and the row could never overflow-scroll.
+                div().flex().flex_row().flex_shrink_0().children(
                     scrollable
                         .into_iter()
                         .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
