@@ -546,6 +546,10 @@ impl DbtResultsPanel {
     /// query — this is what makes file browsing drive the graph.
     fn refresh_lineage(&mut self, model: String, root: PathBuf, cx: &mut Context<Self>) {
         if self.lineage_model.as_deref() == Some(model.as_str()) {
+            // Same model re-opened: the graph is current, but still bring the
+            // centered node back into view.
+            self.pending_center = true;
+            cx.notify();
             return;
         }
 
@@ -1246,6 +1250,12 @@ impl DbtResultsPanel {
         let center_y = (node.y + node.height / 2.) * self.zoom + offset.1;
         self.pan = (view_w / 2. - center_x, view_h / 2. - center_y);
         self.canvas_scroll.set_offset(point(px(0.), px(0.)));
+        log::debug!(
+            "dbt lineage: centered {} at ({center_x:.0},{center_y:.0}) in {view_w:.0}x{view_h:.0} -> pan ({:.0},{:.0})",
+            node.name,
+            self.pan.0,
+            self.pan.1,
+        );
         true
     }
 
