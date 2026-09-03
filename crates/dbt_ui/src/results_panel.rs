@@ -638,6 +638,7 @@ impl DbtResultsPanel {
                 }
                 this.lineage_tree = tree.map(Arc::new);
                 this.lineage_layout = layout.map(Arc::new);
+                this.center_on_model();
                 this.expanded.clear();
                 this.collapsed_up.clear();
                 this.collapsed_down.clear();
@@ -744,6 +745,7 @@ impl DbtResultsPanel {
                 match result {
                     Ok((columns, rows, compiled, lineage_tree, lineage_layout)) => {
                         this.lineage_layout = lineage_layout;
+                        this.center_on_model();
                         this.lineage_tree = lineage_tree;
                         this.expanded.clear();
                         this.collapsed_up.clear();
@@ -1213,6 +1215,33 @@ impl DbtResultsPanel {
             width: x - GRAPH_COL_GAP + GRAPH_PADDING,
             height: max_height + GRAPH_PADDING,
         }))
+    }
+
+    /// Pans the canvas so the centered (browsed) model sits in the middle of
+    /// the viewport — browsing a file always brings its node into view.
+    fn center_on_model(&mut self) {
+        let Some(layout) = self.lineage_layout.as_ref() else {
+            return;
+        };
+        let Some(node) = layout.nodes.iter().find(|node| node.is_center) else {
+            return;
+        };
+        let viewport = self.canvas_scroll.bounds().size;
+        let (view_w, view_h) = (f32::from(viewport.width), f32::from(viewport.height));
+        if view_w <= 1. || view_h <= 1. {
+            // Not painted yet; keep the neutral origin.
+            self.pan = (0., 0.);
+            return;
+        }
+        let offset = self
+            .node_offsets
+            .get(&node.name)
+            .copied()
+            .unwrap_or((0., 0.));
+        let center_x = (node.x + node.width / 2.) * self.zoom + offset.0;
+        let center_y = (node.y + node.height / 2.) * self.zoom + offset.1;
+        self.pan = (view_w / 2. - center_x, view_h / 2. - center_y);
+        self.canvas_scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// Changes zoom anchored on the graph's gravity center (the browsed
