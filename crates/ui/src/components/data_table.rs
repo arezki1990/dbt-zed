@@ -1335,6 +1335,7 @@ impl RenderOnce for Table {
                 .custom_scrollbar
                 .clone()
                 .unwrap_or_else(|| Scrollbars::new(ScrollAxes::Both));
+            let h_scrollbars = scrollbars.visibility_for_axes(ScrollAxes::Horizontal);
             let mut content = if let Some(list_state) = variable_list_state {
                 content.custom_scrollbars(scrollbars.tracked_scroll_handle(&list_state), window, cx)
             } else {
@@ -1357,7 +1358,9 @@ impl RenderOnce for Table {
                     // right+left) without needing to hardcode the scrollbar thickness.
                     let h_scrollbar = div().absolute().inset_0().left(pinned_width);
                     let h_scrollbar = h_scrollbar.custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Horizontal)
+                        // Inherit the configured visibility (e.g. always
+                        // visible) instead of hardcoding the default policy.
+                        h_scrollbars
                             .tracked_scroll_handle(&state.read(cx).horizontal_scroll_handle),
                         window,
                         cx,

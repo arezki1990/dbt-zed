@@ -400,6 +400,12 @@ impl Scrollbars {
         Self::new_with_setting(show_along, |_| ShowScrollbar::Always)
     }
 
+    /// Reuses this configuration's visibility policy for a different axis
+    /// set — e.g. deriving a horizontal-only bar from a configured pair.
+    pub fn visibility_for_axes(&self, show_along: ScrollAxes) -> Scrollbars {
+        Scrollbars::new_with_setting(show_along, self.get_visibility)
+    }
+
     pub fn for_settings<S: ScrollbarVisibility + Default>() -> Scrollbars {
         Scrollbars::new_with_setting(ScrollAxes::Both, |cx| S::default().visibility(cx))
     }
