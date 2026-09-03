@@ -442,8 +442,12 @@ impl DbtResultsPanel {
             let parse_root = root.clone();
             let parse_model = model.clone();
             let catalog_settings = settings.clone();
+            let http = self.http_client(cx);
             let parse = cx.background_spawn(async move {
-                let mut command = new_command(&settings.binary);
+                let binary = crate::dbt_install::ensure_binary(&settings, http)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let mut command = new_command(&binary);
                 command.arg("parse");
                 apply_common_args(&mut command, &settings, &command_root);
                 command.current_dir(&command_root).output().await
@@ -475,7 +479,10 @@ impl DbtResultsPanel {
                 // columns from catalog.json) participate in column lineage.
                 let catalog_root = parse_root.clone();
                 let catalog = cx.background_executor().spawn(async move {
-                    let mut command = new_command(&catalog_settings.binary);
+                    let binary = crate::dbt_install::ensure_binary(&catalog_settings, None)
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    let mut command = new_command(&binary);
                     command.args(["compile", "--write-catalog"]);
                     apply_common_args(&mut command, &catalog_settings, &catalog_root);
                     command.current_dir(&catalog_root).output().await
@@ -530,6 +537,15 @@ impl DbtResultsPanel {
         });
     }
 
+    /// The app's HTTP client, used to download the managed dbt Fusion
+    /// distribution when nothing is on PATH.
+    fn http_client(&self, cx: &Context<Self>) -> Option<Arc<dyn http_client::HttpClient>> {
+        let workspace = self.workspace.upgrade()?;
+        let client: Arc<dyn http_client::HttpClient> =
+            workspace.read(cx).project().read(cx).client().http_client();
+        Some(client)
+    }
+
     fn run_show(
         &mut self,
         target: ShowTarget,
@@ -546,9 +562,11 @@ impl DbtResultsPanel {
         self.last_root = Some(root.clone());
         let settings = DbtSettings::get_global(cx).clone();
         let lineage_store = self.lineage_store.clone();
+        let http = self.http_client(cx);
         let command = cx.background_spawn(async move {
             let limit = settings.show_limit.to_string();
-            let mut command = new_command(&settings.binary);
+            let binary = crate::dbt_install::ensure_binary(&settings, http).await?;
+            let mut command = new_command(&binary);
             command.arg("show");
             match &target {
                 ShowTarget::Model { name, .. } => {
@@ -564,12 +582,10 @@ impl DbtResultsPanel {
                 .current_dir(&root)
                 .output()
                 .await
-                .with_context(|| {
-                    format!("spawning `{} show` (is it on PATH?)", settings.binary)
-                })?;
+                .with_context(|| format!("spawning `{binary} show`"))?;
             let (columns, rows) =
                 parse_show_output(&output.stdout, &output.stderr, output.status.success())?;
-            let compiled = fetch_compiled_sql(&settings, &target, &root).await;
+            let compiled = fetch_compiled_sql(&binary, &settings, &target, &root).await;
             let (lineage_tree, lineage_layout) = match &target {
                 ShowTarget::Model { name, .. } => (
                     lineage_store
@@ -2093,11 +2109,12 @@ fn apply_common_args(
 /// for models, read from `target/compiled/<project>/<rel_path>`; for inline
 /// queries, parsed from stdout.
 async fn fetch_compiled_sql(
+    binary: &str,
     settings: &DbtSettings,
     target: &ShowTarget,
     root: &std::path::Path,
 ) -> Option<String> {
-    let mut command = new_command(&settings.binary);
+    let mut command = new_command(binary);
     command.arg("compile");
     match target {
         ShowTarget::Model { name, .. } => {
@@ -2184,13 +2201,21 @@ fn parse_show_output(
         return Ok((columns, rows));
     }
 
+    let stderr_str = String::from_utf8_lossy(stderr);
     if success {
-        anyhow::bail!("no result rows found in dbt show output:\n{stdout_str}");
+        if let Some(reason) = stderr_str
+            .lines()
+            .find(|line| line.contains("does not match any enabled nodes"))
+        {
+            anyhow::bail!(
+                "dbt selected no models — {}\n\nIs this file inside the dbt project's \
+                 model paths, and does the project parse cleanly?",
+                reason.trim()
+            );
+        }
+        anyhow::bail!("no result rows found in dbt show output:\n{stdout_str}\n{stderr_str}");
     }
-    anyhow::bail!(
-        "dbt show failed:\n{stdout_str}\n{}",
-        String::from_utf8_lossy(stderr)
-    );
+    anyhow::bail!("dbt show failed:\n{stdout_str}\n{stderr_str}");
 }
 
 impl EventEmitter<PanelEvent> for DbtResultsPanel {}
