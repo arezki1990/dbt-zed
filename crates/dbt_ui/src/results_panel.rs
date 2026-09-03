@@ -2645,6 +2645,9 @@ impl DbtResultsPanel {
                     .id("dbt-grid-hscroll")
                     .size_full()
                     .overflow_x_scroll()
+                    // Only take horizontal wheel motion; vertical passes
+                    // through to the uniform_list so the two axes don't fight.
+                    .restrict_scroll_to_axis()
                     .track_scroll(&self.grid_h_scroll)
                     .child(
                         v_flex()
