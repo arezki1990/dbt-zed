@@ -29,6 +29,10 @@ use crate::{
     },
 };
 
+/// Below this zoom, column rows (and their edges) collapse away — node text
+/// scales with zoom, so columns stay legible well under 100%.
+const COLUMNS_MIN_ZOOM: f32 = 0.55;
+
 pub struct DbtResultsPanel {
     focus_handle: FocusHandle,
     table_interaction: Entity<TableInteractionState>,
@@ -974,7 +978,7 @@ impl DbtResultsPanel {
                 index_map[ix] = Some(nodes.len());
                 let mut node = node.clone();
                 // Semantic zoom: columns collapse away when zoomed out.
-                let columns_visible = self.show_columns && self.zoom >= 0.85;
+                let columns_visible = self.show_columns && self.zoom >= COLUMNS_MIN_ZOOM;
                 if columns_visible && !node.columns.is_empty() {
                     let shown = node.columns.len().min(GRAPH_MAX_COLUMNS);
                     let more = usize::from(node.columns.len() > GRAPH_MAX_COLUMNS);
@@ -1141,7 +1145,11 @@ impl DbtResultsPanel {
 
                     // Column-level lineage: same-named columns on connected
                     // nodes get a thin edge from row to row.
-                    if show_columns && !from.columns.is_empty() && !to.columns.is_empty() {
+                    if show_columns
+                        && zoom >= COLUMNS_MIN_ZOOM
+                        && !from.columns.is_empty()
+                        && !to.columns.is_empty()
+                    {
                         let to_rows: HashMap<String, usize> = to
                             .columns
                             .iter()
@@ -1203,7 +1211,7 @@ impl DbtResultsPanel {
                 let workspace = workspace.clone();
                 let materialization_color =
                     Self::materialization_color(&node.materialization, cx);
-                let shown_columns = if self.show_columns && zoom >= 0.85 {
+                let shown_columns = if self.show_columns && zoom >= COLUMNS_MIN_ZOOM {
                     node.columns.len().min(GRAPH_MAX_COLUMNS)
                 } else {
                     0
