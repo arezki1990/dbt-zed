@@ -206,6 +206,8 @@ pub struct GraphLayoutNode {
     pub path: Option<PathBuf>,
     /// Summary of SQL operations this model applies, when derivable.
     pub ops: Option<NodeOps>,
+    /// Lowercased column name -> the select-list expression producing it.
+    pub col_exprs: std::collections::HashMap<String, String>,
     /// Column names, ordered (from catalog.json when present, else the
     /// documented columns in manifest.json).
     pub columns: Vec<String>,
@@ -490,6 +492,18 @@ impl LineageStore {
                             .unwrap_or(entity.kind.as_str())
                             .to_owned(),
                         ops: entity.data.get("ops").and_then(NodeOps::from_json),
+                        col_exprs: entity
+                            .data
+                            .get("col_exprs")
+                            .and_then(|value| value.as_object())
+                            .map(|map| {
+                                map.iter()
+                                    .filter_map(|(key, value)| {
+                                        Some((key.clone(), value.as_str()?.to_owned()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         path: entity
                             .file_path
                             .as_ref()
@@ -642,7 +656,9 @@ pub fn lineage_svg(model: &str, lineage: &Lineage) -> String {
 /// Best-effort extraction of output column names from a compiled SELECT.
 /// Returns None for anything it can't handle confidently (e.g. `select *`),
 /// letting the caller fall back to parent inheritance.
-fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
+/// Parses the final top-level select list into (column name, expression)
+/// pairs — the per-model transformation story for column tracing.
+fn parse_select_entries(sql: &str) -> Option<Vec<(String, String)>> {
     let lower = sql.to_lowercase();
     let select_pos = lower.find("select")?;
     let body = &sql[select_pos + 6..];
@@ -688,14 +704,23 @@ fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
             return;
         }
         let segment_lower = segment.to_lowercase();
-        let name = if let Some(pos) = segment_lower.rfind(" as ") {
-            segment[pos + 4..].trim()
+        let (name, expr) = if let Some(pos) = segment_lower.rfind(" as ") {
+            (segment[pos + 4..].trim(), segment[..pos].trim())
         } else {
-            segment.rsplit('.').next().unwrap_or(segment).trim()
+            (
+                segment.rsplit('.').next().unwrap_or(segment).trim(),
+                segment,
+            )
         };
         let name = name.trim_matches('"');
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            columns.push(name.to_owned());
+            // Whitespace-normalize and cap the expression for display.
+            let mut expr = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+            if expr.len() > 160 {
+                expr.truncate(157);
+                expr.push_str("...");
+            }
+            columns.push((name.to_owned(), expr));
         }
     };
     let mut depth = 0i32;
@@ -714,6 +739,11 @@ fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
     push(&list[start..]);
 
     (!columns.is_empty()).then_some(columns)
+}
+
+fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
+    parse_select_entries(sql)
+        .map(|entries| entries.into_iter().map(|(name, _)| name).collect())
 }
 
 fn build_graph(
@@ -776,6 +806,7 @@ fn build_graph(
         materialized: String,
         columns: Vec<String>,
         ops: Option<NodeOps>,
+        col_exprs: std::collections::HashMap<String, String>,
     }
     let mut pending: Vec<PendingNode> = Vec::new();
     for section in ["nodes", "sources"] {
@@ -824,6 +855,17 @@ fn build_graph(
                 .and_then(|value| value.as_str())
                 .map(extract_ops)
                 .filter(|ops| !ops.is_empty());
+            let col_exprs: std::collections::HashMap<String, String> = node
+                .get("compiled_code")
+                .and_then(|value| value.as_str())
+                .and_then(parse_select_entries)
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|(name, expr)| (name.to_lowercase(), expr))
+                        .collect()
+                })
+                .unwrap_or_default();
             pending.push(PendingNode {
                 unique_id: unique_id.clone(),
                 kind: resource_type.to_owned(),
@@ -832,6 +874,7 @@ fn build_graph(
                 materialized,
                 columns,
                 ops,
+                col_exprs,
             });
         }
     }
@@ -903,6 +946,7 @@ fn build_graph(
                     "materialized": node.materialized,
                     "columns": node.columns,
                     "ops": node.ops.as_ref().map(NodeOps::to_json),
+                    "col_exprs": node.col_exprs,
                 }),
             })
             .map_err(|error| anyhow::anyhow!("inserting lineage node: {error}"))?;

@@ -913,6 +913,97 @@ impl DbtResultsPanel {
 
     /// The interactive lineage graph in a pannable viewport; shared between
     /// the Results view (side pane) and the Lineage view.
+    /// When a column is selected, an overlay tracing the transformation each
+    /// model on the path applies to it — source to target, in level order.
+    fn render_column_trace(&self, cx: &Context<Self>) -> Option<gpui::Div> {
+        let column = self.selected_column.clone()?;
+        let layout = self.lineage_layout.as_ref()?;
+        let mut steps: Vec<(i32, String, String, bool)> = layout
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.columns
+                    .iter()
+                    .any(|name| name.to_lowercase() == column)
+            })
+            .map(|node| {
+                let expr = node.col_exprs.get(&column).cloned();
+                let is_transform = expr.as_ref().is_some_and(|expr| {
+                    let lower = expr.to_lowercase();
+                    lower != column && !lower.ends_with(&format!(".{column}"))
+                });
+                let label = match expr {
+                    Some(expr) if is_transform => expr,
+                    Some(_) => "passthrough".to_owned(),
+                    None if node.kind == "source" => "source".to_owned(),
+                    None => "—".to_owned(),
+                };
+                (node.level, node.name.clone(), label, is_transform)
+            })
+            .collect();
+        if steps.is_empty() {
+            return None;
+        }
+        steps.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let colors = cx.theme().colors();
+        let accent = cx.theme().players().local().cursor;
+        let total = steps.len();
+        Some(
+            div()
+                .absolute()
+                .left_2()
+                .bottom_2()
+                .max_w(px(560.))
+                .max_h(px(220.))
+                .overflow_hidden()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.elevated_surface_background)
+                .p_2()
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            Label::new(format!("Trace · {}", column.to_uppercase()))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .children(steps.into_iter().take(12).map(
+                            |(_, name, label, is_transform)| {
+                                h_flex()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(colors.text)
+                                            .child(SharedString::from(name)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(if is_transform {
+                                                accent
+                                            } else {
+                                                colors.text_muted
+                                            })
+                                            .child(SharedString::from(label)),
+                                    )
+                            },
+                        ))
+                        .when(total > 12, |this| {
+                            this.child(
+                                Label::new(format!("+{} more", total - 12))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                ),
+        )
+    }
+
     fn render_graph_viewport(
         &self,
         id: &'static str,
@@ -1347,6 +1438,8 @@ impl DbtResultsPanel {
                                     node.columns.iter().take(shown_columns).enumerate().map(
                                         |(row, column)| {
                                             let column_lower = column.to_lowercase();
+                                            let column_expr =
+                                                node.col_exprs.get(&column_lower).cloned();
                                             let is_selected = self.selected_column.as_deref()
                                                 == Some(column_lower.as_str());
                                             let mut selected_bg = center_border;
@@ -1362,6 +1455,11 @@ impl DbtResultsPanel {
                                                 .items_center()
                                                 .cursor_pointer()
                                                 .when(is_selected, |this| this.bg(selected_bg))
+                                                .when_some(column_expr, |this, expr| {
+                                                    this.tooltip(ui::Tooltip::text(format!(
+                                                        "= {expr}"
+                                                    )))
+                                                })
                                                 .hover(|style| style.bg(selected_bg))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -1790,9 +1888,20 @@ impl DbtResultsPanel {
                                         })),
                                 )
                                 .child(
-                                    div().flex_1().w_full().children(
-                                        self.render_graph_viewport("dbt-lineage-canvas", cx),
-                                    ),
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .w_full()
+                                        .children(
+                                            self.render_graph_viewport(
+                                                "dbt-lineage-canvas",
+                                                cx,
+                                            ),
+                                        )
+                                        .when_some(
+                                            self.render_column_trace(cx),
+                                            |this, trace| this.child(trace),
+                                        ),
                                 ),
                         )
                     })
