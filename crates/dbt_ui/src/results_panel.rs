@@ -2547,6 +2547,9 @@ impl DbtResultsPanel {
         let visible_arc = Arc::new(visible.clone());
         let widths_arc: Arc<Vec<f32>> =
             Arc::new(visible.iter().map(|ix| width_of(*ix)).collect());
+        let mut stripe_bg = cx.theme().colors().text;
+        stripe_bg.a = 0.03;
+        let hover_bg = cx.theme().colors().element_hover;
         let panel = cx.entity().downgrade();
         let list = gpui::uniform_list(
             "dbt-grid-rows",
@@ -2558,6 +2561,12 @@ impl DbtResultsPanel {
                         let row = rows_arc.get(original)?;
                         let mut cells = h_flex()
                             .h(px(26.))
+                            .flex_none()
+                            .items_center()
+                            .overflow_hidden()
+                            // Zebra striping for row scanning.
+                            .when(display_ix % 2 == 1, |row| row.bg(stripe_bg))
+                            .hover(|row| row.bg(hover_bg))
                             .child(
                                 div().w(px(ROWNUM_W)).flex_none().px_2().child(
                                     Label::new(format!("{}", original + 1))
@@ -2570,15 +2579,19 @@ impl DbtResultsPanel {
                             let cell = row.get(ix).cloned().unwrap_or_default();
                             let column_name =
                                 columns_vec.get(ix).cloned().unwrap_or_default();
-                            const MAX: usize = 120;
-                            let display = if cell.len() > MAX {
-                                let mut cut = MAX;
-                                while !cell.is_char_boundary(cut) {
-                                    cut -= 1;
-                                }
-                                SharedString::from(format!("{}…", &cell[..cut]))
+                            // Collapse newlines/whitespace so every cell is
+                            // exactly one line — uniform_list assumes a fixed
+                            // row height, so a multi-line JSON cell would make
+                            // rows overlap. The full value stays in the card.
+                            const MAX: usize = 200;
+                            let one_line = cell.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let display = if one_line.chars().count() > MAX {
+                                SharedString::from(format!(
+                                    "{}…",
+                                    one_line.chars().take(MAX).collect::<String>()
+                                ))
                             } else {
-                                cell.clone()
+                                SharedString::from(one_line)
                             };
                             let full = cell.clone();
                             let panel = panel.clone();
@@ -2588,9 +2601,13 @@ impl DbtResultsPanel {
                                         "dbt-cell-{display_ix}-{vi}"
                                     )))
                                     .w(px(w))
+                                    .h_full()
                                     .flex_none()
                                     .px_2()
                                     .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .flex()
+                                    .items_center()
                                     .cursor_pointer()
                                     .child(Label::new(display).size(LabelSize::Small))
                                     .on_click(move |_, _, cx| {
