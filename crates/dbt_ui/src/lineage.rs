@@ -126,6 +126,43 @@ impl NodeOps {
     }
 }
 
+/// Identifiers a select expression references (last dot-segment, lowercased),
+/// excluding SQL keywords and common functions.
+pub(crate) fn expr_column_refs(expr: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "sum", "count", "avg", "min", "max", "cast", "coalesce", "case", "when", "then",
+        "else", "end", "as", "and", "or", "not", "null", "true", "false", "over",
+        "partition", "by", "order", "asc", "desc", "row_number", "rank", "dense_rank",
+        "lag", "lead", "nullif", "concat", "trim", "upper", "lower", "substring",
+        "substr", "round", "floor", "ceil", "abs", "date", "timestamp", "interval",
+        "extract", "from", "distinct", "int", "integer", "bigint", "varchar", "string",
+        "numeric", "decimal", "float", "boolean", "char", "text", "iff", "ifnull",
+        "listagg", "array_agg", "to_char", "to_date", "to_number", "try_cast", "left",
+        "right", "replace", "split_part", "len", "length", "greatest", "least",
+        "any_value", "first_value", "last_value", "current_date", "current_timestamp",
+        "year", "month", "week", "day", "dateadd", "datediff", "date_trunc", "md5",
+        "like", "in", "is", "between", "exists", "union", "all", "select",
+    ];
+    let lower = expr.to_lowercase();
+    let mut refs = Vec::new();
+    for token in lower.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.')) {
+        if token.is_empty() {
+            continue;
+        }
+        let ident = token.rsplit('.').next().unwrap_or(token);
+        if ident.is_empty()
+            || ident.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            || SKIP.contains(&ident)
+        {
+            continue;
+        }
+        if !refs.iter().any(|existing| existing == ident) {
+            refs.push(ident.to_owned());
+        }
+    }
+    refs
+}
+
 /// Best-effort text scan of compiled SQL — a debugging aid, not a parser.
 pub(crate) fn extract_ops(sql: &str) -> NodeOps {
     let lower = sql.to_lowercase();
@@ -208,6 +245,9 @@ pub struct GraphLayoutNode {
     pub ops: Option<NodeOps>,
     /// Lowercased column name -> the select-list expression producing it.
     pub col_exprs: std::collections::HashMap<String, String>,
+    /// Lowercased column name -> upstream/CTE identifiers its full
+    /// (untruncated) expression references.
+    pub col_refs: std::collections::HashMap<String, Vec<String>>,
     /// More parents/children exist beyond the loaded depth or node cap.
     pub truncated_up: bool,
     pub truncated_down: bool,
@@ -518,6 +558,25 @@ impl LineageStore {
                             .unwrap_or(entity.kind.as_str())
                             .to_owned(),
                         ops: entity.data.get("ops").and_then(NodeOps::from_json),
+                        col_refs: entity
+                            .data
+                            .get("col_refs")
+                            .and_then(|value| value.as_object())
+                            .map(|map| {
+                                map.iter()
+                                    .filter_map(|(key, value)| {
+                                        let refs = value
+                                            .as_array()?
+                                            .iter()
+                                            .filter_map(|item| {
+                                                item.as_str().map(str::to_owned)
+                                            })
+                                            .collect();
+                                        Some((key.clone(), refs))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         col_exprs: entity
                             .data
                             .get("col_exprs")
@@ -806,17 +865,9 @@ fn parse_select_entries_at(
         };
         let name = name.trim_matches('"');
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            // Whitespace-normalize and cap the expression for display.
-            let mut expr = expr.split_whitespace().collect::<Vec<_>>().join(" ");
-            if expr.len() > 160 {
-                // Truncate on a char boundary (comments may hold non-ASCII).
-                let mut cut = 157;
-                while !expr.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                expr.truncate(cut);
-                expr.push_str("...");
-            }
+            // Whitespace-normalize; display truncation happens at storage
+            // time so reference extraction sees the full expression.
+            let expr = expr.split_whitespace().collect::<Vec<_>>().join(" ");
             columns.push((name.to_owned(), expr));
         }
     };
@@ -904,6 +955,7 @@ fn build_graph(
         columns: Vec<String>,
         ops: Option<NodeOps>,
         col_exprs: std::collections::HashMap<String, String>,
+        col_refs: std::collections::HashMap<String, Vec<String>>,
     }
     let mut pending: Vec<PendingNode> = Vec::new();
     for section in ["nodes", "sources"] {
@@ -952,11 +1004,32 @@ fn build_graph(
                 .and_then(|value| value.as_str())
                 .map(extract_ops)
                 .filter(|ops| !ops.is_empty());
-            let col_exprs: std::collections::HashMap<String, String> = node
+            let col_exprs_full: std::collections::HashMap<String, String> = node
                 .get("compiled_code")
                 .and_then(|value| value.as_str())
                 .map(parse_all_select_entries)
                 .unwrap_or_default();
+            // References come from the full expression; the stored display
+            // copy is truncated on a char boundary.
+            let col_refs: std::collections::HashMap<String, Vec<String>> = col_exprs_full
+                .iter()
+                .map(|(name, expr)| (name.clone(), expr_column_refs(expr)))
+                .filter(|(_, refs)| !refs.is_empty())
+                .collect();
+            let col_exprs: std::collections::HashMap<String, String> = col_exprs_full
+                .into_iter()
+                .map(|(name, mut expr)| {
+                    if expr.len() > 160 {
+                        let mut cut = 157;
+                        while !expr.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        expr.truncate(cut);
+                        expr.push_str("...");
+                    }
+                    (name, expr)
+                })
+                .collect();
             pending.push(PendingNode {
                 unique_id: unique_id.clone(),
                 kind: resource_type.to_owned(),
@@ -966,6 +1039,7 @@ fn build_graph(
                 columns,
                 ops,
                 col_exprs,
+                col_refs,
             });
         }
     }
@@ -1038,6 +1112,7 @@ fn build_graph(
                     "columns": node.columns,
                     "ops": node.ops.as_ref().map(NodeOps::to_json),
                     "col_exprs": node.col_exprs,
+                    "col_refs": node.col_refs,
                 }),
             })
             .map_err(|error| anyhow::anyhow!("inserting lineage node: {error}"))?;

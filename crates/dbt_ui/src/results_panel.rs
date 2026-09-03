@@ -30,40 +30,32 @@ use crate::{
     },
 };
 
-/// Identifiers a select expression references (last dot-segment, lowercased),
-/// excluding SQL keywords and common functions — powers rename-aware column
-/// edges: `employee_id` defined as `e.id_employe` links to `id_employe`.
-fn expr_column_refs(expr: &str) -> Vec<String> {
-    const SKIP: &[&str] = &[
-        "sum", "count", "avg", "min", "max", "cast", "coalesce", "case", "when", "then",
-        "else", "end", "as", "and", "or", "not", "null", "true", "false", "over",
-        "partition", "by", "order", "asc", "desc", "row_number", "rank", "dense_rank",
-        "lag", "lead", "nullif", "concat", "trim", "upper", "lower", "substring",
-        "substr", "round", "floor", "ceil", "abs", "date", "timestamp", "interval",
-        "extract", "from", "distinct", "int", "integer", "bigint", "varchar", "string",
-        "numeric", "decimal", "float", "boolean", "char", "text", "iff", "ifnull",
-        "listagg", "array_agg", "to_char", "to_date", "to_number", "try_cast", "left",
-        "right", "replace", "split_part", "len", "length", "greatest", "least",
-        "any_value", "first_value", "last_value", "current_date", "current_timestamp",
-    ];
-    let lower = expr.to_lowercase();
-    let mut refs = Vec::new();
-    for token in lower.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.')) {
-        if token.is_empty() {
-            continue;
+/// Upstream-facing source names for `column` on `node`: the stored references
+/// of its full expression, closed transitively through the node's own
+/// CTE-level entries — so `MAX(absence_date)` where `absence_date` was itself
+/// renamed from `date_absence` in an earlier CTE resolves to `date_absence`.
+fn column_sources(node: &crate::lineage::GraphLayoutNode, column: &str) -> Vec<String> {
+    let mut sources = vec![column.to_owned()];
+    let mut queue = vec![column.to_owned()];
+    let mut steps = 0;
+    while let Some(current) = queue.pop() {
+        steps += 1;
+        if steps > 64 || sources.len() > 32 {
+            break;
         }
-        let ident = token.rsplit('.').next().unwrap_or(token);
-        if ident.is_empty()
-            || ident.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-            || SKIP.contains(&ident)
-        {
-            continue;
-        }
-        if !refs.iter().any(|existing| existing == ident) {
-            refs.push(ident.to_owned());
+        let refs = node.col_refs.get(&current).cloned().or_else(|| {
+            node.col_exprs
+                .get(&current)
+                .map(|expr| crate::lineage::expr_column_refs(expr))
+        });
+        for referenced in refs.unwrap_or_default() {
+            if !sources.contains(&referenced) {
+                sources.push(referenced.clone());
+                queue.push(referenced);
+            }
         }
     }
-    refs
+    sources
 }
 
 /// One-glance badge string for a node's SQL operations, e.g. "⋈2 Σ σ ƒ".
@@ -986,17 +978,7 @@ impl DbtResultsPanel {
                 marked[ix].insert(selected.to_owned());
             }
         }
-        let sources_of = |node: &crate::lineage::GraphLayoutNode, column: &str| -> Vec<String> {
-            let mut sources = vec![column.to_owned()];
-            if let Some(expr) = node.col_exprs.get(column) {
-                for referenced in expr_column_refs(expr) {
-                    if !sources.contains(&referenced) {
-                        sources.push(referenced);
-                    }
-                }
-            }
-            sources
-        };
+        let sources_of = column_sources;
         let mut passes = 0;
         loop {
             let mut changed = false;
@@ -1673,18 +1655,10 @@ impl DbtResultsPanel {
                             to.columns.iter().take(GRAPH_MAX_COLUMNS).enumerate()
                         {
                             let to_lower = to_column.to_lowercase();
-                            // Source candidates: the same name (classic match)
-                            // plus every identifier the target's expression
-                            // references — this keeps lineage across renames,
-                            // e.g. employee_id defined as e.id_employe.
-                            let mut sources = vec![to_lower.clone()];
-                            if let Some(expr) = to.col_exprs.get(&to_lower) {
-                                for referenced in expr_column_refs(expr) {
-                                    if !sources.contains(&referenced) {
-                                        sources.push(referenced);
-                                    }
-                                }
-                            }
+                            // Source candidates: same name plus everything the
+                            // target's expression references, closed through
+                            // the node's own CTE renames.
+                            let sources = column_sources(to, &to_lower);
                             for source in &sources {
                                 let Some(&from_row) = from_rows.get(source) else {
                                     continue;
