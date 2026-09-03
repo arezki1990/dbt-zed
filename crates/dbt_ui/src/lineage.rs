@@ -661,6 +661,63 @@ pub fn lineage_svg(model: &str, lineage: &Lineage) -> String {
 fn parse_select_entries(sql: &str) -> Option<Vec<(String, String)>> {
     let lower = sql.to_lowercase();
     let select_pos = lower.find("select")?;
+    parse_select_entries_at(sql, &lower, select_pos)
+}
+
+/// Every select statement's (column, expression) pairs, merged first-wins —
+/// the earliest (deepest CTE) definition of a name is the real transformation;
+/// later selects are usually passthroughs. One chaining pass resolves columns
+/// whose expression is a bare rename of another parsed column.
+fn parse_all_select_entries(sql: &str) -> std::collections::HashMap<String, String> {
+    let lower = sql.to_lowercase();
+    let is_ident = |ch: u8| ch.is_ascii_alphanumeric() || ch == b'_';
+    let bytes = lower.as_bytes();
+    let mut merged: std::collections::HashMap<String, String> = Default::default();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("select") {
+        let at = from + found;
+        from = at + 6;
+        // Word boundaries so identifiers like `selected` don't match.
+        if at > 0 && is_ident(bytes[at - 1]) {
+            continue;
+        }
+        if bytes.get(at + 6).copied().is_some_and(is_ident) {
+            continue;
+        }
+        if let Some(entries) = parse_select_entries_at(sql, &lower, at) {
+            for (name, expr) in entries {
+                merged.entry(name.to_lowercase()).or_insert(expr);
+            }
+        }
+    }
+    // Chaining: `week_number` defined as bare `numero_semaine` picks up
+    // numero_semaine's own expression when that one is a real transformation.
+    let snapshot = merged.clone();
+    for (name, expr) in merged.iter_mut() {
+        let bare = expr
+            .rsplit('.')
+            .next()
+            .unwrap_or(expr)
+            .trim_matches('"')
+            .to_lowercase();
+        if bare == *name || !bare.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+            continue;
+        }
+        if let Some(base) = snapshot.get(&bare) {
+            let base_bare = base.rsplit('.').next().unwrap_or(base).trim_matches('"');
+            if !base_bare.eq_ignore_ascii_case(&bare) {
+                *expr = base.clone();
+            }
+        }
+    }
+    merged
+}
+
+fn parse_select_entries_at(
+    sql: &str,
+    lower: &str,
+    select_pos: usize,
+) -> Option<Vec<(String, String)>> {
     let body = &sql[select_pos + 6..];
     let body_lower = &lower[select_pos + 6..];
 
@@ -858,13 +915,7 @@ fn build_graph(
             let col_exprs: std::collections::HashMap<String, String> = node
                 .get("compiled_code")
                 .and_then(|value| value.as_str())
-                .and_then(parse_select_entries)
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .map(|(name, expr)| (name.to_lowercase(), expr))
-                        .collect()
-                })
+                .map(parse_all_select_entries)
                 .unwrap_or_default();
             pending.push(PendingNode {
                 unique_id: unique_id.clone(),

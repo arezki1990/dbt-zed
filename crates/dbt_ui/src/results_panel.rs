@@ -5,13 +5,14 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use editor::{Editor, ToOffset as _};
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
-    PathBuilder, Pixels, Point, ScrollHandle, Task, WeakEntity, Window, canvas, point, px,
+    App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, PathBuilder, Pixels, Point, ScrollHandle, Subscription,
+    Task, WeakEntity, Window, anchored, canvas, deferred, point, px,
 };
 use language::LanguageRegistry;
 use settings::Settings as _;
 use ui::{
-    ColumnWidthConfig, ResizableColumnsState, Table, TableInteractionState,
+    ColumnWidthConfig, ContextMenu, ResizableColumnsState, Table, TableInteractionState,
     TableResizeBehavior, prelude::*,
 };
 use util::command::new_command;
@@ -156,6 +157,12 @@ pub struct DbtResultsPanel {
     last_root: Option<PathBuf>,
     /// Project roots already auto-parsed this session.
     parsed_roots: HashSet<PathBuf>,
+    /// When set, the lineage view shows a DAG focused on this column only.
+    column_focus: Option<String>,
+    /// Pan/zoom to restore when leaving column focus.
+    focus_return: Option<((f32, f32), f32)>,
+    /// Open right-click menu on a column row.
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     _run: Task<()>,
     _lineage_refresh: Task<()>,
 }
@@ -416,6 +423,9 @@ impl DbtResultsPanel {
                 show_column_picker: false,
                 last_root: None,
                 parsed_roots: Default::default(),
+                column_focus: None,
+                focus_return: None,
+                context_menu: None,
                 _run: Task::ready(()),
                 _lineage_refresh: Task::ready(()),
             }
@@ -990,7 +1000,7 @@ impl DbtResultsPanel {
                 let to = &layout.nodes[to_ix];
                 // Downstream: target columns whose sources are marked upstream.
                 let mut add_to = Vec::new();
-                for column in to.columns.iter().take(GRAPH_MAX_COLUMNS) {
+                for column in to.columns.iter() {
                     let column = column.to_lowercase();
                     if marked[to_ix].contains(&column) {
                         continue;
@@ -1028,6 +1038,175 @@ impl DbtResultsPanel {
             }
         }
         marked
+    }
+
+    fn enter_column_focus(&mut self, column: String, cx: &mut Context<Self>) {
+        if self.column_focus.is_none() {
+            self.focus_return = Some((self.pan, self.zoom));
+        }
+        self.selected_column = Some(column.clone());
+        self.column_focus = Some(column);
+        self.pan = (0., 0.);
+        self.zoom = 1.0;
+        cx.notify();
+    }
+
+    fn exit_column_focus(&mut self, cx: &mut Context<Self>) {
+        self.column_focus = None;
+        if let Some((pan, zoom)) = self.focus_return.take() {
+            self.pan = pan;
+            self.zoom = zoom;
+        }
+        cx.notify();
+    }
+
+    /// Right-click menu on a column row: focus its lineage, copy things.
+    fn deploy_column_menu(
+        &mut self,
+        column: String,
+        expr: Option<String>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.entity().downgrade();
+        let focus_column = column.clone();
+        let menu = ContextMenu::build(window, cx, |menu, _, _| {
+            menu.context(self.focus_handle.clone())
+                .entry("Focus column lineage", None, {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel
+                            .update(cx, |this, cx| {
+                                this.enter_column_focus(focus_column.to_lowercase(), cx);
+                            })
+                            .ok();
+                    }
+                })
+                .entry("Copy column name", None, {
+                    let column = column.clone();
+                    move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(column.clone()));
+                    }
+                })
+                .when_some(expr, |menu, expr| {
+                    menu.entry("Copy expression", None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(expr.clone()));
+                    })
+                })
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Whether column rows render, given the zoom — always in focus mode.
+    fn columns_visible_at(&self, zoom: f32) -> bool {
+        self.column_focus.is_some() || (self.show_columns && zoom >= COLUMNS_MIN_ZOOM)
+    }
+
+    /// A compact DAG of only the nodes on `column`'s lineage path, each node
+    /// showing just its marked column(s) — the per-column focus view.
+    fn build_column_focus_layout(
+        &self,
+        full: &LayoutGraph,
+        column: &str,
+    ) -> Option<Arc<LayoutGraph>> {
+        use crate::lineage::{
+            GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_NODE_HEIGHT, GRAPH_PADDING,
+            GRAPH_ROW_GAP,
+        };
+        let marks = Self::column_highlights(full, column);
+        let mut kept: Vec<(usize, crate::lineage::GraphLayoutNode)> = Vec::new();
+        for (ix, node) in full.nodes.iter().enumerate() {
+            if marks[ix].is_empty() {
+                continue;
+            }
+            let mut node = node.clone();
+            let mut columns: Vec<String> = node
+                .columns
+                .iter()
+                .filter(|name| marks[ix].contains(&name.to_lowercase()))
+                .cloned()
+                .collect();
+            columns.sort();
+            node.columns = columns;
+            kept.push((ix, node));
+        }
+        if kept.is_empty() {
+            return None;
+        }
+
+        // Restack by level: x from cumulative level widths, y stacked.
+        let mut index_map: HashMap<usize, usize> = HashMap::default();
+        let mut levels: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+        for (kept_ix, (full_ix, node)) in kept.iter().enumerate() {
+            index_map.insert(*full_ix, kept_ix);
+            levels.entry(node.level).or_default().push(kept_ix);
+        }
+        let row_pitch = |node: &crate::lineage::GraphLayoutNode| {
+            GRAPH_NODE_HEIGHT
+                + 4.
+                + node.columns.len() as f32 * GRAPH_COLUMN_ROW_HEIGHT
+                + GRAPH_ROW_GAP
+        };
+        let tallest = levels
+            .values()
+            .map(|ixs| {
+                ixs.iter()
+                    .map(|&kept_ix| row_pitch(&kept[kept_ix].1))
+                    .sum::<f32>()
+            })
+            .fold(0.0_f32, f32::max);
+        let mut x = GRAPH_PADDING;
+        let mut max_height = 0.0_f32;
+        for ixs in levels.values() {
+            let column_width = ixs
+                .iter()
+                .map(|&kept_ix| {
+                    let node = &kept[kept_ix].1;
+                    let longest = node
+                        .columns
+                        .iter()
+                        .map(String::len)
+                        .max()
+                        .unwrap_or(0)
+                        .max(node.name.len());
+                    26. + 8. * longest as f32
+                })
+                .fold(120.0_f32, f32::max);
+            let level_height: f32 = ixs
+                .iter()
+                .map(|&kept_ix| row_pitch(&kept[kept_ix].1))
+                .sum();
+            let mut y = GRAPH_PADDING + (tallest - level_height) / 2.;
+            for &kept_ix in ixs {
+                let node = &mut kept[kept_ix].1;
+                node.x = x;
+                node.y = y;
+                node.width = column_width;
+                node.height =
+                    GRAPH_NODE_HEIGHT + 4. + node.columns.len() as f32 * GRAPH_COLUMN_ROW_HEIGHT;
+                y += row_pitch(node);
+                max_height = max_height.max(y);
+            }
+            x += column_width + GRAPH_COL_GAP;
+        }
+        let edges = full
+            .edges
+            .iter()
+            .filter_map(|(from, to)| Some((*index_map.get(from)?, *index_map.get(to)?)))
+            .collect();
+        Some(Arc::new(LayoutGraph {
+            nodes: kept.into_iter().map(|(_, node)| node).collect(),
+            edges,
+            width: x - GRAPH_COL_GAP + GRAPH_PADDING,
+            height: max_height + GRAPH_PADDING,
+        }))
     }
 
     /// Changes zoom anchored on the graph's gravity center (the browsed
@@ -1162,7 +1341,14 @@ impl DbtResultsPanel {
             }
         }
         let degrees = Arc::new(degrees);
-        let layout = self.filtered_layout(&full_layout);
+        let layout = match self
+            .column_focus
+            .as_ref()
+            .and_then(|column| self.build_column_focus_layout(&full_layout, column))
+        {
+            Some(focus_layout) => focus_layout,
+            None => self.filtered_layout(&full_layout),
+        };
         Some(
             div()
                 .id(SharedString::from(id.to_owned()))
@@ -1269,14 +1455,36 @@ impl DbtResultsPanel {
             self.collapsed_up,
             self.collapsed_down,
         );
+        // Column selection promotes marked-but-hidden columns into the visible
+        // window, so a traced path never disappears into "+N more".
+        let column_marks = self
+            .selected_column
+            .as_ref()
+            .map(|selected| Self::column_highlights(layout, selected));
         let mut index_map = vec![None; node_count];
         let mut nodes = Vec::new();
         for (ix, node) in layout.nodes.iter().enumerate() {
             if visible[ix] {
                 index_map[ix] = Some(nodes.len());
                 let mut node = node.clone();
+                if let Some(marks) = column_marks.as_ref() {
+                    let set = &marks[ix];
+                    let hidden_marked = node
+                        .columns
+                        .iter()
+                        .skip(GRAPH_MAX_COLUMNS)
+                        .any(|column| set.contains(&column.to_lowercase()));
+                    if hidden_marked {
+                        let (mut promoted, rest): (Vec<String>, Vec<String>) = node
+                            .columns
+                            .drain(..)
+                            .partition(|column| set.contains(&column.to_lowercase()));
+                        promoted.extend(rest);
+                        node.columns = promoted;
+                    }
+                }
                 // Semantic zoom: columns collapse away when zoomed out.
-                let columns_visible = self.show_columns && self.zoom >= COLUMNS_MIN_ZOOM;
+                let columns_visible = self.columns_visible_at(self.zoom);
                 if columns_visible && !node.columns.is_empty() {
                     let shown = node.columns.len().min(GRAPH_MAX_COLUMNS);
                     let more = usize::from(node.columns.len() > GRAPH_MAX_COLUMNS);
@@ -1389,7 +1597,7 @@ impl DbtResultsPanel {
         let positioned = Arc::new(positioned);
 
         let edge_nodes = positioned.clone();
-        let show_columns = self.show_columns;
+        let show_columns = self.columns_visible_at(self.zoom);
         let selected_column = self.selected_column.clone();
         let column_marks = selected_column
             .as_ref()
@@ -1447,11 +1655,7 @@ impl DbtResultsPanel {
 
                     // Column-level lineage: same-named columns on connected
                     // nodes get a thin edge from row to row.
-                    if show_columns
-                        && zoom >= COLUMNS_MIN_ZOOM
-                        && !from.columns.is_empty()
-                        && !to.columns.is_empty()
-                    {
+                    if show_columns && !from.columns.is_empty() && !to.columns.is_empty() {
                         let from_rows: HashMap<String, usize> = from
                             .columns
                             .iter()
@@ -1531,7 +1735,7 @@ impl DbtResultsPanel {
                 let workspace = workspace.clone();
                 let materialization_color =
                     Self::materialization_color(&node.materialization, cx);
-                let shown_columns = if self.show_columns && zoom >= COLUMNS_MIN_ZOOM {
+                let shown_columns = if self.columns_visible_at(zoom) {
                     node.columns.len().min(GRAPH_MAX_COLUMNS)
                 } else {
                     0
@@ -1618,6 +1822,8 @@ impl DbtResultsPanel {
                                             let column_lower = column.to_lowercase();
                                             let column_expr =
                                                 node.col_exprs.get(&column_lower).cloned();
+                                            let menu_column = column.clone();
+                                            let menu_expr = column_expr.clone();
                                             let is_selected =
                                                 column_marks.as_ref().is_some_and(|marks| {
                                                     marks.get(ix).is_some_and(|set| {
@@ -1647,8 +1853,29 @@ impl DbtResultsPanel {
                                                     MouseButton::Left,
                                                     |_, _, cx| cx.stop_propagation(),
                                                 )
+                                                .on_mouse_down(
+                                                    MouseButton::Right,
+                                                    cx.listener(
+                                                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                                            this.deploy_column_menu(
+                                                                menu_column.clone(),
+                                                                menu_expr.clone(),
+                                                                event.position,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        },
+                                                    ),
+                                                )
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.selected_column.as_deref()
+                                                    if this.column_focus.is_some() {
+                                                        // Inside focus mode a click re-focuses.
+                                                        this.enter_column_focus(
+                                                            column_lower.clone(),
+                                                            cx,
+                                                        );
+                                                    } else if this.selected_column.as_deref()
                                                         == Some(column_lower.as_str())
                                                     {
                                                         this.selected_column = None;
@@ -2065,6 +2292,34 @@ impl DbtResultsPanel {
                                                 )
                                         })),
                                 )
+                                .when_some(self.column_focus.clone(), |this, column| {
+                                    this.child(
+                                        h_flex()
+                                            .w_full()
+                                            .px_2()
+                                            .py_1()
+                                            .gap_2()
+                                            .items_center()
+                                            .border_b_1()
+                                            .border_color(cx.theme().colors().border)
+                                            .bg(cx.theme().colors().elevated_surface_background)
+                                            .child(
+                                                Label::new(format!(
+                                                    "⌖ Column focus: {}",
+                                                    column.to_uppercase()
+                                                ))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Accent),
+                                            )
+                                            .child(
+                                                Button::new("dbt-focus-back", "Back to graph")
+                                                    .label_size(LabelSize::Small)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.exit_column_focus(cx);
+                                                    })),
+                                            ),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .relative()
@@ -2596,6 +2851,15 @@ impl Render for DbtResultsPanel {
             .size_full()
             .child(self.render_toolbar(cx))
             .child(self.render_body(cx))
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(3)
+            }))
     }
 }
 
