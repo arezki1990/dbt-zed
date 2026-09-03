@@ -29,6 +29,42 @@ use crate::{
     },
 };
 
+/// Identifiers a select expression references (last dot-segment, lowercased),
+/// excluding SQL keywords and common functions — powers rename-aware column
+/// edges: `employee_id` defined as `e.id_employe` links to `id_employe`.
+fn expr_column_refs(expr: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "sum", "count", "avg", "min", "max", "cast", "coalesce", "case", "when", "then",
+        "else", "end", "as", "and", "or", "not", "null", "true", "false", "over",
+        "partition", "by", "order", "asc", "desc", "row_number", "rank", "dense_rank",
+        "lag", "lead", "nullif", "concat", "trim", "upper", "lower", "substring",
+        "substr", "round", "floor", "ceil", "abs", "date", "timestamp", "interval",
+        "extract", "from", "distinct", "int", "integer", "bigint", "varchar", "string",
+        "numeric", "decimal", "float", "boolean", "char", "text", "iff", "ifnull",
+        "listagg", "array_agg", "to_char", "to_date", "to_number", "try_cast", "left",
+        "right", "replace", "split_part", "len", "length", "greatest", "least",
+        "any_value", "first_value", "last_value", "current_date", "current_timestamp",
+    ];
+    let lower = expr.to_lowercase();
+    let mut refs = Vec::new();
+    for token in lower.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.')) {
+        if token.is_empty() {
+            continue;
+        }
+        let ident = token.rsplit('.').next().unwrap_or(token);
+        if ident.is_empty()
+            || ident.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+            || SKIP.contains(&ident)
+        {
+            continue;
+        }
+        if !refs.iter().any(|existing| existing == ident) {
+            refs.push(ident.to_owned());
+        }
+    }
+    refs
+}
+
 /// One-glance badge string for a node's SQL operations, e.g. "⋈2 Σ σ ƒ".
 fn ops_badges(ops: &crate::lineage::NodeOps) -> String {
     let mut badges = Vec::new();
@@ -1292,44 +1328,60 @@ impl DbtResultsPanel {
                         && !from.columns.is_empty()
                         && !to.columns.is_empty()
                     {
-                        let to_rows: HashMap<String, usize> = to
+                        let from_rows: HashMap<String, usize> = from
                             .columns
                             .iter()
                             .take(GRAPH_MAX_COLUMNS)
                             .enumerate()
                             .map(|(row, name)| (name.to_lowercase(), row))
                             .collect();
-                        for (from_row, column) in
-                            from.columns.iter().take(GRAPH_MAX_COLUMNS).enumerate()
+                        for (to_row, to_column) in
+                            to.columns.iter().take(GRAPH_MAX_COLUMNS).enumerate()
                         {
-                            let column_lower = column.to_lowercase();
-                            let Some(&to_row) = to_rows.get(&column_lower) else {
-                                continue;
-                            };
-                            let row_y = |node: &_, row: usize| {
-                                let node: &crate::lineage::GraphLayoutNode = node;
-                                node.y
-                                    + header_height
-                                    + 2. * zoom
-                                    + (row as f32 + 0.5) * column_row_height
-                            };
-                            let start = point(
-                                bounds.origin.x + px(from.x + from.width),
-                                bounds.origin.y + px(row_y(from, from_row)),
-                            );
-                            let end = point(
-                                bounds.origin.x + px(to.x),
-                                bounds.origin.y + px(row_y(to, to_row)),
-                            );
-                            // The selected column's transformation path lights
-                            // up in accent with direction arrows.
-                            let is_selected =
-                                selected_column.as_deref() == Some(column_lower.as_str());
-                            if is_selected {
-                                draw_curve(window, start, end, 2.0, accent);
-                                draw_arrow(window, end, accent);
-                            } else {
-                                draw_curve(window, start, end, 1.0, column_edge_color);
+                            let to_lower = to_column.to_lowercase();
+                            // Source candidates: the same name (classic match)
+                            // plus every identifier the target's expression
+                            // references — this keeps lineage across renames,
+                            // e.g. employee_id defined as e.id_employe.
+                            let mut sources = vec![to_lower.clone()];
+                            if let Some(expr) = to.col_exprs.get(&to_lower) {
+                                for referenced in expr_column_refs(expr) {
+                                    if !sources.contains(&referenced) {
+                                        sources.push(referenced);
+                                    }
+                                }
+                            }
+                            for source in &sources {
+                                let Some(&from_row) = from_rows.get(source) else {
+                                    continue;
+                                };
+                                let row_y = |node: &_, row: usize| {
+                                    let node: &crate::lineage::GraphLayoutNode = node;
+                                    node.y
+                                        + header_height
+                                        + 2. * zoom
+                                        + (row as f32 + 0.5) * column_row_height
+                                };
+                                let start = point(
+                                    bounds.origin.x + px(from.x + from.width),
+                                    bounds.origin.y + px(row_y(from, from_row)),
+                                );
+                                let end = point(
+                                    bounds.origin.x + px(to.x),
+                                    bounds.origin.y + px(row_y(to, to_row)),
+                                );
+                                // The selected column's transformation path
+                                // lights up in accent with direction arrows —
+                                // selecting either endpoint works.
+                                let is_selected = selected_column.as_deref()
+                                    == Some(to_lower.as_str())
+                                    || selected_column.as_deref() == Some(source.as_str());
+                                if is_selected {
+                                    draw_curve(window, start, end, 2.0, accent);
+                                    draw_arrow(window, end, accent);
+                                } else {
+                                    draw_curve(window, start, end, 1.0, column_edge_color);
+                                }
                             }
                         }
                     }
