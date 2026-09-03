@@ -149,6 +149,8 @@ pub struct DbtResultsPanel {
     show_tree: bool,
     /// Details card sidebar for the centered model.
     show_details: bool,
+    /// Full value of a clicked results cell: (column, row number, value).
+    cell_detail: Option<(SharedString, usize, SharedString)>,
     collapsed_up: HashSet<String>,
     collapsed_down: HashSet<String>,
     selected_column: Option<String>,
@@ -429,6 +431,7 @@ impl DbtResultsPanel {
             show_columns: false,
             show_tree: true,
             show_details: false,
+            cell_detail: None,
             collapsed_up: Default::default(),
             collapsed_down: Default::default(),
             selected_column: None,
@@ -2766,6 +2769,8 @@ impl DbtResultsPanel {
                 let indices = Arc::new(self.display_indices(rows, cx));
                 let rows = rows.clone();
                 let display_rows = indices.clone();
+                let cell_columns: Vec<SharedString> = columns.to_vec();
+                let panel = cx.entity().downgrade();
                 let mut headers =
                     vec![Label::new("#").color(Color::Muted).into_any_element()];
                 headers.extend(columns.iter().enumerate().map(|(ix, column)| {
@@ -2803,6 +2808,14 @@ impl DbtResultsPanel {
                             .map(|(ix, _)| self.hidden_columns.contains(&ix)),
                     )
                     .collect();
+                {
+                    let handle = &self.table_interaction.read(cx).horizontal_scroll_handle;
+                    log::debug!(
+                        "dbt table h-scroll: max_offset={:?} viewport={:?}",
+                        handle.max_offset(),
+                        handle.bounds().size,
+                    );
+                }
                 let table = div()
                     .flex_1()
                     .h_full()
@@ -2844,11 +2857,56 @@ impl DbtResultsPanel {
                                                     .color(Color::Muted)
                                                     .into_any_element(),
                                             );
-                                            cells.extend(row.iter().map(|cell| {
-                                                Label::new(cell.clone())
-                                                    .size(LabelSize::Small)
-                                                    .into_any_element()
-                                            }));
+                                            cells.extend(row.iter().enumerate().map(
+                                                |(col_ix, cell)| {
+                                                    // Long values truncate for display; a
+                                                    // click opens the full value.
+                                                    const MAX: usize = 120;
+                                                    let truncated = if cell.len() > MAX {
+                                                        let mut cut = MAX;
+                                                        while !cell.is_char_boundary(cut) {
+                                                            cut -= 1;
+                                                        }
+                                                        SharedString::from(format!(
+                                                            "{}…",
+                                                            &cell[..cut]
+                                                        ))
+                                                    } else {
+                                                        cell.clone()
+                                                    };
+                                                    let full = cell.clone();
+                                                    let column_name = cell_columns
+                                                        .get(col_ix)
+                                                        .cloned()
+                                                        .unwrap_or_default();
+                                                    let panel = panel.clone();
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "dbt-cell-{display_ix}-{col_ix}"
+                                                        )))
+                                                        .cursor_pointer()
+                                                        .on_click(move |_, _, cx| {
+                                                            let full = full.clone();
+                                                            let column_name =
+                                                                column_name.clone();
+                                                            panel
+                                                                .update(cx, |this, cx| {
+                                                                    this.cell_detail = Some((
+                                                                        column_name,
+                                                                        original + 1,
+                                                                        full,
+                                                                    ));
+                                                                    cx.notify();
+                                                                })
+                                                                .ok();
+                                                        })
+                                                        .child(
+                                                            Label::new(truncated)
+                                                                .size(LabelSize::Small),
+                                                        )
+                                                        .into_any_element()
+                                                },
+                                            ));
                                             Some(cells)
                                         })
                                         .collect()
@@ -3222,6 +3280,89 @@ impl Render for DbtResultsPanel {
                     .overflow_hidden()
                     .child(self.render_body(cx)),
             )
+            .when_some(self.cell_detail.clone(), |this, (column, row, value)| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::hsla(0., 0., 0., 0.45))
+                        .id("dbt-cell-detail-backdrop")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cell_detail = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("dbt-cell-detail-card")
+                                .w(px(560.))
+                                .max_h(px(420.))
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().elevated_surface_background)
+                                .shadow_lg()
+                                .p_3()
+                                .gap_2()
+                                .occlude()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(
+                                            Label::new(format!("{column} · row {row}"))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Accent),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new("dbt-cell-copy", "Copy")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click({
+                                                            let value = value.clone();
+                                                            move |_, _, cx| {
+                                                                cx.write_to_clipboard(
+                                                                    ClipboardItem::new_string(
+                                                                        value.to_string(),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        }),
+                                                )
+                                                .child(
+                                                    Button::new("dbt-cell-close", "✕")
+                                                        .label_size(LabelSize::Small)
+                                                        .on_click(cx.listener(
+                                                            |this, _, _, cx| {
+                                                                this.cell_detail = None;
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("dbt-cell-detail-value")
+                                        .flex_1()
+                                        .min_h(px(0.))
+                                        .overflow_y_scroll()
+                                        .child(
+                                            div()
+                                                .font_family("Menlo")
+                                                .text_size(px(12.))
+                                                .whitespace_normal()
+                                                .child(value.clone()),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
