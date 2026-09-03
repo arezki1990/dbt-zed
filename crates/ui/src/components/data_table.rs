@@ -682,6 +682,21 @@ pub fn render_table_row(
             .collect();
         let scrollable: Vec<(AnyElement, Option<Length>)> = kept.drain(pinned_visible..).collect();
 
+        // Explicit strip width: intrinsic sizing of a scroll container's flex
+        // content does not reliably propagate fixed cell widths (taffy sizes
+        // the strip to the viewport), so sum the definite widths directly —
+        // the same approach the resize-divider overlay uses.
+        let rem_size = window.rem_size();
+        let strip_width: Pixels = scrollable
+            .iter()
+            .filter_map(|(_, width)| match width {
+                Some(Length::Definite(DefiniteLength::Absolute(abs))) => {
+                    Some(abs.to_pixels(rem_size))
+                }
+                _ => None,
+            })
+            .fold(px(0.), |acc, width| acc + width);
+
         let pinned_section = div().flex().flex_row().flex_shrink_0().children(
             kept.into_iter()
                 .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
@@ -700,11 +715,16 @@ pub fn render_table_row(
                 // The strip must keep its intrinsic width (sum of the fixed
                 // cells) — as a shrinkable flex child it would compress to
                 // the viewport and the row could never overflow-scroll.
-                div().flex().flex_row().flex_shrink_0().children(
-                    scrollable
-                        .into_iter()
-                        .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
-                ),
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_shrink_0()
+                    .when(strip_width > px(0.), |this| this.w(strip_width))
+                    .children(
+                        scrollable
+                            .into_iter()
+                            .map(|(cell, width)| render_cell(width, cell, &table_context, cx)),
+                    ),
             );
 
         if let Some(ref handle) = table_context.h_scroll_handle {
