@@ -28,6 +28,14 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'macos'
     runs-on: macos-15
     timeout-minutes: 360
+    env:
+      # When these secrets are configured, bundle-mac signs and notarizes the
+      # app; while unset it produces an unsigned build (same script behavior).
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+      APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+      APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Bundle
