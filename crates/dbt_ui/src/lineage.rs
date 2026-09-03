@@ -661,7 +661,9 @@ pub fn lineage_svg(model: &str, lineage: &Lineage) -> String {
 fn parse_select_entries(sql: &str) -> Option<Vec<(String, String)>> {
     let lower = sql.to_lowercase();
     let select_pos = lower.find("select")?;
-    parse_select_entries_at(sql, &lower, select_pos)
+    let (entries, saw_star) = parse_select_entries_at(sql, &lower, select_pos)?;
+    // A `select *` (or `t.*`) hides columns, so the list is not authoritative.
+    (!saw_star).then_some(entries)
 }
 
 /// Every select statement's (column, expression) pairs, merged first-wins —
@@ -684,7 +686,7 @@ fn parse_all_select_entries(sql: &str) -> std::collections::HashMap<String, Stri
         if bytes.get(at + 6).copied().is_some_and(is_ident) {
             continue;
         }
-        if let Some(entries) = parse_select_entries_at(sql, &lower, at) {
+        if let Some((entries, _)) = parse_select_entries_at(sql, &lower, at) {
             for (name, expr) in entries {
                 merged.entry(name.to_lowercase()).or_insert(expr);
             }
@@ -713,11 +715,13 @@ fn parse_all_select_entries(sql: &str) -> std::collections::HashMap<String, Stri
     merged
 }
 
+/// Returns the (name, expression) entries of one select list plus whether a
+/// bare `*` / `alias.*` projection was seen.
 fn parse_select_entries_at(
     sql: &str,
     lower: &str,
     select_pos: usize,
-) -> Option<Vec<(String, String)>> {
+) -> Option<(Vec<(String, String)>, bool)> {
     let body = &sql[select_pos + 6..];
     let body_lower = &lower[select_pos + 6..];
 
@@ -747,7 +751,7 @@ fn parse_select_entries_at(
         i += 1;
     }
     let mut list = &body[..from_ix?];
-    if list.contains('*') || list.contains("{{") {
+    if list.contains("{{") {
         return None;
     }
     if let Some(stripped) = list.trim_start().strip_prefix("distinct") {
@@ -755,9 +759,14 @@ fn parse_select_entries_at(
     }
 
     let mut columns = Vec::new();
+    let mut saw_star = false;
     let mut push = |segment: &str| {
         let segment = segment.trim();
         if segment.is_empty() {
+            return;
+        }
+        if segment == "*" || segment.ends_with(".*") {
+            saw_star = true;
             return;
         }
         let segment_lower = segment.to_lowercase();
@@ -774,7 +783,12 @@ fn parse_select_entries_at(
             // Whitespace-normalize and cap the expression for display.
             let mut expr = expr.split_whitespace().collect::<Vec<_>>().join(" ");
             if expr.len() > 160 {
-                expr.truncate(157);
+                // Truncate on a char boundary (comments may hold non-ASCII).
+                let mut cut = 157;
+                while !expr.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                expr.truncate(cut);
                 expr.push_str("...");
             }
             columns.push((name.to_owned(), expr));
@@ -795,7 +809,7 @@ fn parse_select_entries_at(
     }
     push(&list[start..]);
 
-    (!columns.is_empty()).then_some(columns)
+    (!columns.is_empty()).then_some((columns, saw_star))
 }
 
 fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
