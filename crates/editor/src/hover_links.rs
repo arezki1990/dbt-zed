@@ -439,6 +439,8 @@ pub fn show_link_definition(
                     let mut links = Vec::new();
                     let mut symbol_range = None;
 
+                    let mut skip_lsp_definitions = false;
+
                     // LSP-provided document link wins over heuristic URL/file
                     // detection at the same position: the server tells us the
                     // exact range and target, while `find_url`/`find_file` are
@@ -448,6 +450,19 @@ pub fn show_link_definition(
                     {
                         symbol_range = Some(RangeInEditor::Text(multi_buffer_range));
                         links.push(document_link_target_to_hover_link(&target, server_id));
+                    } else if let Some((name_range, file_target)) =
+                        find_dbt_model_link(&buffer, project.clone(), anchor, cx)
+                    {
+                        let snapshot =
+                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                        if let Some(range) = snapshot.buffer_anchor_range_to_anchor_range(name_range)
+                        {
+                            symbol_range = Some(RangeInEditor::Text(range));
+                        }
+                        links.push(HoverLink::File(file_target));
+                        // The dbt language server stalls definition requests
+                        // behind project compilation; the local link is enough.
+                        skip_lsp_definitions = true;
                     } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
                         let snapshot =
                             this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
@@ -472,7 +487,7 @@ pub fn show_link_definition(
                     // Always also collect LSP definitions so that cmd-click
                     // reveals every applicable target (e.g. a position that
                     // carries both a document link and a definition).
-                    if let Some(provider) = provider {
+                    if !skip_lsp_definitions && let Some(provider) = provider {
                         let task = cx.update(|_, cx| {
                             provider.definitions(&buffer, anchor, preferred_kind, cx)
                         })?;
@@ -738,6 +753,118 @@ pub(crate) fn find_url_from_range(
     }
 
     None
+}
+
+/// Fork: instant cmd-hover links for dbt `ref('model')` calls. The dbt
+/// language server blocks go-to-definition on a full project compilation
+/// (minutes on large projects), so the model file is resolved directly from
+/// the worktree instead — the underline and cmd-click are immediate.
+pub(crate) fn find_dbt_model_link(
+    buffer: &Entity<language::Buffer>,
+    project: Option<Entity<Project>>,
+    position: text::Anchor,
+    cx: &AsyncWindowContext,
+) -> Option<(Range<text::Anchor>, ResolvedFileTarget)> {
+    const WINDOW: usize = 256;
+
+    let project = project?;
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    if snapshot.language().is_none_or(|language| language.name().as_ref() != "dbt SQL") {
+        return None;
+    }
+
+    let offset = position.to_offset(&snapshot);
+    let window_start = offset.saturating_sub(WINDOW);
+    let mut window_end = offset;
+    for ch in snapshot.chars_at(offset).take(WINDOW) {
+        window_end += ch.len_utf8();
+    }
+    let text = snapshot
+        .text_for_range(window_start..window_end)
+        .collect::<String>();
+    let cursor = offset - window_start;
+
+    // Find a ref(...) whose first quoted argument contains the cursor.
+    let mut model_span = None;
+    let mut search_from = 0;
+    while let Some(found) = text[search_from..].find("ref(") {
+        let call_start = search_from + found;
+        search_from = call_start + 4;
+        // Reject identifiers merely ending in "ref", e.g. `my_ref(`.
+        if call_start > 0
+            && text[..call_start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            continue;
+        }
+        let rest = &text[call_start + 4..];
+        let Some(quote_rel) = rest.find(['\'', '"']) else {
+            continue;
+        };
+        if !rest[..quote_rel].trim().is_empty() {
+            continue;
+        }
+        let quote = rest.as_bytes()[quote_rel] as char;
+        let name_start = call_start + 4 + quote_rel + 1;
+        let Some(name_len) = text[name_start..].find(quote) else {
+            continue;
+        };
+        let name = &text[name_start..name_start + name_len];
+        if cursor >= call_start
+            && cursor <= name_start + name_len + 1
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '.')
+        {
+            model_span = Some((name_start, name_len, name.to_owned()));
+            break;
+        }
+    }
+    let (name_start, name_len, model_name) = model_span?;
+
+    // Resolve `<model>.sql` in the project worktrees, preferring model paths.
+    let file_name = format!("{model_name}.sql");
+    let resolved = project.read_with(cx, |project, cx| {
+        let mut fallback = None;
+        for worktree in project.worktrees(cx) {
+            let worktree = worktree.read(cx);
+            let worktree_id = worktree.id();
+            for entry in worktree.snapshot().files(false, 0) {
+                if entry.path.file_name() == Some(file_name.as_str()) {
+                    let project_path = project::ProjectPath {
+                        worktree_id,
+                        path: entry.path.clone(),
+                    };
+                    if entry
+                        .path
+                        .components()
+                        .any(|component| component == "models")
+                    {
+                        return Some(project_path);
+                    }
+                    fallback.get_or_insert(project_path);
+                }
+            }
+        }
+        fallback
+    })?;
+
+    let range = snapshot.anchor_before(window_start + name_start)
+        ..snapshot.anchor_after(window_start + name_start + name_len);
+    Some((
+        range,
+        ResolvedFileTarget {
+            resolved_path: ResolvedPath::ProjectPath {
+                project_path: resolved,
+                is_dir: false,
+            },
+            row: None,
+            column: None,
+        },
+    ))
 }
 
 #[derive(Debug, Clone)]
