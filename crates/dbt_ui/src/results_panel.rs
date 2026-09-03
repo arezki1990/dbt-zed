@@ -167,6 +167,10 @@ pub struct DbtResultsPanel {
     last_root: Option<PathBuf>,
     /// Project roots already auto-parsed this session.
     parsed_roots: HashSet<PathBuf>,
+    /// Recenter the viewport on the browsed model at the next paint-valid
+    /// render (set when a lineage refresh lands while the canvas isn't
+    /// painted yet, e.g. another results tab is active).
+    pending_center: bool,
     /// Nodes expanded past the lineage depth budget via their + handle.
     depth_expansions: HashSet<String>,
     /// When set, the lineage view shows a DAG focused on this column only.
@@ -435,6 +439,7 @@ impl DbtResultsPanel {
                 show_column_picker: false,
                 last_root: None,
                 parsed_roots: Default::default(),
+                pending_center: false,
                 depth_expansions: Default::default(),
                 column_focus: None,
                 focus_return: None,
@@ -638,7 +643,7 @@ impl DbtResultsPanel {
                 }
                 this.lineage_tree = tree.map(Arc::new);
                 this.lineage_layout = layout.map(Arc::new);
-                this.center_on_model();
+                this.pending_center = !this.center_on_model();
                 this.expanded.clear();
                 this.collapsed_up.clear();
                 this.collapsed_down.clear();
@@ -745,7 +750,7 @@ impl DbtResultsPanel {
                 match result {
                     Ok((columns, rows, compiled, lineage_tree, lineage_layout)) => {
                         this.lineage_layout = lineage_layout;
-                        this.center_on_model();
+                        this.pending_center = !this.center_on_model();
                         this.lineage_tree = lineage_tree;
                         this.expanded.clear();
                         this.collapsed_up.clear();
@@ -1219,19 +1224,18 @@ impl DbtResultsPanel {
 
     /// Pans the canvas so the centered (browsed) model sits in the middle of
     /// the viewport — browsing a file always brings its node into view.
-    fn center_on_model(&mut self) {
+    fn center_on_model(&mut self) -> bool {
         let Some(layout) = self.lineage_layout.as_ref() else {
-            return;
+            return true;
         };
         let Some(node) = layout.nodes.iter().find(|node| node.is_center) else {
-            return;
+            return true;
         };
         let viewport = self.canvas_scroll.bounds().size;
         let (view_w, view_h) = (f32::from(viewport.width), f32::from(viewport.height));
         if view_w <= 1. || view_h <= 1. {
-            // Not painted yet; keep the neutral origin.
-            self.pan = (0., 0.);
-            return;
+            // The canvas hasn't painted yet — retry on a later render.
+            return false;
         }
         let offset = self
             .node_offsets
@@ -1242,6 +1246,7 @@ impl DbtResultsPanel {
         let center_y = (node.y + node.height / 2.) * self.zoom + offset.1;
         self.pan = (view_w / 2. - center_x, view_h / 2. - center_y);
         self.canvas_scroll.set_offset(point(px(0.), px(0.)));
+        true
     }
 
     /// Changes zoom anchored on the graph's gravity center (the browsed
@@ -2931,7 +2936,16 @@ impl Focusable for DbtResultsPanel {
 }
 
 impl Render for DbtResultsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_center {
+            if self.center_on_model() {
+                self.pending_center = false;
+            } else {
+                // Canvas not measured yet: try again right after this frame.
+                let entity = cx.entity_id();
+                window.on_next_frame(move |_, cx| cx.notify(entity));
+            }
+        }
         v_flex()
             .key_context("DbtResultsPanel")
             .track_focus(&self.focus_handle)
