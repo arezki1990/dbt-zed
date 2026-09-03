@@ -410,7 +410,9 @@ impl DbtResultsPanel {
             focus_handle: cx.focus_handle(),
             table_interaction: cx.new(|cx| {
                 TableInteractionState::new(cx).with_custom_scrollbar(
-                    ui::Scrollbars::for_settings::<editor::EditorSettingsScrollbarProxy>(),
+                    // Always-visible scrollbars: wide result sets need the
+                    // horizontal bar discoverable, not hover-revealed.
+                    ui::Scrollbars::always_visible(ui::ScrollAxes::Both),
                 )
             }),
             languages,
