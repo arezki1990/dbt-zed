@@ -473,6 +473,17 @@ pub fn show_link_definition(
                         // The dbt language server stalls definition requests
                         // behind project compilation; the local link is enough.
                         skip_lsp_definitions = true;
+                    } else if let Some((name_range, file_target)) =
+                        find_dbt_cte_link(&buffer, anchor, cx)
+                    {
+                        let snapshot =
+                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                        if let Some(range) = snapshot.buffer_anchor_range_to_anchor_range(name_range)
+                        {
+                            symbol_range = Some(RangeInEditor::Text(range));
+                        }
+                        links.push(HoverLink::File(file_target));
+                        skip_lsp_definitions = true;
                     } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
                         let snapshot =
                             this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
@@ -763,6 +774,104 @@ pub(crate) fn find_url_from_range(
     }
 
     None
+}
+
+/// Fork: instant cmd-hover links from a CTE usage to its `name as (`
+/// definition within the same dbt SQL buffer.
+pub(crate) fn find_dbt_cte_link(
+    buffer: &Entity<language::Buffer>,
+    position: text::Anchor,
+    cx: &AsyncWindowContext,
+) -> Option<(Range<text::Anchor>, ResolvedFileTarget)> {
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    if snapshot.language().is_none_or(|language| language.name().as_ref() != "dbt SQL") {
+        return None;
+    }
+
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let offset = position.to_offset(&snapshot);
+
+    // The identifier under the cursor.
+    let mut word_start = offset;
+    for ch in snapshot.reversed_chars_at(offset).take(128) {
+        if !is_ident(ch) {
+            break;
+        }
+        word_start -= ch.len_utf8();
+    }
+    let mut word_end = offset;
+    for ch in snapshot.chars_at(offset).take(128) {
+        if !is_ident(ch) {
+            break;
+        }
+        word_end += ch.len_utf8();
+    }
+    if word_start == word_end {
+        return None;
+    }
+    let word = snapshot
+        .text_for_range(word_start..word_end)
+        .collect::<String>();
+    if word.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    // Find a `word as (` definition site anywhere in the buffer.
+    let text = snapshot.text();
+    let mut def_start = None;
+    let mut from = 0;
+    while let Some(found) = text[from..].find(&word) {
+        let start = from + found;
+        from = start + word.len();
+        if text[..start].chars().next_back().is_some_and(is_ident) {
+            continue;
+        }
+        let after = &text[start + word.len()..];
+        if after.chars().next().is_some_and(is_ident) {
+            continue;
+        }
+        // Expect whitespace, `as` (any case), then an opening paren.
+        if after.chars().next().is_none_or(|ch| !ch.is_whitespace()) {
+            continue;
+        }
+        let trimmed = after.trim_start();
+        if !trimmed.get(..2).is_some_and(|kw| kw.eq_ignore_ascii_case("as")) {
+            continue;
+        }
+        let rest = &trimmed[2..];
+        if rest.chars().next().is_some_and(is_ident) {
+            continue;
+        }
+        if rest.trim_start().starts_with('(') {
+            def_start = Some(start);
+            break;
+        }
+    }
+    let def_start = def_start?;
+    // No self-link when the cursor is already on the definition.
+    if offset >= def_start && offset <= def_start + word.len() {
+        return None;
+    }
+
+    let def_point = snapshot.offset_to_point(def_start);
+    let project_path = buffer.read_with(cx, |buffer, cx| {
+        project::File::from_dyn(buffer.file()).map(|file| project::ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path.clone(),
+        })
+    })?;
+    let range = snapshot.anchor_before(word_start)..snapshot.anchor_after(word_end);
+    Some((
+        range,
+        ResolvedFileTarget {
+            resolved_path: ResolvedPath::ProjectPath {
+                project_path,
+                is_dir: false,
+            },
+            row: Some(def_point.row + 1),
+            column: Some(def_point.column + 1),
+        },
+    ))
 }
 
 /// Fork: instant cmd-hover links for dbt `ref('model')` calls. The dbt
