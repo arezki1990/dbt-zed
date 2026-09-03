@@ -546,10 +546,12 @@ impl DbtResultsPanel {
     /// query — this is what makes file browsing drive the graph.
     fn refresh_lineage(&mut self, model: String, root: PathBuf, cx: &mut Context<Self>) {
         if self.lineage_model.as_deref() == Some(model.as_str()) {
-            // Same model re-opened: the graph is current, but still bring the
-            // centered node back into view.
-            self.pending_center = true;
-            cx.notify();
+            // Same model still active: only pull it back when it has actually
+            // left the viewport — never fight manual panning.
+            if !self.center_in_view() {
+                self.pending_center = true;
+                cx.notify();
+            }
             return;
         }
 
@@ -1226,6 +1228,29 @@ impl DbtResultsPanel {
         }))
     }
 
+    /// Whether the centered model is currently visible in the viewport.
+    fn center_in_view(&self) -> bool {
+        let Some(layout) = self.lineage_layout.as_ref() else {
+            return true;
+        };
+        let Some(node) = layout.nodes.iter().find(|node| node.is_center) else {
+            return true;
+        };
+        let viewport = self.canvas_scroll.bounds().size;
+        let (view_w, view_h) = (f32::from(viewport.width), f32::from(viewport.height));
+        if view_w <= 1. || view_h <= 1. {
+            return true;
+        }
+        let offset = self
+            .node_offsets
+            .get(&node.name)
+            .copied()
+            .unwrap_or((0., 0.));
+        let x = (node.x + node.width / 2.) * self.zoom + offset.0 + self.pan.0;
+        let y = (node.y + node.height / 2.) * self.zoom + offset.1 + self.pan.1;
+        x >= 0. && x <= view_w && y >= 0. && y <= view_h
+    }
+
     /// Pans the canvas so the centered (browsed) model sits in the middle of
     /// the viewport — browsing a file always brings its node into view.
     fn center_on_model(&mut self) -> bool {
@@ -1250,7 +1275,7 @@ impl DbtResultsPanel {
         let center_y = (node.y + node.height / 2.) * self.zoom + offset.1;
         self.pan = (view_w / 2. - center_x, view_h / 2. - center_y);
         self.canvas_scroll.set_offset(point(px(0.), px(0.)));
-        log::debug!(
+        log::info!(
             "dbt lineage: centered {} at ({center_x:.0},{center_y:.0}) in {view_w:.0}x{view_h:.0} -> pan ({:.0},{:.0})",
             node.name,
             self.pan.0,
