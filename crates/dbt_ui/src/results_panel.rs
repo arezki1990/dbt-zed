@@ -951,28 +951,112 @@ impl DbtResultsPanel {
     /// the Results view (side pane) and the Lineage view.
     /// When a column is selected, an overlay tracing the transformation each
     /// model on the path applies to it — source to target, in level order.
+    /// Per-node set of column names on the selected column's lineage path,
+    /// propagated transitively through renames in both directions: a target
+    /// column marks the upstream columns its expression references, and a
+    /// downstream column referencing a marked one gets marked too.
+    fn column_highlights(
+        layout: &LayoutGraph,
+        selected: &str,
+    ) -> Vec<std::collections::HashSet<String>> {
+        let mut marked: Vec<std::collections::HashSet<String>> =
+            vec![Default::default(); layout.nodes.len()];
+        for (ix, node) in layout.nodes.iter().enumerate() {
+            if node
+                .columns
+                .iter()
+                .any(|column| column.to_lowercase() == selected)
+            {
+                marked[ix].insert(selected.to_owned());
+            }
+        }
+        let sources_of = |node: &crate::lineage::GraphLayoutNode, column: &str| -> Vec<String> {
+            let mut sources = vec![column.to_owned()];
+            if let Some(expr) = node.col_exprs.get(column) {
+                for referenced in expr_column_refs(expr) {
+                    if !sources.contains(&referenced) {
+                        sources.push(referenced);
+                    }
+                }
+            }
+            sources
+        };
+        let mut passes = 0;
+        loop {
+            let mut changed = false;
+            passes += 1;
+            for &(from_ix, to_ix) in &layout.edges {
+                let from = &layout.nodes[from_ix];
+                let to = &layout.nodes[to_ix];
+                // Downstream: target columns whose sources are marked upstream.
+                let mut add_to = Vec::new();
+                for column in to.columns.iter().take(GRAPH_MAX_COLUMNS) {
+                    let column = column.to_lowercase();
+                    if marked[to_ix].contains(&column) {
+                        continue;
+                    }
+                    if sources_of(to, &column)
+                        .iter()
+                        .any(|source| marked[from_ix].contains(source))
+                    {
+                        add_to.push(column);
+                    }
+                }
+                // Upstream: sources referenced by marked target columns.
+                let mut add_from = Vec::new();
+                for column in marked[to_ix].iter() {
+                    for source in sources_of(to, column) {
+                        if !marked[from_ix].contains(&source)
+                            && from
+                                .columns
+                                .iter()
+                                .any(|from_column| from_column.to_lowercase() == source)
+                        {
+                            add_from.push(source);
+                        }
+                    }
+                }
+                for column in add_to {
+                    changed |= marked[to_ix].insert(column);
+                }
+                for source in add_from {
+                    changed |= marked[from_ix].insert(source);
+                }
+            }
+            if !changed || passes > 16 {
+                break;
+            }
+        }
+        marked
+    }
+
     fn render_column_trace(&self, cx: &Context<Self>) -> Option<gpui::Div> {
         let column = self.selected_column.clone()?;
         let layout = self.lineage_layout.as_ref()?;
+        // Rename-aware: follow the same propagation as the canvas highlight,
+        // so renamed columns appear in the trace under their local names.
+        let marks = Self::column_highlights(layout, &column);
         let mut steps: Vec<(i32, String, String, bool)> = layout
             .nodes
             .iter()
-            .filter(|node| {
-                node.columns
+            .enumerate()
+            .filter(|(ix, _)| !marks[*ix].is_empty())
+            .map(|(ix, node)| {
+                let local = marks[ix]
                     .iter()
-                    .any(|name| name.to_lowercase() == column)
-            })
-            .map(|node| {
-                let expr = node.col_exprs.get(&column).cloned();
+                    .min()
+                    .cloned()
+                    .unwrap_or_else(|| column.clone());
+                let expr = node.col_exprs.get(&local).cloned();
                 let is_transform = expr.as_ref().is_some_and(|expr| {
                     let lower = expr.to_lowercase();
-                    lower != column && !lower.ends_with(&format!(".{column}"))
+                    lower != local && !lower.ends_with(&format!(".{local}"))
                 });
                 let label = match expr {
-                    Some(expr) if is_transform => expr,
-                    Some(_) => "passthrough".to_owned(),
-                    None if node.kind == "source" => "source".to_owned(),
-                    None => "—".to_owned(),
+                    Some(expr) if is_transform => format!("{local} = {expr}"),
+                    Some(_) => format!("{local} · passthrough"),
+                    None if node.kind == "source" => format!("{local} · source"),
+                    None => local.clone(),
                 };
                 (node.level, node.name.clone(), label, is_transform)
             })
@@ -1271,6 +1355,10 @@ impl DbtResultsPanel {
         let edge_nodes = positioned.clone();
         let show_columns = self.show_columns;
         let selected_column = self.selected_column.clone();
+        let column_marks = selected_column
+            .as_ref()
+            .map(|selected| Arc::new(Self::column_highlights(&layout, selected)));
+        let edge_column_marks = column_marks.clone();
         let accent = center_border;
         let mut column_edge_color = edge_color;
         column_edge_color.a *= if selected_column.is_some() { 0.2 } else { 0.45 };
@@ -1373,9 +1461,11 @@ impl DbtResultsPanel {
                                 // The selected column's transformation path
                                 // lights up in accent with direction arrows —
                                 // selecting either endpoint works.
-                                let is_selected = selected_column.as_deref()
-                                    == Some(to_lower.as_str())
-                                    || selected_column.as_deref() == Some(source.as_str());
+                                let is_selected =
+                                    edge_column_marks.as_ref().is_some_and(|marks| {
+                                        marks[to_ix].contains(to_lower.as_str())
+                                            && marks[from_ix].contains(source.as_str())
+                                    });
                                 if is_selected {
                                     draw_curve(window, start, end, 2.0, accent);
                                     draw_arrow(window, end, accent);
@@ -1492,8 +1582,12 @@ impl DbtResultsPanel {
                                             let column_lower = column.to_lowercase();
                                             let column_expr =
                                                 node.col_exprs.get(&column_lower).cloned();
-                                            let is_selected = self.selected_column.as_deref()
-                                                == Some(column_lower.as_str());
+                                            let is_selected =
+                                                column_marks.as_ref().is_some_and(|marks| {
+                                                    marks.get(ix).is_some_and(|set| {
+                                                        set.contains(&column_lower)
+                                                    })
+                                                });
                                             let mut selected_bg = center_border;
                                             selected_bg.a = 0.16;
                                             div()
