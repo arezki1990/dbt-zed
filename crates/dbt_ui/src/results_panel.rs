@@ -2803,10 +2803,7 @@ impl DbtResultsPanel {
                     .collect();
                 let table = div()
                     .flex_1()
-                    // flex_1 must own the height; h_full would size to the
-                    // whole panel and push the last rows under its bottom
-                    // edge by the toolbar's height.
-                    .min_h(px(0.))
+                    .h_full()
                     .min_w(px(0.))
                     .overflow_hidden()
                     .child(
@@ -3212,7 +3209,17 @@ impl Render for DbtResultsPanel {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(self.render_toolbar(cx))
-            .child(self.render_body(cx))
+            // The body must own exactly the space left under the toolbar —
+            // its inner size_full elements resolve against this wrapper, not
+            // the whole panel (which clipped the bottom by the toolbar height).
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_body(cx)),
+            )
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
