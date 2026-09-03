@@ -173,6 +173,8 @@ pub struct DbtResultsPanel {
     /// render (set when a lineage refresh lands while the canvas isn't
     /// painted yet, e.g. another results tab is active).
     pending_center: bool,
+    /// Consecutive render frames spent waiting for canvas bounds.
+    center_retry_frames: u8,
     /// Nodes expanded past the lineage depth budget via their + handle.
     depth_expansions: HashSet<String>,
     /// When set, the lineage view shows a DAG focused on this column only.
@@ -443,6 +445,7 @@ impl DbtResultsPanel {
                 last_root: None,
                 parsed_roots: Default::default(),
                 pending_center: false,
+                center_retry_frames: 0,
                 depth_expansions: Default::default(),
                 column_focus: None,
                 focus_return: None,
@@ -1542,7 +1545,7 @@ impl DbtResultsPanel {
             }
         }
 
-        log::info!(
+        log::debug!(
             "dbt lineage: visibility {}/{} nodes (show_up={} show_down={} collapsed_up={:?} collapsed_down={:?})",
             visible.iter().filter(|visible| **visible).count(),
             node_count,
@@ -3182,11 +3185,23 @@ impl Render for DbtResultsPanel {
         if self.pending_center {
             if self.center_on_model() {
                 self.pending_center = false;
-            } else {
-                // Canvas not measured yet: try again right after this frame.
-                let entity = cx.entity_id();
-                window.on_next_frame(move |_, cx| cx.notify(entity));
+                self.center_retry_frames = 0;
+            } else if self.view == ResultsView::Lineage {
+                // Canvas visible but not measured yet: nudge one more frame,
+                // with a hard cap so this can never become a notify loop
+                // (that exact loop once froze the app when the canvas was
+                // hidden behind another tab).
+                self.center_retry_frames += 1;
+                if self.center_retry_frames <= 10 {
+                    let entity = cx.entity_id();
+                    window.on_next_frame(move |_, cx| cx.notify(entity));
+                } else {
+                    self.pending_center = false;
+                    self.center_retry_frames = 0;
+                }
             }
+            // Hidden canvas: keep the flag armed silently — the next render
+            // with the lineage view visible applies it.
         }
         v_flex()
             .key_context("DbtResultsPanel")
