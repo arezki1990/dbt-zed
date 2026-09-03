@@ -1152,6 +1152,42 @@ impl ContextServerStore {
                     });
             }
         }
+        // Fork: dbt projects get zdbt's built-in MCP server automatically —
+        // this binary re-invoked with --dbt-mcp — unless the user configured
+        // their own "dbt" entry.
+        if !merged.contains_key("dbt") {
+            let has_dbt_project = worktree_store.read(cx).visible_worktrees(cx).any(|worktree| {
+                let root = worktree.read(cx).abs_path();
+                if root.join("dbt_project.yml").is_file() {
+                    return true;
+                }
+                std::fs::read_dir(&root)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .take(64)
+                    .any(|entry| entry.path().join("dbt_project.yml").is_file())
+            });
+            if has_dbt_project && let Ok(exe) = std::env::current_exe() {
+                merged.insert(
+                    "dbt".into(),
+                    ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: ContextServerSettings::Stdio {
+                            enabled: true,
+                            remote: false,
+                            command: settings::ContextServerCommand {
+                                path: exe,
+                                args: vec!["--dbt-mcp".to_owned()],
+                                env: None,
+                                timeout: None,
+                            },
+                        },
+                    },
+                );
+            }
+        }
         merged
     }
 

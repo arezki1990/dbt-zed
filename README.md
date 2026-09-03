@@ -96,9 +96,12 @@ auto-update so builds don't replace themselves with official Zed.
 
 The binary doubles as an MCP server: `zdbt --dbt-mcp` speaks MCP over stdio,
 exposing `dbt_list_models`, `dbt_model_info`, `dbt_lineage`,
-`dbt_column_lineage`, `dbt_show`, and `dbt_compile`. Register it for Zed's
-agent panel in `settings.json` (adjust the path to your build or
-`/Applications/zdbt.app/Contents/MacOS/zdbt`):
+`dbt_column_lineage`, `dbt_show`, and `dbt_compile`.
+
+**Inside zdbt no setup is needed**: any workspace containing a dbt project
+auto-registers the built-in `dbt` context server for the agent panel (your own
+`context_servers.dbt` entry overrides it). For external MCP clients, point
+them at the binary yourself:
 
 ```json
 "context_servers": {
