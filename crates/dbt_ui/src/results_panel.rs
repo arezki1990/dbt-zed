@@ -2803,7 +2803,10 @@ impl DbtResultsPanel {
                     .collect();
                 let table = div()
                     .flex_1()
-                    .h_full()
+                    // flex_1 must own the height; h_full would size to the
+                    // whole panel and push the last rows under its bottom
+                    // edge by the toolbar's height.
+                    .min_h(px(0.))
                     .min_w(px(0.))
                     .overflow_hidden()
                     .child(
