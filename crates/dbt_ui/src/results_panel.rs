@@ -11,10 +11,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use settings::Settings as _;
-use ui::{
-    ColumnWidthConfig, ContextMenu, ResizableColumnsState, Table, TableInteractionState,
-    TableResizeBehavior, prelude::*,
-};
+use ui::{ContextMenu, WithScrollbar, prelude::*};
 use util::command::new_command;
 use workspace::{
     Workspace,
@@ -133,7 +130,6 @@ const COLUMNS_MIN_ZOOM: f32 = 0.55;
 
 pub struct DbtResultsPanel {
     focus_handle: FocusHandle,
-    table_interaction: Entity<TableInteractionState>,
     languages: Arc<LanguageRegistry>,
     workspace: WeakEntity<Workspace>,
     lineage_store: Arc<LineageStore>,
@@ -165,7 +161,13 @@ pub struct DbtResultsPanel {
     search_editor: Entity<Editor>,
     /// Active sort: (column index, ascending).
     sort: Option<(usize, bool)>,
-    column_widths: Option<Entity<ResizableColumnsState>>,
+    /// Per-column pixel widths (original column index -> width). The
+    /// row-number gutter is fixed separately.
+    col_widths: HashMap<usize, f32>,
+    /// Active column resize: (column index, pointer x at start, width at start).
+    col_resize: Option<(usize, f32, f32)>,
+    grid_h_scroll: ScrollHandle,
+    grid_v_scroll: gpui::UniformListScrollHandle,
     hidden_columns: HashSet<usize>,
     show_column_picker: bool,
     last_root: Option<PathBuf>,
@@ -410,13 +412,6 @@ impl DbtResultsPanel {
             .detach();
             Self {
             focus_handle: cx.focus_handle(),
-            table_interaction: cx.new(|cx| {
-                TableInteractionState::new(cx).with_custom_scrollbar(
-                    // Always-visible scrollbars: wide result sets need the
-                    // horizontal bar discoverable, not hover-revealed.
-                    ui::Scrollbars::always_visible(ui::ScrollAxes::Both),
-                )
-            }),
             languages,
             workspace: workspace_handle,
             lineage_store: Arc::new(LineageStore::default()),
@@ -444,7 +439,10 @@ impl DbtResultsPanel {
                 lineage_model: None,
                 search_editor,
                 sort: None,
-                column_widths: None,
+                col_widths: Default::default(),
+                col_resize: None,
+                grid_h_scroll: ScrollHandle::new(),
+                grid_v_scroll: gpui::UniformListScrollHandle::new(),
                 hidden_columns: Default::default(),
                 show_column_picker: false,
                 last_root: None,
@@ -805,41 +803,22 @@ impl DbtResultsPanel {
                         this.view = ResultsView::Table;
                         this.sort = None;
                         this.hidden_columns.clear();
-                        // Content-aware initial widths; drag handles resize
-                        // like a spreadsheet from there. Column 0 is the
-                        // pinned row-number gutter (pinning also activates
-                        // the table's scroll-aware resize layout).
-                        let mut widths: Vec<Pixels> = vec![px(56.)];
-                        widths.extend(columns.iter().enumerate().map(
-                            |(column_ix, column)| {
+                        // Content-aware initial widths (spreadsheet-style;
+                        // drag handles resize from there).
+                        this.col_widths = columns
+                            .iter()
+                            .enumerate()
+                            .map(|(column_ix, column)| {
                                 let mut chars = column.len();
                                 for row in rows.iter().take(30) {
                                     if let Some(cell) = row.get(column_ix) {
                                         chars = chars.max(cell.len());
                                     }
                                 }
-                                px((chars as f32 * 8.2 + 24.).clamp(90., 340.))
-                            },
-                        ));
-                        this.column_widths = (!columns.is_empty()).then(|| {
-                            let state = cx.new(|_| {
-                                // MinSize is in rems: 3.75rem ≈ 60px columns,
-                                // 2rem ≈ 32px row-number gutter.
-                                let mut behaviors =
-                                    vec![TableResizeBehavior::MinSize(3.75); columns.len() + 1];
-                                behaviors[0] = TableResizeBehavior::MinSize(2.);
-                                ResizableColumnsState::new(
-                                    columns.len() + 1,
-                                    widths,
-                                    behaviors,
-                                )
-                            });
-                            // The table updates this entity on every drag
-                            // frame; observing it makes the resize track the
-                            // pointer smoothly instead of jumping on release.
-                            cx.observe(&state, |_, _, cx| cx.notify()).detach();
-                            state
-                        });
+                                (column_ix, (chars as f32 * 8.2 + 24.).clamp(90., 340.))
+                            })
+                            .collect();
+                        this.col_resize = None;
                         this.search_editor.update(cx, |editor, cx| {
                             editor.set_text("", window, cx);
                         });
@@ -1385,8 +1364,8 @@ impl DbtResultsPanel {
                 .overflow_hidden()
                 .rounded_md()
                 .border_1()
-                .border_color(colors.border)
-                .bg(colors.elevated_surface_background)
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().elevated_surface_background)
                 .p_2()
                 .child(
                     v_flex()
@@ -2469,7 +2448,273 @@ impl DbtResultsPanel {
             .into_any_element()
     }
 
-    fn render_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// Purpose-built results grid: a single horizontally-scrolling container
+    /// with an explicit total width (so wide tables always overflow and
+    /// scroll), a uniform_list for vertical virtualization, per-column pixel
+    /// widths with drag handles, sortable headers, truncated cells with
+    /// click-to-inspect, and an optional column-visibility sidebar.
+    fn render_results_grid(
+        &self,
+        columns: &Arc<Vec<SharedString>>,
+        rows: &Arc<Vec<Vec<SharedString>>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let border = cx.theme().colors().border;
+        let surface = cx.theme().colors().elevated_surface_background;
+        let indices = Arc::new(self.display_indices(rows, cx));
+        let visible: Vec<usize> = (0..columns.len())
+            .filter(|ix| !self.hidden_columns.contains(ix))
+            .collect();
+        let width_of = |ix: usize| self.col_widths.get(&ix).copied().unwrap_or(140.);
+        const ROWNUM_W: f32 = 56.;
+        let total: f32 = ROWNUM_W + visible.iter().map(|ix| width_of(*ix)).sum::<f32>();
+
+        // Header: fixed-width cells, sortable label, right-edge resize handle.
+        let mut header = h_flex()
+            .h(px(30.))
+            .flex_none()
+            .bg(surface)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .w(px(ROWNUM_W))
+                    .flex_none()
+                    .px_2()
+                    .child(Label::new("#").size(LabelSize::XSmall).color(Color::Muted)),
+            );
+        for &ix in &visible {
+            let w = width_of(ix);
+            let column = columns[ix].clone();
+            let indicator = match self.sort {
+                Some((sorted, true)) if sorted == ix => " ▲",
+                Some((sorted, false)) if sorted == ix => " ▼",
+                _ => "",
+            };
+            header = header.child(
+                div()
+                    .w(px(w))
+                    .flex_none()
+                    .h_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("dbt-sort-{ix}")))
+                            .size_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(Label::new(format!("{column}{indicator}")).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.sort = match this.sort {
+                                    Some((s, true)) if s == ix => Some((ix, false)),
+                                    Some((s, false)) if s == ix => None,
+                                    _ => Some((ix, true)),
+                                };
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("dbt-colresize-{ix}")))
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(5.))
+                            .h_full()
+                            .cursor(gpui::CursorStyle::ResizeColumn)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    let cw =
+                                        this.col_widths.get(&ix).copied().unwrap_or(140.);
+                                    this.col_resize =
+                                        Some((ix, f32::from(event.position.x), cw));
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
+            );
+        }
+
+        // Rows, virtualized.
+        let rows_arc = rows.clone();
+        let indices_arc = indices.clone();
+        let columns_vec: Vec<SharedString> = columns.to_vec();
+        let visible_arc = Arc::new(visible.clone());
+        let widths_arc: Arc<Vec<f32>> =
+            Arc::new(visible.iter().map(|ix| width_of(*ix)).collect());
+        let panel = cx.entity().downgrade();
+        let list = gpui::uniform_list(
+            "dbt-grid-rows",
+            indices_arc.len(),
+            move |range, _window, _cx| {
+                range
+                    .filter_map(|display_ix| {
+                        let original = *indices_arc.get(display_ix)?;
+                        let row = rows_arc.get(original)?;
+                        let mut cells = h_flex()
+                            .h(px(26.))
+                            .child(
+                                div().w(px(ROWNUM_W)).flex_none().px_2().child(
+                                    Label::new(format!("{}", original + 1))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            );
+                        for (vi, &ix) in visible_arc.iter().enumerate() {
+                            let w = widths_arc[vi];
+                            let cell = row.get(ix).cloned().unwrap_or_default();
+                            let column_name =
+                                columns_vec.get(ix).cloned().unwrap_or_default();
+                            const MAX: usize = 120;
+                            let display = if cell.len() > MAX {
+                                let mut cut = MAX;
+                                while !cell.is_char_boundary(cut) {
+                                    cut -= 1;
+                                }
+                                SharedString::from(format!("{}…", &cell[..cut]))
+                            } else {
+                                cell.clone()
+                            };
+                            let full = cell.clone();
+                            let panel = panel.clone();
+                            cells = cells.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "dbt-cell-{display_ix}-{vi}"
+                                    )))
+                                    .w(px(w))
+                                    .flex_none()
+                                    .px_2()
+                                    .overflow_hidden()
+                                    .cursor_pointer()
+                                    .child(Label::new(display).size(LabelSize::Small))
+                                    .on_click(move |_, _, cx| {
+                                        let full = full.clone();
+                                        let column_name = column_name.clone();
+                                        panel
+                                            .update(cx, |this, cx| {
+                                                this.cell_detail =
+                                                    Some((column_name, original + 1, full));
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    }),
+                            );
+                        }
+                        Some(cells.into_any_element())
+                    })
+                    .collect()
+            },
+        )
+        .flex_1()
+        .track_scroll(&self.grid_v_scroll);
+
+        let grid = div()
+            .id("dbt-grid")
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            // Column resize is a global drag while active.
+            .when(self.col_resize.is_some(), |this| {
+                this.on_mouse_move(cx.listener(
+                    |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        if let Some((ix, start_x, start_w)) = this.col_resize {
+                            let new_w = (start_w + (f32::from(event.position.x) - start_x))
+                                .clamp(60., 900.);
+                            this.col_widths.insert(ix, new_w);
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        if this.col_resize.take().is_some() {
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
+            .child(
+                div()
+                    .id("dbt-grid-hscroll")
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.grid_h_scroll)
+                    .child(
+                        v_flex()
+                            .w(px(total))
+                            .h_full()
+                            .child(header)
+                            .child(list),
+                    )
+                    .custom_scrollbars(
+                        ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
+                            .tracked_scroll_handle(&self.grid_h_scroll),
+                        window,
+                        cx,
+                    ),
+            );
+
+        h_flex()
+            .size_full()
+            .child(grid)
+            .when(self.show_column_picker, |this| {
+                this.child(
+                    div()
+                        .id("dbt-column-picker")
+                        .w(px(220.))
+                        .h_full()
+                        .flex_none()
+                        .p_2()
+                        .border_l_1()
+                        .border_color(border)
+                        .overflow_y_scroll()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new("Show columns")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .children(columns.iter().enumerate().map(|(ix, column)| {
+                                    let hidden = self.hidden_columns.contains(&ix);
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            ui::Checkbox::new(
+                                                ("dbt-col-visible", ix),
+                                                if hidden {
+                                                    ui::ToggleState::Unselected
+                                                } else {
+                                                    ui::ToggleState::Selected
+                                                },
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if !this.hidden_columns.remove(&ix) {
+                                                    this.hidden_columns.insert(ix);
+                                                }
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            Label::new(column.clone()).size(LabelSize::Small),
+                                        )
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.view == ResultsView::Lineage {
             let lineage_tree = self.lineage_tree.clone();
             return match lineage_tree {
@@ -2766,214 +3011,7 @@ impl DbtResultsPanel {
                         .child(Label::new("Query returned no rows").color(Color::Muted))
                         .into_any_element();
                 }
-                let indices = Arc::new(self.display_indices(rows, cx));
-                let rows = rows.clone();
-                let display_rows = indices.clone();
-                let cell_columns: Vec<SharedString> = columns.to_vec();
-                let panel = cx.entity().downgrade();
-                let mut headers =
-                    vec![Label::new("#").color(Color::Muted).into_any_element()];
-                headers.extend(columns.iter().enumerate().map(|(ix, column)| {
-                        let indicator = match self.sort {
-                            Some((sorted, true)) if sorted == ix => " ▲",
-                            Some((sorted, false)) if sorted == ix => " ▼",
-                            _ => "",
-                        };
-                        // Only the label is clickable, so the resize handles
-                        // on the column boundaries stay easy to grab.
-                        h_flex()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("dbt-sort-{ix}")))
-                                    .cursor_pointer()
-                                    .child(Label::new(format!("{column}{indicator}")))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.sort = match this.sort {
-                                            Some((sorted, true)) if sorted == ix => {
-                                                Some((ix, false))
-                                            }
-                                            Some((sorted, false)) if sorted == ix => None,
-                                            _ => Some((ix, true)),
-                                        };
-                                        cx.notify();
-                                    })),
-                            )
-                            .into_any_element()
-                    }));
-                let column_mask: Vec<bool> = std::iter::once(false)
-                    .chain(
-                        columns
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, _)| self.hidden_columns.contains(&ix)),
-                    )
-                    .collect();
-                {
-                    let handle = &self.table_interaction.read(cx).horizontal_scroll_handle;
-                    log::debug!(
-                        "dbt table h-scroll: max_offset={:?} viewport={:?}",
-                        handle.max_offset(),
-                        handle.bounds().size,
-                    );
-                }
-                let table = div()
-                    .flex_1()
-                    .h_full()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .child(
-                        Table::new(columns.len() + 1)
-                            .striped()
-                            .pin_cols(1)
-                            .column_filter(ui::table_row::TableRow::from_vec(
-                                column_mask,
-                                columns.len() + 1,
-                            ))
-                            .interactable(&self.table_interaction)
-                            .map(|table| match &self.column_widths {
-                                Some(state)
-                                    if state.read(cx).cols() == columns.len() + 1 =>
-                                {
-                                    table.width_config(ColumnWidthConfig::Resizable(
-                                        state.clone(),
-                                    ))
-                                }
-                                _ => table,
-                            })
-                            .header(headers)
-                            .uniform_list(
-                                "dbt-results-rows",
-                                display_rows.len(),
-                                move |range, _, _| {
-                                    range
-                                        .filter_map(|display_ix| {
-                                            let original = *display_rows.get(display_ix)?;
-                                            let row = rows.get(original)?;
-                                            let mut cells: Vec<gpui::AnyElement> =
-                                                Vec::with_capacity(row.len() + 1);
-                                            cells.push(
-                                                Label::new(format!("{}", original + 1))
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted)
-                                                    .into_any_element(),
-                                            );
-                                            cells.extend(row.iter().enumerate().map(
-                                                |(col_ix, cell)| {
-                                                    // Long values truncate for display; a
-                                                    // click opens the full value.
-                                                    const MAX: usize = 120;
-                                                    let truncated = if cell.len() > MAX {
-                                                        let mut cut = MAX;
-                                                        while !cell.is_char_boundary(cut) {
-                                                            cut -= 1;
-                                                        }
-                                                        SharedString::from(format!(
-                                                            "{}…",
-                                                            &cell[..cut]
-                                                        ))
-                                                    } else {
-                                                        cell.clone()
-                                                    };
-                                                    let full = cell.clone();
-                                                    let column_name = cell_columns
-                                                        .get(col_ix)
-                                                        .cloned()
-                                                        .unwrap_or_default();
-                                                    let panel = panel.clone();
-                                                    div()
-                                                        .id(SharedString::from(format!(
-                                                            "dbt-cell-{display_ix}-{col_ix}"
-                                                        )))
-                                                        .cursor_pointer()
-                                                        .on_click(move |_, _, cx| {
-                                                            let full = full.clone();
-                                                            let column_name =
-                                                                column_name.clone();
-                                                            panel
-                                                                .update(cx, |this, cx| {
-                                                                    this.cell_detail = Some((
-                                                                        column_name,
-                                                                        original + 1,
-                                                                        full,
-                                                                    ));
-                                                                    cx.notify();
-                                                                })
-                                                                .ok();
-                                                        })
-                                                        .child(
-                                                            Label::new(truncated)
-                                                                .size(LabelSize::Small),
-                                                        )
-                                                        .into_any_element()
-                                                },
-                                            ));
-                                            Some(cells)
-                                        })
-                                        .collect()
-                                },
-                            ),
-                    );
-                h_flex()
-                    .size_full()
-                    .child(table)
-                    .when(self.show_column_picker, |this| {
-                        this.child(
-                            div()
-                                .id("dbt-column-picker")
-                                .w(px(220.))
-                                .h_full()
-                                .flex_none()
-                                .p_2()
-                                .border_l_1()
-                                .border_color(cx.theme().colors().border)
-                                .overflow_y_scroll()
-                                .child(
-                                    v_flex()
-                                        .gap_1()
-                                        .child(
-                                            Label::new("Show columns")
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .children(columns.iter().enumerate().map(
-                                            |(ix, column)| {
-                                                let hidden =
-                                                    self.hidden_columns.contains(&ix);
-                                                h_flex()
-                                                    .gap_2()
-                                                    .items_center()
-                                                    .child(
-                                                        ui::Checkbox::new(
-                                                            ("dbt-col-visible", ix),
-                                                            if hidden {
-                                                                ui::ToggleState::Unselected
-                                                            } else {
-                                                                ui::ToggleState::Selected
-                                                            },
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                if !this
-                                                                    .hidden_columns
-                                                                    .remove(&ix)
-                                                                {
-                                                                    this.hidden_columns
-                                                                        .insert(ix);
-                                                                }
-                                                                cx.notify();
-                                                            },
-                                                        )),
-                                                    )
-                                                    .child(
-                                                        Label::new(column.clone())
-                                                            .size(LabelSize::Small),
-                                                    )
-                                            },
-                                        )),
-                                ),
-                        )
-                    })
-                    .into_any_element()
+                self.render_results_grid(columns, rows, window, cx)
             }
         }
     }
@@ -3278,7 +3316,7 @@ impl Render for DbtResultsPanel {
                     .min_h(px(0.))
                     .w_full()
                     .overflow_hidden()
-                    .child(self.render_body(cx)),
+                    .child(self.render_body(window, cx)),
             )
             .when_some(self.cell_detail.clone(), |this, (column, row, value)| {
                 this.child(
