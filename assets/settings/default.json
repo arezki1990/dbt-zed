@@ -132,6 +132,10 @@
     "auto_install": true,
     // Which dbt Fusion build to auto-install: "latest", "dev", "canary", or an explicit version.
     "fusion_version": "latest",
+    // Which dbt distribution to target: "fusion" or "core".
+    "distribution": "fusion",
+    // Adapter installed with dbt Core when auto-installing (distribution "core").
+    "core_adapter": "",
     // Maximum number of rows fetched by `dbt show` for the dbt results panel.
     "show_limit": 500,
     // The dbt executable used by the dbt results panel (resolved from PATH).

@@ -14,6 +14,10 @@ pub struct DbtSettings {
     /// ("latest", "dev", "canary") or an explicit version like
     /// "2.0.0-preview.218".
     pub fusion_version: String,
+    /// "fusion" (default) or "core".
+    pub distribution: String,
+    /// Adapter installed with dbt Core when auto-installing.
+    pub core_adapter: String,
     /// The `--target` to pass, if any.
     pub target: Option<String>,
     /// The `--profiles-dir` to pass, if any.
@@ -48,6 +52,16 @@ impl Settings for DbtSettings {
                 .fusion_version
                 .filter(|version| !version.is_empty())
                 .unwrap_or_else(|| "latest".to_owned()),
+            distribution: content
+                .distribution
+                .filter(|distribution| !distribution.is_empty())
+                .unwrap_or_else(|| "fusion".to_owned())
+                .to_lowercase(),
+            core_adapter: content
+                .core_adapter
+                .filter(|adapter| !adapter.is_empty())
+                .unwrap_or_default()
+                .to_lowercase(),
             target: content.target.filter(|target| !target.is_empty()),
             profiles_dir: content.profiles_dir.filter(|dir| !dir.is_empty()),
             env: content

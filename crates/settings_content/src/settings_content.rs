@@ -1266,6 +1266,17 @@ pub struct DbtSettingsContent {
     ///
     /// Default: "latest"
     pub fusion_version: Option<String>,
+    /// Which dbt distribution zdbt targets: "fusion" or "core". Core switches
+    /// catalog refresh to `dbt docs generate` and auto-install to a Python
+    /// virtualenv with dbt-core plus the configured adapter.
+    ///
+    /// Default: "fusion"
+    pub distribution: Option<String>,
+    /// The adapter package installed alongside dbt Core when auto-installing
+    /// (e.g. "snowflake", "duckdb"). Only used when `distribution` is "core".
+    ///
+    /// Default: ""
+    pub core_adapter: Option<String>,
     /// The dbt target passed as `--target` to dbt commands run by the results
     /// panel. When empty, the profile's default target is used.
     ///

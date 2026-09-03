@@ -27,6 +27,18 @@ pub fn managed_binary_path() -> PathBuf {
     managed_dir().join(format!("dbt{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// Managed dbt Core install: a Python virtualenv under the data dir.
+pub fn managed_core_dir() -> PathBuf {
+    paths::data_dir().join("dbt-core")
+}
+
+pub fn managed_core_binary_path() -> PathBuf {
+    let bin = if cfg!(windows) { "Scripts" } else { "bin" };
+    managed_core_dir()
+        .join(bin)
+        .join(format!("dbt{}", std::env::consts::EXE_SUFFIX))
+}
+
 /// (CDN target triple, archive extension) for this platform.
 fn cdn_target() -> Option<(&'static str, &'static str)> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -59,6 +71,19 @@ pub async fn ensure_binary(
     if path_has_binary("dbt") {
         return Ok("dbt".to_owned());
     }
+    if settings.distribution == "core" {
+        let managed = managed_core_binary_path();
+        if smol::fs::metadata(&managed).await.is_ok() {
+            return Ok(managed.to_string_lossy().into_owned());
+        }
+        anyhow::ensure!(
+            settings.auto_install,
+            "dbt is not on PATH. Install dbt Core, set the `dbt.binary` setting, \
+             or enable `dbt.auto_install` to let zdbt create a managed install"
+        );
+        install_core(settings).await?;
+        return Ok(managed_core_binary_path().to_string_lossy().into_owned());
+    }
     let managed = managed_binary_path();
     if smol::fs::metadata(&managed).await.is_ok() {
         return Ok(managed.to_string_lossy().into_owned());
@@ -71,6 +96,52 @@ pub async fn ensure_binary(
     let http = http.context("no HTTP client available to download dbt Fusion")?;
     install(http.as_ref(), &settings.fusion_version).await?;
     Ok(managed_binary_path().to_string_lossy().into_owned())
+}
+
+/// Creates a Python virtualenv with dbt-core and the configured adapter.
+async fn install_core(settings: &DbtSettings) -> Result<()> {
+    anyhow::ensure!(
+        !settings.core_adapter.is_empty(),
+        "set the `dbt.core_adapter` setting (e.g. \"snowflake\", \"duckdb\") so \
+         zdbt knows which dbt Core adapter to install"
+    );
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let dir = managed_core_dir();
+    smol::fs::create_dir_all(&dir).await.ok();
+    log::info!("dbt: creating dbt Core virtualenv at {dir:?}");
+    let venv = util::command::new_command(python)
+        .args(["-m", "venv"])
+        .arg(&dir)
+        .output()
+        .await
+        .with_context(|| format!("running `{python} -m venv` (is Python installed?)"))?;
+    anyhow::ensure!(
+        venv.status.success(),
+        "creating the dbt Core virtualenv failed:\n{}",
+        String::from_utf8_lossy(&venv.stderr)
+    );
+    let pip = dir
+        .join(if cfg!(windows) { "Scripts" } else { "bin" })
+        .join(format!("pip{}", std::env::consts::EXE_SUFFIX));
+    let adapter = format!("dbt-{}", settings.core_adapter);
+    log::info!("dbt: pip installing dbt-core and {adapter}");
+    let install = util::command::new_command(&pip)
+        .args(["install", "--disable-pip-version-check", "dbt-core"])
+        .arg(&adapter)
+        .output()
+        .await
+        .context("running pip install for dbt Core")?;
+    anyhow::ensure!(
+        install.status.success(),
+        "pip install dbt-core {adapter} failed:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    anyhow::ensure!(
+        smol::fs::metadata(managed_core_binary_path()).await.is_ok(),
+        "the dbt Core install did not produce a dbt executable"
+    );
+    log::info!("dbt: installed dbt Core at {:?}", managed_core_binary_path());
+    Ok(())
 }
 
 /// A channel name ("latest", "dev", "canary") resolves through versions.json;

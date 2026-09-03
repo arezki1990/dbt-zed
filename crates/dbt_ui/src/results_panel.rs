@@ -611,7 +611,12 @@ impl DbtResultsPanel {
                         .await
                         .map_err(std::io::Error::other)?;
                     let mut command = new_command(&binary);
-                    command.args(["compile", "--write-catalog"]);
+                    // Fusion writes the catalog from compile; Core uses docs.
+                    if catalog_settings.distribution == "core" {
+                        command.args(["docs", "generate"]);
+                    } else {
+                        command.args(["compile", "--write-catalog"]);
+                    }
                     apply_common_args(&mut command, &catalog_settings, &catalog_root);
                     command.current_dir(&catalog_root).output().await
                 });
@@ -3104,12 +3109,23 @@ fn parse_show_output(
     let stdout_str = String::from_utf8_lossy(stdout);
     for line in stdout_str.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with('[') {
-            continue;
-        }
-        let Ok(serde_json::Value::Array(json_rows)) =
-            serde_json::from_str::<serde_json::Value>(trimmed)
-        else {
+        // Fusion prints a bare JSON array; dbt Core prints {"show": [...]}.
+        let json_rows = if trimmed.starts_with('[') {
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(serde_json::Value::Array(rows)) => rows,
+                _ => continue,
+            }
+        } else if trimmed.starts_with('{') {
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(serde_json::Value::Object(mut object)) => {
+                    match object.remove("show") {
+                        Some(serde_json::Value::Array(rows)) => rows,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+        } else {
             continue;
         };
         let columns: Vec<SharedString> = json_rows

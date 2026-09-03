@@ -10,7 +10,7 @@ use theme::SystemAppearance;
 use ui::IntoElement;
 
 use crate::{
-    ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
+    ActionLink, DynamicItem, PROJECT, PathPick, SettingField, SettingItem, SettingsFieldMetadata,
     SettingsPage, SettingsPageItem, SubPageLink, USER, active_language, all_language_names,
     pages::{
         open_audio_test_window, render_edit_prediction_setup_page, render_external_agents_page,
@@ -8823,7 +8823,7 @@ fn ai_page(cx: &App) -> SettingsPage {
 }
 
 fn dbt_page() -> SettingsPage {
-    fn dbt_section() -> [SettingsPageItem; 13] {
+    fn dbt_section() -> [SettingsPageItem; 15] {
         [
             SettingsPageItem::SectionHeader("dbt"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8860,6 +8860,7 @@ fn dbt_page() -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("dbt"),
+                    pick_path: Some(PathPick::File),
                     ..Default::default()
                 })),
                 files: USER,
@@ -8906,6 +8907,50 @@ fn dbt_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Distribution",
+                description: "Which dbt distribution zdbt targets: \"fusion\" (default) or \"core\". Core switches catalog refresh to `dbt docs generate` and auto-install to a Python virtualenv.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.distribution"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.distribution.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().distribution = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("fusion"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Core Adapter",
+                description: "The dbt adapter installed with dbt Core when auto-installing (e.g. \"snowflake\", \"duckdb\", \"postgres\"). Only used when Distribution is \"core\".",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.core_adapter"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.core_adapter.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().core_adapter = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("snowflake"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Target",
                 description: "The dbt target passed as --target; empty uses the profile's default target.",
                 field: Box::new(SettingField {
@@ -8942,6 +8987,7 @@ fn dbt_page() -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("~/.dbt"),
+                    pick_path: Some(PathPick::Directory),
                     ..Default::default()
                 })),
                 files: USER | PROJECT,
@@ -8964,6 +9010,7 @@ fn dbt_page() -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("employees"),
+                    pick_path: Some(PathPick::Directory),
                     ..Default::default()
                 })),
                 files: USER | PROJECT,
@@ -8986,6 +9033,7 @@ fn dbt_page() -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("../.env"),
+                    pick_path: Some(PathPick::File),
                     ..Default::default()
                 })),
                 files: USER | PROJECT,

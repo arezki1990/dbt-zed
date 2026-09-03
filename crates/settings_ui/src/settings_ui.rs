@@ -426,6 +426,15 @@ struct SettingsFieldMetadata {
     display_clear_button: bool,
     confirm_on_focus_out: bool,
     treat_missing_text_as_empty: bool,
+    /// Fork: renders a native path-picker button beside the text field.
+    pick_path: Option<PathPick>,
+}
+
+/// What a path-picking settings field selects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathPick {
+    File,
+    Directory,
 }
 
 pub fn init(cx: &mut App) {
@@ -4869,9 +4878,10 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
             .map(|text| text.as_ref().to_string())
     };
 
+    let pick_path = metadata.and_then(|metadata| metadata.pick_path);
     // The JSON path uniquely identifies the setting this field edits, making
     // it a stable, collision-free element ID within the page.
-    SettingsInputField::new(field.json_path.unwrap_or("settings-text-field"))
+    let input = SettingsInputField::new(field.json_path.unwrap_or("settings-text-field"))
         .tab_index(0)
         .aria_label(title)
         .when(!description.is_empty(), |editor| {
@@ -4895,6 +4905,7 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
             |editor| editor.confirm_on_focus_out(),
         )
         .on_confirm({
+            let file = file.clone();
             move |new_text, window, cx| {
                 update_settings_file(
                     file.clone(),
@@ -4908,6 +4919,64 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
                 .log_err(); // todo(settings_ui) don't log err
             }
         })
+        .into_any_element();
+
+    let Some(kind) = pick_path else {
+        return input;
+    };
+    h_flex()
+        .w_full()
+        .gap_1()
+        .items_center()
+        .child(div().flex_1().min_w(px(0.)).child(input))
+        .child(
+            IconButton::new(
+                SharedString::from(format!(
+                    "{}-path-picker",
+                    field.json_path.unwrap_or("settings-text-field")
+                )),
+                IconName::FolderOpen,
+            )
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text(match kind {
+                PathPick::File => "Choose a file…",
+                PathPick::Directory => "Choose a directory…",
+            }))
+            .on_click(move |_, window, cx| {
+                let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: kind == PathPick::File,
+                    directories: kind == PathPick::Directory,
+                    multiple: false,
+                    prompt: None,
+                });
+                let file = file.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        if let Ok(Ok(Some(mut paths))) = receiver.await
+                            && let Some(path) = paths.pop()
+                        {
+                            cx.update(|window, cx| {
+                                update_settings_file(
+                                    file.clone(),
+                                    field.json_path,
+                                    window,
+                                    cx,
+                                    move |settings, app| {
+                                        (field.write)(
+                                            settings,
+                                            Some(path.to_string_lossy().into_owned().into()),
+                                            app,
+                                        );
+                                    },
+                                )
+                                .log_err();
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+            }),
+        )
         .into_any_element()
 }
 
