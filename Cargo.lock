@@ -4995,6 +4995,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "client",
  "editor",
  "futures 0.3.32",
  "gpui",

@@ -683,11 +683,12 @@ impl DbtResultsPanel {
     }
 
     /// The app's HTTP client, used to download the managed dbt Fusion
-    /// distribution when nothing is on PATH.
+    /// distribution when nothing is on PATH. Read from the global Client —
+    /// never from the Workspace entity, which is mid-update when panel
+    /// actions run (reading it there double-leases and panics).
     fn http_client(&self, cx: &Context<Self>) -> Option<Arc<dyn http_client::HttpClient>> {
-        let workspace = self.workspace.upgrade()?;
         let client: Arc<dyn http_client::HttpClient> =
-            workspace.read(cx).project().read(cx).client().http_client();
+            client::Client::global(cx).http_client();
         Some(client)
     }
 
