@@ -931,17 +931,23 @@ fn build_resize_dividers(
     widths: &TableRow<AbsoluteLength>,
     resize_behavior: &TableRow<TableResizeBehavior>,
     range: Range<usize>,
+    column_filter: Option<&TableRow<bool>>,
     interactive: bool,
     rem_size: Pixels,
     window: &mut Window,
     cx: &mut App,
 ) -> Vec<AnyElement> {
     let entity_id = columns_state.entity_id();
-    let last = range.end.saturating_sub(1);
-    let mut dividers = Vec::with_capacity(range.end - range.start);
+    // Hidden columns render no cells, so they get no width and no divider —
+    // otherwise dividers drift and the scroll range extends into blank space.
+    let visible: Vec<usize> = range
+        .filter(|idx| column_filter.is_none_or(|filter| filter[*idx]))
+        .collect();
+    let last = visible.last().copied().unwrap_or(0);
+    let mut dividers = Vec::with_capacity(visible.len());
     let mut accumulated = px(0.);
 
-    for col_idx in range {
+    for col_idx in visible {
         accumulated = accumulated + widths[col_idx].to_pixels(rem_size);
 
         // Add a resize divider after every column, including the last.
@@ -981,6 +987,7 @@ fn render_resize_handles_resizable(
     columns_state: &Entity<ResizableColumnsState>,
     pinned_cols: usize,
     h_scroll_handle: Option<&ScrollHandle>,
+    column_filter: Option<&TableRow<bool>>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -998,6 +1005,7 @@ fn render_resize_handles_resizable(
             &widths,
             &resize_behavior,
             0..n_cols,
+            column_filter,
             true,
             rem_size,
             window,
@@ -1012,8 +1020,14 @@ fn render_resize_handles_resizable(
             .into_any_element();
     }
 
-    let pinned_width = state.pinned_width(pinned_cols, rem_size);
-    let total_scrollable_width = state.scrollable_width(pinned_cols, rem_size);
+    let visible_width = |range: Range<usize>| -> Pixels {
+        range
+            .filter(|idx| column_filter.is_none_or(|filter| filter[*idx]))
+            .map(|idx| widths[idx].to_pixels(rem_size))
+            .fold(px(0.), |acc, width| acc + width)
+    };
+    let pinned_width = visible_width(0..pinned_cols);
+    let total_scrollable_width = visible_width(pinned_cols..n_cols);
 
     // Non-interactive: pinned columns don't visually shift with scroll, so resizing them would
     // need separate drag-math from the scrollable columns. Header double-click reset still works.
@@ -1022,6 +1036,7 @@ fn render_resize_handles_resizable(
         &widths,
         &resize_behavior,
         0..pinned_cols,
+        column_filter,
         false,
         rem_size,
         window,
@@ -1041,6 +1056,7 @@ fn render_resize_handles_resizable(
         &widths,
         &resize_behavior,
         pinned_cols..n_cols,
+        column_filter,
         true,
         rem_size,
         window,
@@ -1156,6 +1172,7 @@ impl RenderOnce for Table {
                             entity,
                             pinned_cols,
                             h_scroll_handle.as_ref(),
+                            self.column_filter.as_ref(),
                             window,
                             cx,
                         )),
