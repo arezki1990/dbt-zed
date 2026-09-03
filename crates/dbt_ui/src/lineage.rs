@@ -250,6 +250,9 @@ pub struct GraphLayoutNode {
     pub col_refs: std::collections::HashMap<String, Vec<String>>,
     /// Exact AST-resolved lineage: column -> (upstream node name, column).
     pub col_lineage: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Details card data (description, relation, tags, column types/docs,
+    /// stats) as stored JSON.
+    pub details: Option<serde_json::Value>,
     /// More parents/children exist beyond the loaded depth or node cap.
     pub truncated_up: bool,
     pub truncated_down: bool,
@@ -560,6 +563,7 @@ impl LineageStore {
                             .unwrap_or(entity.kind.as_str())
                             .to_owned(),
                         ops: entity.data.get("ops").and_then(NodeOps::from_json),
+                        details: entity.data.get("details").cloned(),
                         col_lineage: entity
                             .data
                             .get("col_lineage")
@@ -940,6 +944,76 @@ fn build_graph(
         std::fs::File::open(project_root.join("target").join("catalog.json"))
             .ok()
             .and_then(|file| serde_json::from_reader(std::io::BufReader::new(file)).ok());
+    // Per-node details card data: types/stats from catalog, docs from manifest.
+    let node_details = |unique_id: &str, node: &serde_json::Value| -> serde_json::Value {
+        let mut column_types = serde_json::Map::new();
+        let mut row_count = serde_json::Value::Null;
+        let mut bytes = serde_json::Value::Null;
+        if let Some(catalog) = catalog.as_ref() {
+            for section in ["nodes", "sources"] {
+                let Some(entry) = catalog
+                    .get(section)
+                    .and_then(|section| section.get(unique_id))
+                else {
+                    continue;
+                };
+                if let Some(columns) =
+                    entry.get("columns").and_then(|columns| columns.as_object())
+                {
+                    for (name, meta) in columns {
+                        if let Some(kind) = meta.get("type").and_then(|t| t.as_str()) {
+                            column_types.insert(
+                                name.to_lowercase(),
+                                serde_json::Value::String(kind.to_owned()),
+                            );
+                        }
+                    }
+                }
+                if let Some(stats) = entry.get("stats") {
+                    row_count = stats
+                        .get("row_count")
+                        .and_then(|stat| stat.get("value"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    bytes = stats
+                        .get("bytes")
+                        .and_then(|stat| stat.get("value"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                break;
+            }
+        }
+        let column_descriptions: serde_json::Map<String, serde_json::Value> = node
+            .get("columns")
+            .and_then(|columns| columns.as_object())
+            .map(|columns| {
+                columns
+                    .iter()
+                    .filter_map(|(name, meta)| {
+                        let description =
+                            meta.get("description").and_then(|d| d.as_str())?.trim();
+                        (!description.is_empty()).then(|| {
+                            (
+                                name.to_lowercase(),
+                                serde_json::Value::String(description.to_owned()),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({
+            "description": node.get("description").and_then(|d| d.as_str()).unwrap_or("").trim(),
+            "relation": node.get("relation_name").and_then(|r| r.as_str()).unwrap_or(""),
+            "tags": node.get("tags").cloned().unwrap_or(serde_json::Value::Array(vec![])),
+            "column_types": column_types,
+            "column_descriptions": column_descriptions,
+            "row_count": row_count,
+            "bytes": bytes,
+        })
+    };
+
     let catalog_columns = |unique_id: &str| -> Option<Vec<String>> {
         let catalog = catalog.as_ref()?;
         for section in ["nodes", "sources"] {
@@ -986,6 +1060,7 @@ fn build_graph(
         compiled_code: Option<String>,
         /// Exact AST-resolved lineage: column -> (parent node name, column).
         col_lineage: std::collections::HashMap<String, Vec<(String, String)>>,
+        details: serde_json::Value,
     }
     let mut pending: Vec<PendingNode> = Vec::new();
     for section in ["nodes", "sources"] {
@@ -1085,6 +1160,7 @@ fn build_graph(
                     .and_then(|value| value.as_str())
                     .map(str::to_owned),
                 col_lineage: Default::default(),
+                details: node_details(unique_id, node),
             });
         }
     }
@@ -1196,6 +1272,7 @@ fn build_graph(
                     "col_exprs": node.col_exprs,
                     "col_refs": node.col_refs,
                     "col_lineage": node.col_lineage,
+                    "details": node.details,
                 }),
             })
             .map_err(|error| anyhow::anyhow!("inserting lineage node: {error}"))?;

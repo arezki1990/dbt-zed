@@ -147,6 +147,8 @@ pub struct DbtResultsPanel {
     show_downstream: bool,
     show_columns: bool,
     show_tree: bool,
+    /// Details card sidebar for the centered model.
+    show_details: bool,
     collapsed_up: HashSet<String>,
     collapsed_down: HashSet<String>,
     selected_column: Option<String>,
@@ -422,6 +424,7 @@ impl DbtResultsPanel {
             show_downstream: true,
             show_columns: false,
             show_tree: true,
+            show_details: false,
             collapsed_up: Default::default(),
             collapsed_down: Default::default(),
             selected_column: None,
@@ -2160,6 +2163,163 @@ impl DbtResultsPanel {
             .into_any_element()
     }
 
+    /// Details card for the centered model: relation, docs, stats, columns.
+    fn render_details_sidebar(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let layout = self.lineage_layout.as_ref()?;
+        let node = layout.nodes.iter().find(|node| node.is_center)?.clone();
+        let details = node.details.clone().unwrap_or(serde_json::Value::Null);
+        let get_str = |key: &str| -> Option<String> {
+            details
+                .get(key)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let tags: Vec<String> = details
+            .get("tags")
+            .and_then(|tags| tags.as_array())
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|tag| tag.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let column_type = |name: &str| -> Option<String> {
+            details
+                .get("column_types")?
+                .get(name.to_lowercase())
+                .and_then(|kind| kind.as_str())
+                .map(|kind| kind.to_lowercase())
+        };
+        let column_doc = |name: &str| -> Option<String> {
+            details
+                .get("column_descriptions")?
+                .get(name.to_lowercase())
+                .and_then(|doc| doc.as_str())
+                .map(str::to_owned)
+        };
+        let row_count = details.get("row_count").and_then(|value| value.as_u64());
+        let bytes = details.get("bytes").and_then(|value| value.as_u64());
+        let materialization_color = Self::materialization_color(&node.materialization, cx);
+        let muted = cx.theme().colors().text_muted;
+
+        let mut body = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .flex_wrap()
+                    .child(Label::new(node.name.clone()).size(LabelSize::Small))
+                    .child(
+                        div()
+                            .px_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(materialization_color)
+                            .child(
+                                Label::new(node.materialization.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            );
+        if let Some(relation) = get_str("relation") {
+            body = body.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(SharedString::from(relation)),
+            );
+        }
+        if let Some(description) = get_str("description") {
+            body = body.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().colors().text)
+                    .child(SharedString::from(description)),
+            );
+        }
+        if row_count.is_some() || bytes.is_some() {
+            let mut stats = Vec::new();
+            if let Some(rows) = row_count {
+                stats.push(format!("{rows} rows"));
+            }
+            if let Some(bytes) = bytes {
+                stats.push(format!("{:.1} MB", bytes as f64 / 1_048_576.));
+            }
+            body = body.child(
+                Label::new(stats.join(" · "))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
+        if !tags.is_empty() {
+            body = body.child(h_flex().gap_1().flex_wrap().children(tags.into_iter().map(
+                |tag| {
+                    div()
+                        .px_1p5()
+                        .rounded_md()
+                        .bg(cx.theme().colors().element_background)
+                        .child(Label::new(tag).size(LabelSize::XSmall).color(Color::Muted))
+                },
+            )));
+        }
+        if let Some(ops) = node.ops.as_ref() {
+            body = body.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(SharedString::from(ops_tooltip(ops))),
+            );
+        }
+        body = body.child(
+            Label::new(format!("Columns ({})", node.columns.len()))
+                .size(LabelSize::XSmall)
+                .color(Color::Accent),
+        );
+        for (ix, column) in node.columns.iter().enumerate() {
+            let doc = column_doc(column);
+            let mut row = h_flex()
+                .id(SharedString::from(format!("dbt-detail-col-{ix}")))
+                .w_full()
+                .gap_2()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(cx.theme().colors().text)
+                        .child(SharedString::from(column.clone())),
+                );
+            if let Some(kind) = column_type(column) {
+                row = row.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(muted)
+                        .child(SharedString::from(kind)),
+                );
+            }
+            if let Some(doc) = doc {
+                row = row.tooltip(ui::Tooltip::text(doc));
+            }
+            body = body.child(row);
+        }
+
+        Some(
+            div()
+                .id("dbt-lineage-details")
+                .w(px(300.))
+                .h_full()
+                .flex_none()
+                .p_2()
+                .border_l_1()
+                .border_color(cx.theme().colors().border)
+                .overflow_y_scroll()
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
     fn render_tree_rows(
         &self,
         id_prefix: &'static str,
@@ -2410,6 +2570,21 @@ impl DbtResultsPanel {
                                                 cx.notify();
                                             })),
                                         )
+                                        .child(
+                                            IconButton::new(
+                                                "dbt-toggle-details",
+                                                IconName::Info,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .toggle_state(self.show_details)
+                                            .tooltip(ui::Tooltip::text(
+                                                "Show/hide model details",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_details = !this.show_details;
+                                                cx.notify();
+                                            })),
+                                        )
                                         .children(legend.into_iter().map(|materialization| {
                                             let color = Self::materialization_color(
                                                 &materialization,
@@ -2477,6 +2652,9 @@ impl DbtResultsPanel {
                                         ),
                                 ),
                         )
+                    })
+                    .when(self.show_details, |this| {
+                        this.children(self.render_details_sidebar(cx))
                     })
                     .when(self.show_tree, |this| {
                         this.child(
