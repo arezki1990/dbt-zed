@@ -1939,7 +1939,12 @@ impl DbtResultsPanel {
                                 workspace
                                     .open_abs_path(
                                         path,
-                                        workspace::OpenOptions::default(),
+                                        workspace::OpenOptions {
+                                            // Keep keyboard focus in the graph
+                                            // while browsing node to node.
+                                            focus: Some(false),
+                                            ..Default::default()
+                                        },
                                         window,
                                         cx,
                                     )
@@ -2088,7 +2093,12 @@ impl DbtResultsPanel {
                                 workspace
                                     .open_abs_path(
                                         path,
-                                        workspace::OpenOptions::default(),
+                                        workspace::OpenOptions {
+                                            // Keep keyboard focus in the graph
+                                            // while browsing node to node.
+                                            focus: Some(false),
+                                            ..Default::default()
+                                        },
                                         window,
                                         cx,
                                     )

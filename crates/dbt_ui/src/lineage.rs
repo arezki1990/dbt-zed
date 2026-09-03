@@ -1051,3 +1051,34 @@ fn build_graph(
         by_name,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_asterisk_does_not_disable_expressions() {
+        let sql = "SELECT\n  c.employee_id,\n  CASE WHEN x < c.reference_seniority_date THEN 0 ELSE 1 END AS seniority_in_years,\n  seniority_in_years * 12 AS seniority_in_months\nFROM t";
+        let entries = parse_all_select_entries(sql);
+        assert_eq!(
+            entries.get("seniority_in_years").map(|expr| expr.contains("reference_seniority_date")),
+            Some(true)
+        );
+        assert!(entries.contains_key("seniority_in_months"));
+    }
+
+    #[test]
+    fn lone_star_disqualifies_column_list_but_not_expressions() {
+        let sql = "SELECT t.*, a AS b FROM t";
+        assert_eq!(parse_select_columns(sql), None);
+        let entries = parse_all_select_entries(sql);
+        assert_eq!(entries.get("b").map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn cte_rename_chain_resolves_to_base_expression() {
+        let sql = "WITH base AS (SELECT sum(amount) AS total FROM x), o AS (SELECT total AS grand_total FROM base) SELECT grand_total FROM o";
+        let entries = parse_all_select_entries(sql);
+        assert_eq!(entries.get("grand_total").map(String::as_str), Some("sum(amount)"));
+    }
+}
