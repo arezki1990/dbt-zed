@@ -648,8 +648,12 @@ impl DbtResultsPanel {
                     return;
                 }
                 this.lineage_tree = tree.map(Arc::new);
+                log::debug!(
+                    "dbt lineage: layout arrived for {:?} ({} nodes)",
+                    this.lineage_model,
+                    this.lineage_layout.as_ref().map_or(0, |l| l.nodes.len()),
+                );
                 this.lineage_layout = layout.map(Arc::new);
-                this.pending_center = !this.center_on_model();
                 this.expanded.clear();
                 this.collapsed_up.clear();
                 this.collapsed_down.clear();
@@ -658,6 +662,9 @@ impl DbtResultsPanel {
                 this.node_offsets.clear();
                 this.graph_drag = None;
                 this.view = ResultsView::Lineage;
+                // Centering last: it owns the final pan — nothing below may
+                // reset it (that exact stomp hid the first-open centering).
+                this.pending_center = !this.center_on_model();
                 cx.notify();
             })
             .ok();
@@ -1255,9 +1262,15 @@ impl DbtResultsPanel {
     /// the viewport — browsing a file always brings its node into view.
     fn center_on_model(&mut self) -> bool {
         let Some(layout) = self.lineage_layout.as_ref() else {
+            log::info!("dbt lineage: center skipped — no layout");
             return true;
         };
         let Some(node) = layout.nodes.iter().find(|node| node.is_center) else {
+            log::info!(
+                "dbt lineage: center skipped — no is_center among {} nodes (model {:?})",
+                layout.nodes.len(),
+                self.lineage_model,
+            );
             return true;
         };
         let viewport = self.canvas_scroll.bounds().size;
@@ -1275,7 +1288,7 @@ impl DbtResultsPanel {
         let center_y = (node.y + node.height / 2.) * self.zoom + offset.1;
         self.pan = (view_w / 2. - center_x, view_h / 2. - center_y);
         self.canvas_scroll.set_offset(point(px(0.), px(0.)));
-        log::info!(
+        log::debug!(
             "dbt lineage: centered {} at ({center_x:.0},{center_y:.0}) in {view_w:.0}x{view_h:.0} -> pan ({:.0},{:.0})",
             node.name,
             self.pan.0,
