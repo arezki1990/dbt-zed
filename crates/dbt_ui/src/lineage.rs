@@ -56,12 +56,156 @@ pub const GRAPH_MAX_COLUMNS: usize = 12;
 pub const GRAPH_COL_GAP: f32 = 70.;
 
 /// A positioned node in the interactive lineage graph.
+/// Static summary of the SQL operations a model applies, extracted from its
+/// compiled code. Rendered as badges and a tooltip on the lineage canvas so
+/// grain changes (joins, aggregations, filters) are visible while debugging.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeOps {
+    /// Join descriptions, e.g. "left join stg_payments".
+    pub joins: Vec<String>,
+    /// Aggregate functions used, e.g. "sum", "count".
+    pub aggregations: Vec<String>,
+    pub group_by: bool,
+    /// Filter clauses present: "where", "having", "qualify".
+    pub filters: Vec<String>,
+    /// Window functions (OVER) present.
+    pub windows: bool,
+    /// SELECT DISTINCT present.
+    pub distinct: bool,
+    /// Number of UNION branches beyond the first.
+    pub unions: usize,
+}
+
+impl NodeOps {
+    pub fn is_empty(&self) -> bool {
+        self.joins.is_empty()
+            && self.aggregations.is_empty()
+            && !self.group_by
+            && self.filters.is_empty()
+            && !self.windows
+            && !self.distinct
+            && self.unions == 0
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "joins": self.joins,
+            "aggregations": self.aggregations,
+            "group_by": self.group_by,
+            "filters": self.filters,
+            "windows": self.windows,
+            "distinct": self.distinct,
+            "unions": self.unions,
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let strings = |key: &str| -> Vec<String> {
+            value
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let flag = |key: &str| value.get(key).and_then(|value| value.as_bool()).unwrap_or(false);
+        let ops = Self {
+            joins: strings("joins"),
+            aggregations: strings("aggregations"),
+            group_by: flag("group_by"),
+            filters: strings("filters"),
+            windows: flag("windows"),
+            distinct: flag("distinct"),
+            unions: value.get("unions").and_then(|value| value.as_u64()).unwrap_or(0) as usize,
+        };
+        (!ops.is_empty()).then_some(ops)
+    }
+}
+
+/// Best-effort text scan of compiled SQL — a debugging aid, not a parser.
+pub(crate) fn extract_ops(sql: &str) -> NodeOps {
+    let lower = sql.to_lowercase();
+    // Whitespace-normalized form so multi-word keywords match across newlines.
+    let norm = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut ops = NodeOps::default();
+
+    let mut from = 0;
+    while let Some(found) = norm[from..].find(" join ") {
+        let at = from + found;
+        from = at + 6;
+        let before = norm[..at].trim_end();
+        let mut kind = "join";
+        for candidate in [
+            "left outer", "right outer", "full outer", "left", "right", "full", "inner", "cross",
+        ] {
+            if before.ends_with(candidate) {
+                kind = candidate;
+                break;
+            }
+        }
+        let rest = &norm[at + 6..];
+        let token: String = rest
+            .chars()
+            .take_while(|ch| is_ident(*ch) || *ch == '.' || *ch == '"')
+            .collect();
+        let target = token
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_owned();
+        let label = if target.is_empty() {
+            format!("{kind} join (subquery)")
+        } else if kind == "join" {
+            format!("join {target}")
+        } else {
+            format!("{kind} join {target}")
+        };
+        if ops.joins.len() < 8 && !ops.joins.contains(&label) {
+            ops.joins.push(label);
+        }
+    }
+
+    for name in ["sum", "count", "avg", "min", "max", "array_agg", "listagg", "string_agg"] {
+        let pattern = format!("{name}(");
+        let mut from = 0;
+        while let Some(found) = lower[from..].find(&pattern) {
+            let at = from + found;
+            from = at + pattern.len();
+            if lower[..at].chars().next_back().is_some_and(is_ident) {
+                continue;
+            }
+            if !ops.aggregations.contains(&name.to_owned()) {
+                ops.aggregations.push(name.to_owned());
+            }
+            break;
+        }
+    }
+    ops.group_by = norm.contains(" group by ");
+    for clause in ["where", "having", "qualify"] {
+        if norm.contains(&format!(" {clause} ")) {
+            ops.filters.push(clause.to_owned());
+        }
+    }
+    ops.windows = norm.contains(" over (") || norm.contains(" over(") || lower.contains("over(");
+    ops.distinct = norm.contains("select distinct ") || norm.contains("select distinct\n");
+    ops.unions = norm.matches(" union ").count() + norm.matches(" union all ").count() / 2;
+    ops
+}
+
 #[derive(Clone, Debug)]
 pub struct GraphLayoutNode {
     pub name: String,
     pub kind: String,
     pub materialization: String,
     pub path: Option<PathBuf>,
+    /// Summary of SQL operations this model applies, when derivable.
+    pub ops: Option<NodeOps>,
     /// Column names, ordered (from catalog.json when present, else the
     /// documented columns in manifest.json).
     pub columns: Vec<String>,
@@ -322,7 +466,15 @@ impl LineageStore {
                 let level = min_level + column_ix as i32;
                 let column_width = column
                     .iter()
-                    .map(|(_, entity)| 26. + 8. * entity.name.len() as f32)
+                    .map(|(_, entity)| {
+                        // Ops badges render beside the name; leave room for them.
+                        let badge_pad = if entity.data.get("ops").is_some_and(|ops| !ops.is_null()) {
+                            36.
+                        } else {
+                            0.
+                        };
+                        26. + badge_pad + 8. * entity.name.len() as f32
+                    })
                     .fold(80.0_f32, f32::max);
                 let y_offset =
                     GRAPH_PADDING + (content_height - column.len() as f32 * row_pitch) / 2.;
@@ -337,6 +489,7 @@ impl LineageStore {
                             .and_then(|value| value.as_str())
                             .unwrap_or(entity.kind.as_str())
                             .to_owned(),
+                        ops: entity.data.get("ops").and_then(NodeOps::from_json),
                         path: entity
                             .file_path
                             .as_ref()
@@ -622,6 +775,7 @@ fn build_graph(
         file_path: Option<String>,
         materialized: String,
         columns: Vec<String>,
+        ops: Option<NodeOps>,
     }
     let mut pending: Vec<PendingNode> = Vec::new();
     for section in ["nodes", "sources"] {
@@ -664,6 +818,12 @@ fn build_graph(
                         .and_then(parse_select_columns)
                 })
                 .unwrap_or_default();
+            let ops = node
+                .get("compiled_code")
+                .or_else(|| node.get("raw_code"))
+                .and_then(|value| value.as_str())
+                .map(extract_ops)
+                .filter(|ops| !ops.is_empty());
             pending.push(PendingNode {
                 unique_id: unique_id.clone(),
                 kind: resource_type.to_owned(),
@@ -671,6 +831,7 @@ fn build_graph(
                 file_path,
                 materialized,
                 columns,
+                ops,
             });
         }
     }
@@ -738,7 +899,11 @@ fn build_graph(
                 kind: node.kind.clone(),
                 name: node.name.clone(),
                 file_path: node.file_path.clone(),
-                data: json!({ "materialized": node.materialized, "columns": node.columns }),
+                data: json!({
+                    "materialized": node.materialized,
+                    "columns": node.columns,
+                    "ops": node.ops.as_ref().map(NodeOps::to_json),
+                }),
             })
             .map_err(|error| anyhow::anyhow!("inserting lineage node: {error}"))?;
         by_uid.insert(node.unique_id.clone(), id);

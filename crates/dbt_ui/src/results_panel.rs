@@ -29,6 +29,57 @@ use crate::{
     },
 };
 
+/// One-glance badge string for a node's SQL operations, e.g. "⋈2 Σ σ ƒ".
+fn ops_badges(ops: &crate::lineage::NodeOps) -> String {
+    let mut badges = Vec::new();
+    if !ops.joins.is_empty() {
+        badges.push(format!("⋈{}", ops.joins.len()));
+    }
+    if ops.group_by || !ops.aggregations.is_empty() {
+        badges.push("Σ".to_owned());
+    }
+    if !ops.filters.is_empty() {
+        badges.push("σ".to_owned());
+    }
+    if ops.windows {
+        badges.push("ƒ".to_owned());
+    }
+    if ops.distinct {
+        badges.push("D".to_owned());
+    }
+    if ops.unions > 0 {
+        badges.push("∪".to_owned());
+    }
+    badges.join(" ")
+}
+
+/// Multi-line tooltip describing a node's operations for debugging.
+fn ops_tooltip(ops: &crate::lineage::NodeOps) -> String {
+    let mut lines = Vec::new();
+    if !ops.joins.is_empty() {
+        lines.push(format!("Joins: {}", ops.joins.join(", ")));
+    }
+    if !ops.aggregations.is_empty() {
+        let group = if ops.group_by { " over group by" } else { "" };
+        lines.push(format!("Aggregations: {}{group}", ops.aggregations.join(", ")));
+    } else if ops.group_by {
+        lines.push("Aggregation: group by".to_owned());
+    }
+    if !ops.filters.is_empty() {
+        lines.push(format!("Filters: {}", ops.filters.join(", ")));
+    }
+    if ops.windows {
+        lines.push("Window functions".to_owned());
+    }
+    if ops.distinct {
+        lines.push("Select distinct".to_owned());
+    }
+    if ops.unions > 0 {
+        lines.push(format!("Union of {} branches", ops.unions + 1));
+    }
+    lines.join("\n")
+}
+
 /// Below this zoom, column rows (and their edges) collapse away — node text
 /// scales with zoom, so columns stay legible well under 100%.
 const COLUMNS_MIN_ZOOM: f32 = 0.55;
@@ -1249,6 +1300,10 @@ impl DbtResultsPanel {
                     })
                     .hover(|style| style.border_color(center_border))
                     .cursor_pointer()
+                    // Transformation summary for debugging: what this model does.
+                    .when_some(node.ops.clone(), |this, ops| {
+                        this.tooltip(ui::Tooltip::text(ops_tooltip(&ops)))
+                    })
                     .child(
                         v_flex()
                             .size_full()
@@ -1264,6 +1319,7 @@ impl DbtResultsPanel {
                                         this.border_b_1()
                                             .border_color(cx.theme().colors().border)
                                     })
+                                    .gap_1()
                                     .child(
                                         div()
                                             .text_size(name_text_size)
@@ -1273,6 +1329,17 @@ impl DbtResultsPanel {
                                                 text_color
                                             })
                                             .child(SharedString::from(node.name.clone())),
+                                    )
+                                    .when_some(
+                                        node.ops.as_ref().map(|ops| ops_badges(ops)).filter(|badges| !badges.is_empty()),
+                                        |this, badges| {
+                                            this.child(
+                                                div()
+                                                    .text_size(name_text_size * 0.8)
+                                                    .text_color(materialization_color)
+                                                    .child(SharedString::from(badges)),
+                                            )
+                                        },
                                     ),
                             )
                             .when(shown_columns > 0, |this| {
