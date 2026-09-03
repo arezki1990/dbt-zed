@@ -2616,9 +2616,11 @@ impl DbtResultsPanel {
 
         let grid = div()
             .id("dbt-grid")
+            .relative()
             .flex_1()
             .min_w(px(0.))
             .h_full()
+            .overflow_hidden()
             // Column resize is a global drag while active.
             .when(self.col_resize.is_some(), |this| {
                 this.on_mouse_move(cx.listener(
@@ -2655,13 +2657,26 @@ impl DbtResultsPanel {
                             .h_full()
                             .child(header)
                             .child(list),
-                    )
-                    .custom_scrollbars(
-                        ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
-                            .tracked_scroll_handle(&self.grid_h_scroll),
-                        window,
-                        cx,
                     ),
+            )
+            // Scrollbars as sibling overlays (not on the scroll container),
+            // reading the same handles — the pattern Zed's own table uses,
+            // so the thumbs track cleanly instead of fighting native offset.
+            .child(
+                div().absolute().inset_0().child(div()).custom_scrollbars(
+                    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&self.grid_v_scroll),
+                    window,
+                    cx,
+                ),
+            )
+            .child(
+                div().absolute().inset_0().child(div()).custom_scrollbars(
+                    ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
+                        .tracked_scroll_handle(&self.grid_h_scroll),
+                    window,
+                    cx,
+                ),
             );
 
         h_flex()
