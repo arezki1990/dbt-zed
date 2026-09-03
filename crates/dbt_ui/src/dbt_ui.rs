@@ -5,6 +5,7 @@ pub mod dbt_install;
 pub mod dbt_settings;
 pub mod lineage;
 pub mod lineage_sql;
+pub mod mcp;
 pub mod results_panel;
 
 use gpui::{App, actions};

@@ -1013,7 +1013,7 @@ impl DbtResultsPanel {
     /// propagated transitively through renames in both directions: a target
     /// column marks the upstream columns its expression references, and a
     /// downstream column referencing a marked one gets marked too.
-    fn column_highlights(
+    pub(crate) fn column_highlights(
         layout: &LayoutGraph,
         selected: &str,
     ) -> Vec<std::collections::HashSet<String>> {
@@ -3027,7 +3027,7 @@ fn load_dotenv(root: &std::path::Path, env_file: Option<&str>) -> Vec<(String, S
 
 /// Applies the settings-driven target, profiles dir, and environment to a dbt
 /// invocation.
-fn apply_common_args(
+pub(crate) fn apply_common_args(
     command: &mut util::command::Command,
     settings: &DbtSettings,
     root: &std::path::Path,
@@ -3105,7 +3105,7 @@ async fn fetch_compiled_sql(
     }
 }
 
-fn parse_show_output(
+pub(crate) fn parse_show_output(
     stdout: &[u8],
     stderr: &[u8],
     success: bool,

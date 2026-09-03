@@ -198,6 +198,12 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
+    // Fork: `--dbt-mcp` serves zdbt's dbt tools over MCP stdio for agents
+    // (Zed agent panel context_servers, Claude Code, any MCP client).
+    if std::env::args().any(|arg| arg == "--dbt-mcp") {
+        dbt_ui::mcp::serve();
+        return;
+    }
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode

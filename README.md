@@ -91,3 +91,23 @@ MIT-licensed from crates.io.
 If you distribute binaries of this fork: rename the product and replace the
 icon (the Zed name/logo are trademarks not covered by the GPL), and disable
 auto-update so builds don't replace themselves with official Zed.
+
+## MCP server (agents)
+
+The binary doubles as an MCP server: `zdbt --dbt-mcp` speaks MCP over stdio,
+exposing `dbt_list_models`, `dbt_model_info`, `dbt_lineage`,
+`dbt_column_lineage`, `dbt_show`, and `dbt_compile`. Register it for Zed's
+agent panel in `settings.json` (adjust the path to your build or
+`/Applications/zdbt.app/Contents/MacOS/zdbt`):
+
+```json
+"context_servers": {
+  "dbt": {
+    "source": "custom",
+    "command": "/Applications/zdbt.app/Contents/MacOS/zdbt",
+    "args": ["--dbt-mcp"]
+  }
+}
+```
+
+Any MCP client works — e.g. Claude Code: `claude mcp add dbt -- /Applications/zdbt.app/Contents/MacOS/zdbt --dbt-mcp`.
