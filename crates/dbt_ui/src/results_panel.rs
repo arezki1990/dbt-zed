@@ -1030,6 +1030,28 @@ impl DbtResultsPanel {
         marked
     }
 
+    /// Changes zoom anchored on the graph's gravity center (the browsed
+    /// node, or the graph middle) so the graph stays in place instead of
+    /// sliding toward the canvas origin and off screen.
+    fn set_zoom(&mut self, new_zoom: f32, cx: &mut Context<Self>) {
+        let new_zoom = new_zoom.clamp(0.4, 2.0);
+        if (new_zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        if let Some(layout) = self.lineage_layout.as_ref() {
+            let anchor = layout
+                .nodes
+                .iter()
+                .find(|node| node.is_center)
+                .map(|node| (node.x + node.width / 2., node.y + node.height / 2.))
+                .unwrap_or((layout.width / 2., layout.height / 2.));
+            self.pan.0 += anchor.0 * (self.zoom - new_zoom);
+            self.pan.1 += anchor.1 * (self.zoom - new_zoom);
+        }
+        self.zoom = new_zoom;
+        cx.notify();
+    }
+
     fn render_column_trace(&self, cx: &Context<Self>) -> Option<gpui::Div> {
         let column = self.selected_column.clone()?;
         let layout = self.lineage_layout.as_ref()?;
@@ -1153,6 +1175,20 @@ impl DbtResultsPanel {
                         this.graph_drag = Some(GraphDrag::Canvas(event.position));
                     }),
                 )
+                // cmd + scroll wheel zooms, anchored on the gravity center.
+                .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                    if !event.modifiers.platform {
+                        return;
+                    }
+                    let delta_y = match event.delta {
+                        gpui::ScrollDelta::Pixels(delta) => f32::from(delta.y) / 120.,
+                        gpui::ScrollDelta::Lines(delta) => delta.y / 8.,
+                    };
+                    if delta_y != 0. {
+                        this.set_zoom(this.zoom * (1. + delta_y), cx);
+                        cx.stop_propagation();
+                    }
+                }))
                 .on_mouse_move(cx.listener(|this, event, _, cx| {
                     this.graph_mouse_move(event, cx);
                 }))
@@ -1969,9 +2005,7 @@ impl DbtResultsPanel {
                                         .child(
                                             Button::new("dbt-zoom-out", "−").on_click(
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.zoom =
-                                                        (this.zoom / 1.2).clamp(0.4, 2.0);
-                                                    cx.notify();
+                                                    this.set_zoom(this.zoom / 1.2, cx);
                                                 }),
                                             ),
                                         )
@@ -1986,9 +2020,7 @@ impl DbtResultsPanel {
                                         .child(
                                             Button::new("dbt-zoom-in", "+").on_click(
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.zoom =
-                                                        (this.zoom * 1.2).clamp(0.4, 2.0);
-                                                    cx.notify();
+                                                    this.set_zoom(this.zoom * 1.2, cx);
                                                 }),
                                             ),
                                         )
