@@ -58,6 +58,24 @@ fn column_sources(node: &crate::lineage::GraphLayoutNode, column: &str) -> Vec<S
     sources
 }
 
+/// Source columns on `from` feeding `column` of `to`. Exact AST lineage wins
+/// when present (including "no link from this parent" — the precision case);
+/// otherwise the name/reference heuristic closure decides.
+fn sources_toward(
+    from: &crate::lineage::GraphLayoutNode,
+    to: &crate::lineage::GraphLayoutNode,
+    column: &str,
+) -> Vec<String> {
+    if let Some(leaves) = to.col_lineage.get(column) {
+        return leaves
+            .iter()
+            .filter(|(node, _)| *node == from.name)
+            .map(|(_, source)| source.clone())
+            .collect();
+    }
+    column_sources(to, column)
+}
+
 /// One-glance badge string for a node's SQL operations, e.g. "⋈2 Σ σ ƒ".
 fn ops_badges(ops: &crate::lineage::NodeOps) -> String {
     let mut badges = Vec::new();
@@ -978,7 +996,7 @@ impl DbtResultsPanel {
                 marked[ix].insert(selected.to_owned());
             }
         }
-        let sources_of = column_sources;
+
         let mut passes = 0;
         loop {
             let mut changed = false;
@@ -993,7 +1011,7 @@ impl DbtResultsPanel {
                     if marked[to_ix].contains(&column) {
                         continue;
                     }
-                    if sources_of(to, &column)
+                    if sources_toward(from, to, &column)
                         .iter()
                         .any(|source| marked[from_ix].contains(source))
                     {
@@ -1003,7 +1021,7 @@ impl DbtResultsPanel {
                 // Upstream: sources referenced by marked target columns.
                 let mut add_from = Vec::new();
                 for column in marked[to_ix].iter() {
-                    for source in sources_of(to, column) {
+                    for source in sources_toward(from, to, column) {
                         if !marked[from_ix].contains(&source)
                             && from
                                 .columns
@@ -1655,10 +1673,8 @@ impl DbtResultsPanel {
                             to.columns.iter().take(GRAPH_MAX_COLUMNS).enumerate()
                         {
                             let to_lower = to_column.to_lowercase();
-                            // Source candidates: same name plus everything the
-                            // target's expression references, closed through
-                            // the node's own CTE renames.
-                            let sources = column_sources(to, &to_lower);
+                            // Exact AST lineage first, heuristic fallback.
+                            let sources = sources_toward(from, to, &to_lower);
                             for source in &sources {
                                 let Some(&from_row) = from_rows.get(source) else {
                                     continue;

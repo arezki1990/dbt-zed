@@ -248,6 +248,8 @@ pub struct GraphLayoutNode {
     /// Lowercased column name -> upstream/CTE identifiers its full
     /// (untruncated) expression references.
     pub col_refs: std::collections::HashMap<String, Vec<String>>,
+    /// Exact AST-resolved lineage: column -> (upstream node name, column).
+    pub col_lineage: std::collections::HashMap<String, Vec<(String, String)>>,
     /// More parents/children exist beyond the loaded depth or node cap.
     pub truncated_up: bool,
     pub truncated_down: bool,
@@ -558,6 +560,29 @@ impl LineageStore {
                             .unwrap_or(entity.kind.as_str())
                             .to_owned(),
                         ops: entity.data.get("ops").and_then(NodeOps::from_json),
+                        col_lineage: entity
+                            .data
+                            .get("col_lineage")
+                            .and_then(|value| value.as_object())
+                            .map(|map| {
+                                map.iter()
+                                    .filter_map(|(key, value)| {
+                                        let leaves = value
+                                            .as_array()?
+                                            .iter()
+                                            .filter_map(|pair| {
+                                                let pair = pair.as_array()?;
+                                                Some((
+                                                    pair.first()?.as_str()?.to_owned(),
+                                                    pair.get(1)?.as_str()?.to_owned(),
+                                                ))
+                                            })
+                                            .collect();
+                                        Some((key.clone(), leaves))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         col_refs: entity
                             .data
                             .get("col_refs")
@@ -956,6 +981,11 @@ fn build_graph(
         ops: Option<NodeOps>,
         col_exprs: std::collections::HashMap<String, String>,
         col_refs: std::collections::HashMap<String, Vec<String>>,
+        /// Lowercased last segment of relation_name (how FROM clauses see it).
+        table_ident: Option<String>,
+        compiled_code: Option<String>,
+        /// Exact AST-resolved lineage: column -> (parent node name, column).
+        col_lineage: std::collections::HashMap<String, Vec<(String, String)>>,
     }
     let mut pending: Vec<PendingNode> = Vec::new();
     for section in ["nodes", "sources"] {
@@ -1040,6 +1070,21 @@ fn build_graph(
                 ops,
                 col_exprs,
                 col_refs,
+                table_ident: node
+                    .get("relation_name")
+                    .and_then(|value| value.as_str())
+                    .and_then(|relation| relation.rsplit('.').next())
+                    .or_else(|| {
+                        node.get("alias")
+                            .and_then(|value| value.as_str())
+                            .or(Some(name))
+                    })
+                    .map(|ident| ident.trim_matches('"').to_lowercase()),
+                compiled_code: node
+                    .get("compiled_code")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                col_lineage: Default::default(),
             });
         }
     }
@@ -1099,6 +1144,43 @@ fn build_graph(
         }
     }
 
+    // Phase 2.5: exact AST-based column lineage, now that every node's
+    // column list is final. Falls back to the text heuristic per column at
+    // match time when a model's SQL defeats the resolver.
+    for ix in 0..pending.len() {
+        let Some(sql) = pending[ix].compiled_code.clone() else {
+            continue;
+        };
+        let mut upstream_map = std::collections::HashMap::new();
+        for parent_uid in parents_of.get(&pending[ix].unique_id).into_iter().flatten() {
+            if let Some(&parent_ix) = index_of_uid.get(parent_uid) {
+                let parent = &pending[parent_ix];
+                if let Some(ident) = parent.table_ident.clone() {
+                    upstream_map.insert(
+                        ident,
+                        crate::lineage_sql::UpstreamRelation {
+                            node: parent.name.clone(),
+                            columns: parent
+                                .columns
+                                .iter()
+                                .map(|column| column.to_lowercase())
+                                .collect(),
+                        },
+                    );
+                }
+            }
+        }
+        if upstream_map.is_empty() {
+            continue;
+        }
+        if let Some(lineage) = crate::lineage_sql::column_lineage(&sql, &upstream_map) {
+            pending[ix].col_lineage = lineage
+                .into_iter()
+                .filter(|(_, leaves)| !leaves.is_empty())
+                .collect();
+        }
+    }
+
     // Phase 3: insert into the graph.
     for node in &pending {
         let id = graph
@@ -1113,6 +1195,7 @@ fn build_graph(
                     "ops": node.ops.as_ref().map(NodeOps::to_json),
                     "col_exprs": node.col_exprs,
                     "col_refs": node.col_refs,
+                    "col_lineage": node.col_lineage,
                 }),
             })
             .map_err(|error| anyhow::anyhow!("inserting lineage node: {error}"))?;
