@@ -656,10 +656,14 @@ impl Panel for DbtDatabasePanel {
         4
     }
 
-    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
-        // Lazy: a closed panel never reads the artifacts.
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Lazy: a closed panel never reads the artifacts. Deferred because
+        // set_active fires inside the Workspace's own update, and
+        // ensure_loaded reads the Workspace to discover the project root —
+        // reading it synchronously here double-leases and panics (the same
+        // trap the results panel hit in http_client()).
         if active {
-            self.ensure_loaded(cx);
+            cx.defer_in(window, |this, _, cx| this.ensure_loaded(cx));
         }
     }
 }
