@@ -187,6 +187,9 @@ pub struct DbtResultsPanel {
     focus_return: Option<((f32, f32), f32)>,
     /// Open right-click menu on a column row.
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Effective dbt config for the Connection tab, rebuilt on demand.
+    connection: Option<Arc<crate::connection::ConnectionInfo>>,
+    connection_scroll: ScrollHandle,
     _run: Task<()>,
     _lineage_refresh: Task<()>,
 }
@@ -201,6 +204,7 @@ enum ResultsView {
     Table,
     Compiled,
     Lineage,
+    Connection,
 }
 
 /// What `dbt show` should execute: a whole model, or an ad-hoc SQL chunk
@@ -453,6 +457,8 @@ impl DbtResultsPanel {
                 column_focus: None,
                 focus_return: None,
                 context_menu: None,
+                connection: None,
+                connection_scroll: ScrollHandle::new(),
                 _run: Task::ready(()),
                 _lineage_refresh: Task::ready(()),
             }
@@ -925,6 +931,17 @@ impl DbtResultsPanel {
                             .toggle_state(self.view == ResultsView::Lineage)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.view = ResultsView::Lineage;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("dbt-view-connection", "Connection")
+                            .toggle_state(self.view == ResultsView::Connection)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.view = ResultsView::Connection;
+                                // Rebuilt on entry so edits to profiles.yml or
+                                // settings show up without restarting.
+                                this.connection = None;
                                 cx.notify();
                             })),
                     )
@@ -2749,7 +2766,314 @@ impl DbtResultsPanel {
             .into_any_element()
     }
 
+    /// Project root for the Connection tab: the last run's root, else the
+    /// active editor's project, else a dbt project at (or directly under) a
+    /// worktree root — so the tab is useful before anything has been run.
+    fn connection_root(&self, cx: &App) -> Option<PathBuf> {
+        if let Some(root) = self.last_root.clone() {
+            return Some(root);
+        }
+        let workspace = self.workspace.upgrade()?;
+        let workspace = workspace.read(cx);
+        if let Some((_, root)) = active_model_file(workspace, cx) {
+            return Some(root);
+        }
+        let settings = DbtSettings::get_global(cx);
+        for worktree in workspace.project().read(cx).worktrees(cx) {
+            let root = worktree.read(cx).abs_path().to_path_buf();
+            if let Some(dir) = &settings.project_dir {
+                let candidate = if std::path::Path::new(dir).is_absolute() {
+                    PathBuf::from(dir)
+                } else {
+                    root.join(dir)
+                };
+                if candidate.join("dbt_project.yml").is_file() {
+                    return Some(candidate);
+                }
+            }
+            if root.join("dbt_project.yml").is_file() {
+                return Some(root);
+            }
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.join("dbt_project.yml").is_file() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Builds the Connection tab's data if it isn't cached yet.
+    fn ensure_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connection.is_some() {
+            return;
+        }
+        let settings = DbtSettings::get_global(cx).clone();
+        let Some(root) = self.connection_root(cx) else {
+            return;
+        };
+        let profiles_dir = resolve_profiles_dir(&settings, &root);
+        let binary = crate::dbt_install::describe_binary(&settings);
+        // Names only: dotenv values are dropped here and never reach the UI.
+        let mut seen = HashSet::new();
+        let env_names: Vec<String> = load_dotenv(&root, settings.env_file.as_deref())
+            .into_iter()
+            .map(|(name, _)| name)
+            .chain(settings.env.iter().map(|(name, _)| name.clone()))
+            .filter(|name| seen.insert(name.clone()))
+            .collect();
+        self.connection = Some(Arc::new(crate::connection::collect(
+            &settings,
+            &root,
+            profiles_dir,
+            binary,
+            env_names,
+        )));
+    }
+
+    fn render_connection(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let Some(info) = self.connection.clone() else {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(
+                    Label::new("No dbt project found.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Open a folder containing dbt_project.yml.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        };
+
+        let colors = cx.theme().colors();
+        let row = |key: String, value: SharedString, color: Color| {
+            h_flex()
+                .w_full()
+                .gap_2()
+                .items_start()
+                .child(
+                    div().w(px(140.)).flex_shrink_0().child(
+                        Label::new(key)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(value).size(LabelSize::Small).color(color)),
+                )
+                .into_any_element()
+        };
+        let section = |title: &str, rows: Vec<gpui::AnyElement>| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(
+                    Label::new(title.to_owned())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .children(rows)
+                .into_any_element()
+        };
+        let text_or = |value: Option<&String>| -> (SharedString, Color) {
+            match value {
+                Some(value) => (value.clone().into(), Color::Default),
+                None => ("—".into(), Color::Muted),
+            }
+        };
+
+        let mut sections: Vec<gpui::AnyElement> = Vec::new();
+
+        // Project ------------------------------------------------------
+        let (name, name_color) = text_or(info.project_name.as_ref());
+        sections.push(section(
+            "Project",
+            vec![
+                row("name".into(), name, name_color),
+                row(
+                    "directory".into(),
+                    info.project_dir.to_string_lossy().into_owned().into(),
+                    Color::Default,
+                ),
+            ],
+        ));
+
+        // Executable ---------------------------------------------------
+        sections.push(section(
+            "Executable",
+            vec![
+                row("dbt binary".into(), info.binary.clone().into(), Color::Default),
+                row(
+                    "resolved from".into(),
+                    info.binary_source.into(),
+                    Color::Muted,
+                ),
+                row(
+                    "distribution".into(),
+                    info.distribution.clone().into(),
+                    Color::Default,
+                ),
+            ],
+        ));
+
+        // Profile & target ---------------------------------------------
+        let (profile, profile_color) = text_or(info.profile_name.as_ref());
+        let (target, target_color) = match info.active_target.as_ref() {
+            Some(target) => (SharedString::from(target.clone()), Color::Accent),
+            None => ("—".into(), Color::Muted),
+        };
+        let mut profile_rows = vec![
+            row(
+                "profiles.yml".into(),
+                info.profiles_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "not found".to_owned())
+                    .into(),
+                if info.profiles_path.is_some() {
+                    Color::Default
+                } else {
+                    Color::Warning
+                },
+            ),
+            row("found via".into(), info.profiles_source.into(), Color::Muted),
+            row("profile".into(), profile, profile_color),
+            row("active target".into(), target, target_color),
+            row("target from".into(), info.target_source.into(), Color::Muted),
+        ];
+        if !info.targets.is_empty() {
+            let active = info.active_target.clone();
+            profile_rows.push(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
+                    .child(
+                        div().w(px(140.)).flex_shrink_0().child(
+                            Label::new("available")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(info.targets.iter().map(|name| {
+                                let is_active = active.as_deref() == Some(name.as_str());
+                                div()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if is_active {
+                                        colors.text_accent
+                                    } else {
+                                        colors.border
+                                    })
+                                    .child(
+                                        Label::new(name.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(if is_active {
+                                                Color::Accent
+                                            } else {
+                                                Color::Muted
+                                            }),
+                                    )
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        sections.push(section("Profile & target", profile_rows));
+
+        // Connection parameters ----------------------------------------
+        // Names only: no value is read into `ConnectionInfo`, so every row
+        // shows the mask rather than a redacted copy of the real thing.
+        let params: Vec<gpui::AnyElement> = if info.param_keys.is_empty() {
+            vec![
+                Label::new("No parameters resolved for this target.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            ]
+        } else {
+            info.param_keys
+                .iter()
+                .map(|key| row(key.clone(), "••••••••".into(), Color::Muted))
+                .collect()
+        };
+        sections.push(section("Connection parameters", params));
+
+        // Environment ---------------------------------------------------
+        if !info.env_names.is_empty() {
+            sections.push(section(
+                &format!("Environment ({})", info.env_names.len()),
+                vec![
+                    h_flex()
+                        .w_full()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(info.env_names.iter().map(|name| {
+                            div()
+                                .px_1p5()
+                                .rounded_md()
+                                .bg(colors.element_background)
+                                .child(
+                                    Label::new(name.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                        }))
+                        .into_any_element(),
+                    Label::new("Names only — values are passed to dbt, never displayed.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                ],
+            ));
+        }
+
+        v_flex()
+            .id("dbt-connection")
+            .size_full()
+            .p_3()
+            .gap_4()
+            .overflow_y_scroll()
+            .track_scroll(&self.connection_scroll)
+            .children(info.notes.iter().map(|note| {
+                Label::new(note.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Warning)
+            }))
+            .children(sections)
+            .child(
+                Label::new(
+                    "Passwords, keys and tokens are masked and never leave profiles.yml.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.view == ResultsView::Connection {
+            return self.render_connection(cx);
+        }
         if self.view == ResultsView::Lineage {
             let lineage_tree = self.lineage_tree.clone();
             return match lineage_tree {
@@ -3056,7 +3380,7 @@ impl DbtResultsPanel {
 /// otherwise auto-detected in-project profile locations (`local_profiles/`,
 /// `profiles/`, `.dbt/`). A root-level profiles.yml needs nothing — dbt finds
 /// it via the working directory.
-fn resolve_profiles_dir(
+pub(crate) fn resolve_profiles_dir(
     settings: &DbtSettings,
     root: &std::path::Path,
 ) -> Option<PathBuf> {
@@ -3114,7 +3438,10 @@ fn merge_env_file(path: &std::path::Path, vars: &mut Vec<(String, String)>) {
     }
 }
 
-fn load_dotenv(root: &std::path::Path, env_file: Option<&str>) -> Vec<(String, String)> {
+pub(crate) fn load_dotenv(
+    root: &std::path::Path,
+    env_file: Option<&str>,
+) -> Vec<(String, String)> {
     // Search the project root and its ancestors up to the git repo root (a
     // dbt project often lives in a subdirectory of the repo, with .env at the
     // top). Never walk past .git — outer files load first so inner override.
@@ -3316,6 +3643,9 @@ impl Focusable for DbtResultsPanel {
 
 impl Render for DbtResultsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.view == ResultsView::Connection {
+            self.ensure_connection(cx);
+        }
         if self.pending_center {
             if self.center_on_model() {
                 self.pending_center = false;

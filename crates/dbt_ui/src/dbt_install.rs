@@ -51,11 +51,44 @@ fn cdn_target() -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn path_has_binary(name: &str) -> bool {
+/// The first PATH entry providing `name`, if any.
+pub(crate) fn path_lookup(name: &str) -> Option<PathBuf> {
     let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(&file).is_file()))
-        .unwrap_or(false)
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
+}
+
+fn path_has_binary(name: &str) -> bool {
+    path_lookup(name).is_some()
+}
+
+/// Resolves the dbt executable for display without downloading anything:
+/// the same precedence as [`ensure_binary`], reported alongside where it came
+/// from. Returns `("not installed", …)` rather than installing on the spot.
+pub(crate) fn describe_binary(settings: &DbtSettings) -> (String, &'static str) {
+    if settings.binary != "dbt" {
+        return (settings.binary.clone(), "dbt.binary setting");
+    }
+    if let Some(path) = path_lookup("dbt") {
+        return (path.to_string_lossy().into_owned(), "PATH");
+    }
+    let managed = if settings.distribution == "core" {
+        managed_core_binary_path()
+    } else {
+        managed_binary_path()
+    };
+    if managed.is_file() {
+        return (managed.to_string_lossy().into_owned(), "managed install");
+    }
+    (
+        "not installed".to_owned(),
+        if settings.auto_install {
+            "will auto-install on first run"
+        } else {
+            "not on PATH — set dbt.binary or enable dbt.auto_install"
+        },
+    )
 }
 
 /// Resolves the dbt binary to run: an explicit `dbt.binary` setting wins, then
