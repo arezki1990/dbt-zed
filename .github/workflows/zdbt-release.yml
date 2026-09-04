@@ -104,3 +104,31 @@ jobs:
           $exe = Get-ChildItem target\*.exe | Select-Object -First 1
           Copy-Item $exe.FullName zdbt-windows-x86_64-setup.exe
           gh release upload $env:ZDBT_TAG zdbt-windows-x86_64-setup.exe --clobber
+
+  # Regenerates SHA256SUMS.txt from whatever the release actually holds, so the
+  # checksums always match the published assets. Runs even when some platform
+  # jobs were skipped (workflow_dispatch with `only`), because the assets from
+  # earlier runs are still on the release and must stay covered.
+  checksums:
+    needs: [macos-aarch64, linux-x86_64, windows-x86_64]
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Generate and upload SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist && cd dist
+          gh release download "$ZDBT_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'zdbt-*' --clobber
+          if [ -z "$(ls -A)" ]; then
+            echo "::error::no zdbt-* assets on $ZDBT_TAG; nothing to checksum"
+            exit 1
+          fi
+          sha256sum zdbt-* > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$ZDBT_TAG" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --clobber
