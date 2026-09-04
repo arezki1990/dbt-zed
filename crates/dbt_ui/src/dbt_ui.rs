@@ -1,7 +1,10 @@
 //! Native dbt UI for Zed: a bottom-dock results panel that runs
-//! `dbt show --select <model>` and renders the returned rows as a data table.
+//! `dbt show --select <model>` and renders the returned rows as a data table,
+//! plus a left-dock database explorer built from the dbt artifacts.
 
 pub mod connection;
+pub mod database;
+pub mod database_panel;
 pub mod dbt_install;
 pub mod dbt_settings;
 pub mod lineage;
@@ -12,6 +15,7 @@ pub mod results_panel;
 use gpui::{App, actions};
 use workspace::Workspace;
 
+pub use database_panel::DbtDatabasePanel;
 pub use results_panel::DbtResultsPanel;
 
 actions!(
@@ -21,6 +25,8 @@ actions!(
         ShowModelData,
         /// Toggles focus on the dbt results panel.
         ToggleFocus,
+        /// Toggles focus on the dbt database explorer panel.
+        ToggleDatabaseFocus,
     ]
 );
 
@@ -31,6 +37,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<DbtResultsPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleDatabaseFocus, window, cx| {
+            workspace.toggle_panel_focus::<DbtDatabasePanel>(window, cx);
         });
     })
     .detach();

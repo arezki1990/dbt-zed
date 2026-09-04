@@ -5011,6 +5011,7 @@ dependencies = [
  "smol",
  "sqlitegraph",
  "sqlparser",
+ "tempfile",
  "ui",
  "util",
  "workspace",

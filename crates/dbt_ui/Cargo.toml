@@ -35,3 +35,6 @@ util.workspace = true
 workspace.workspace = true
 log.workspace = true
 zed_actions.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

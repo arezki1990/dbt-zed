@@ -214,14 +214,18 @@ pub enum ShowTarget {
         name: SharedString,
         rel_path: PathBuf,
     },
-    Inline(String),
+    Inline {
+        sql: String,
+        /// Shown in the panel title ("dbt show <label> — N rows").
+        label: SharedString,
+    },
 }
 
 impl ShowTarget {
     fn label(&self) -> SharedString {
         match self {
             ShowTarget::Model { name, .. } => name.clone(),
-            ShowTarget::Inline(_) => "selection".into(),
+            ShowTarget::Inline { label, .. } => label.clone(),
         }
     }
 }
@@ -348,7 +352,10 @@ pub fn show_model_data(
                     rel_path,
                 }
             } else {
-                ShowTarget::Inline(snapshot.text_for_range(range).collect::<String>())
+                ShowTarget::Inline {
+                    sql: snapshot.text_for_range(range).collect::<String>(),
+                    label: "selection".into(),
+                }
             };
             Some((target, root))
         });
@@ -701,7 +708,7 @@ impl DbtResultsPanel {
         Some(client)
     }
 
-    fn run_show(
+    pub(crate) fn run_show(
         &mut self,
         target: ShowTarget,
         root: PathBuf,
@@ -728,7 +735,7 @@ impl DbtResultsPanel {
                 ShowTarget::Model { name, .. } => {
                     command.args(["--select", name.as_ref()]);
                 }
-                ShowTarget::Inline(sql) => {
+                ShowTarget::Inline { sql, .. } => {
                     command.args(["--inline", sql]);
                 }
             }
@@ -762,7 +769,7 @@ impl DbtResultsPanel {
                         )
                         .ok(),
                 ),
-                ShowTarget::Inline(_) => (None, None),
+                ShowTarget::Inline { .. } => (None, None),
             };
             anyhow::Ok((columns, rows, compiled, lineage_tree, lineage_layout))
         });
@@ -3524,7 +3531,7 @@ async fn fetch_compiled_sql(
         ShowTarget::Model { name, .. } => {
             command.args(["--select", name.as_ref()]);
         }
-        ShowTarget::Inline(sql) => {
+        ShowTarget::Inline { sql, .. } => {
             command.args(["--inline", sql]);
         }
     }
@@ -3542,7 +3549,7 @@ async fn fetch_compiled_sql(
             }
             None
         }
-        ShowTarget::Inline(_) => {
+        ShowTarget::Inline { .. } => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut collected = Vec::new();
             let mut in_sql = false;
