@@ -608,6 +608,20 @@
     },
   },
   {
+    "context": "Workspace",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-k d": "dbt::ShowModelData",
+    },
+  },
+  {
+    "context": "Editor && dbt_model",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "dbt::ShowModelData",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
