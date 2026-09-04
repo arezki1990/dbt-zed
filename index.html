@@ -81,6 +81,7 @@
     </span>
     <div class="flex items-center gap-6 text-sm font-medium">
       <a href="#features" class="max-md:hidden text-fog hover:text-white transition-colors">Features</a>
+      <a href="#agents" class="max-md:hidden text-fog hover:text-white transition-colors">Agents</a>
       <a href="#workflow" class="max-md:hidden text-fog hover:text-white transition-colors">Workflow</a>
       <a href="#download" class="max-md:hidden text-fog hover:text-white transition-colors">Download</a>
       <a href="https://github.com/arezki1990/dbt-zed" class="max-md:hidden text-fog hover:text-white transition-colors">GitHub</a>
@@ -96,7 +97,8 @@
   <div class="max-w-6xl mx-auto px-6">
     <div class="inline-flex items-center gap-2 text-[13px] font-medium text-fog border border-line rounded-full px-3.5 py-1.5 bg-panel/60 mb-7">
       <span class="w-[7px] h-[7px] rounded-full bg-green-400 shadow-[0_0_8px_#4ade80]"></span>
-      v0.1.0 out now &nbsp;·&nbsp; built on Zed <code class="font-mono text-xs text-vio-soft">v1.17.2</code>
+      <a href="https://github.com/arezki1990/dbt-zed/releases/latest" class="hover:text-white transition-colors">v0.2.0 out now</a>
+      &nbsp;·&nbsp; built on Zed <code class="font-mono text-xs text-vio-soft">v1.17.2</code>
     </div>
     <h1 class="font-display font-bold tracking-tight leading-[1.04] text-[clamp(42px,7.4vw,84px)] max-w-4xl mx-auto mb-5 [text-wrap:balance]">
       The <span class="bg-gradient-to-r from-vio-soft via-vio to-ember bg-clip-text text-transparent">dbt IDE</span> your models deserve.
@@ -194,7 +196,7 @@
         hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
         <div class="absolute -top-16 -right-16 w-44 h-44 rounded-full bg-vio blur-[60px] opacity-50 pointer-events-none"></div>
         <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">⚡</div>
-        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Run anything with <kbd>⌘</kbd> <kbd>⏎</kbd></h3>
+        <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Run anything with <kbd>⌘</kbd><kbd>⏎</kbd></h3>
         <p class="text-sm text-fog">Execute the current model — or just the SQL you selected — through <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt show</code>. Results land in a grid with sorting, live search, a column picker, resizable columns, pinned row numbers, and CSV export.</p>
       </div>
       <div class="reveal lg:col-span-3 relative overflow-hidden rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
@@ -202,7 +204,7 @@
         <div class="absolute -top-16 -right-16 w-44 h-44 rounded-full bg-ember blur-[60px] opacity-40 pointer-events-none"></div>
         <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🕸</div>
         <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Column-level lineage canvas</h3>
-        <p class="text-sm text-fog">Layered auto-layout with crossing reduction, materialization colors, per-node collapse, drag &amp; pan, semantic zoom. Click a column to light up its transformation path across the DAG.</p>
+        <p class="text-sm text-fog">Layered auto-layout with crossing reduction, materialization colors, per-node collapse, drag &amp; pan, semantic zoom. Click a column to light up its transformation path across the DAG.</p><p class="text-[12.5px] text-faint mt-2.5">Resolved from the real SQL AST — 77% of columns on our reference project; the rest fall back to name matching, which can over-link.</p>
       </div>
       <div class="reveal lg:col-span-2 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
         hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
@@ -214,7 +216,7 @@
         hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
         <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🛰</div>
         <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">dbt language server</h3>
-        <p class="text-sm text-fog">dbt Fusion's <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt lsp</code> first — completions, hover, go-to-definition, diagnostics — with an automatic community-LSP fallback.</p>
+        <p class="text-sm text-fog">dbt Fusion's <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt lsp</code> first — completions, hover, go-to-definition, diagnostics — falling back to the community server. dbt&nbsp;Core has no <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">lsp</code> subcommand, so Core users point <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">lsp.dbt-lsp.binary.path</code> at it themselves.</p>
       </div>
       <div class="reveal lg:col-span-2 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
         hover:-translate-y-1 hover:border-[#3b3260] hover:shadow-[0_14px_40px_rgba(0,0,0,.35)] transition-all">
@@ -227,7 +229,7 @@
         <div>
           <div class="size-11 rounded-xl flex items-center justify-center text-lg border border-line bg-gradient-to-br from-vio/20 to-ember/15">🔩</div>
           <h3 class="font-display font-semibold text-lg mt-3.5 mb-2">Your project, auto-wired</h3>
-          <p class="text-sm text-fog">zdbt discovers nested <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt_project.yml</code> files, in-repo profiles (<code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">local_profiles/</code>, <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.dbt/</code>), loads <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.env</code> secrets up to the repo root — into the dbt process only — and keeps the manifest &amp; catalog fresh with automatic <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt parse</code>. Eleven settings on a dedicated page when you want control.</p>
+          <p class="text-sm text-fog">zdbt discovers nested <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt_project.yml</code> files, in-repo profiles (<code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">local_profiles/</code>, <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.dbt/</code>), loads <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">.env</code> secrets up to the repo root — into the dbt process only — and keeps the manifest &amp; catalog fresh with automatic <code class="font-mono text-xs text-vio-soft bg-vio/10 border border-line rounded-md px-1.5 py-px">dbt parse</code>. Fifteen settings on a dedicated page when you want control.</p>
         </div>
         <div class="rounded-2xl overflow-hidden border border-line bg-[#0a0714] shadow-[0_20px_60px_rgba(0,0,0,.4)]">
           <div class="flex items-center gap-[7px] px-3.5 py-2.5 bg-ink-soft border-b border-line-soft">
@@ -246,6 +248,48 @@
   </div>
 </section>
 
+<!-- agents -->
+<section id="agents" class="py-24 border-t border-line-soft">
+  <div class="max-w-6xl mx-auto px-6">
+    <p class="reveal font-mono text-[12.5px] tracking-[.14em] uppercase text-ember-soft mb-3.5">Agents</p>
+    <h2 class="reveal font-display font-bold tracking-tight leading-tight text-[clamp(30px,4.4vw,44px)] mb-3.5">Your AI assistant<br>can read the DAG.</h2>
+    <p class="reveal text-fog text-[16.5px] max-w-2xl">zdbt is also an MCP server. Open a dbt project and it registers itself with the built-in agent — no config file, no setup. Ask about a column and the agent traces it through the lineage instead of guessing from file text.</p>
+
+    <div class="grid md:grid-cols-[1fr_1fr] gap-4 mt-11 items-start">
+      <div class="reveal rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7">
+        <h3 class="font-display font-semibold text-lg mb-3.5">Six tools, zero configuration</h3>
+        <ul class="space-y-2.5 text-sm">
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_list_models</code> <span class="text-fog">— every model, source, seed and snapshot</span></li>
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_model_info</code> <span class="text-fog">— description, relation, columns and their sources</span></li>
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_lineage</code> <span class="text-fog">— upstream and downstream nodes with levels</span></li>
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_column_lineage</code> <span class="text-fog">— one column's path, hop by hop</span></li>
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_show</code> <span class="text-fog">— run a model or ad-hoc SQL, rows as JSON</span></li>
+          <li><code class="font-mono text-[12px] text-vio-soft">dbt_compile</code> <span class="text-fog">— the rendered SQL</span></li>
+        </ul>
+        <p class="text-[12.5px] text-faint mt-4">Runs headless, so <code class="font-mono text-[11.5px]">dbt_show</code> and <code class="font-mono text-[11.5px]">dbt_compile</code> need a dbt already on your PATH — and <code class="font-mono text-[11.5px]">dbt_show</code> queries the real warehouse.</p>
+      </div>
+      <div class="reveal rounded-2xl overflow-hidden border border-line bg-[#0a0714] shadow-[0_20px_60px_rgba(0,0,0,.4)]">
+        <div class="flex items-center gap-[7px] px-3.5 py-2.5 bg-ink-soft border-b border-line-soft">
+          <span class="size-[11px] rounded-full bg-[#ff5f57]"></span>
+          <span class="size-[11px] rounded-full bg-[#febc2e]"></span>
+          <span class="size-[11px] rounded-full bg-[#28c840]"></span>
+        </div>
+        <pre class="p-5 overflow-x-auto font-mono text-[12.5px] leading-[1.85] text-[#d9d5ea]"><span class="text-[#575170]"># in the zdbt agent panel — nothing to configure</span>
+<span class="text-vio-soft">&gt;</span> where does <span class="text-ember-soft">revenue_net</span> in fct_orders come from?
+
+<span class="text-[#575170]">→ dbt_column_lineage(fct_orders, revenue_net)</span>
+  stg_payments.amount
+    → int_payments.gross      sum(amount)
+    → fct_orders.revenue_net  gross - refunds
+
+<span class="text-[#575170]"># same binary, any MCP client</span>
+claude mcp add dbt -- \
+  /Applications/zdbt.app/Contents/MacOS/zed --dbt-mcp</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- workflow -->
 <section id="workflow" class="py-24 border-y border-line-soft bg-gradient-to-b from-transparent via-panel/50 to-transparent">
   <div class="max-w-6xl mx-auto px-6">
@@ -259,7 +303,7 @@
       </div>
       <div class="reveal rounded-2xl border border-line bg-panel/45 p-7">
         <p class="font-display font-bold text-[15px] text-ember mb-3">02</p>
-        <h3 class="font-display font-semibold text-[17px] mb-2">Hit <kbd>⌘</kbd> <kbd>⏎</kbd></h3>
+        <h3 class="font-display font-semibold text-[17px] mb-2">Hit <kbd>⌘</kbd><kbd>⏎</kbd></h3>
         <p class="text-sm text-fog">The model — or your selection — compiles and runs against your warehouse. Jinja resolved, limits applied, secrets from <code class="font-mono text-xs text-vio-soft">.env</code>.</p>
       </div>
       <div class="reveal rounded-2xl border border-line bg-panel/45 p-7">
@@ -276,7 +320,7 @@
   <div class="max-w-6xl mx-auto px-6">
     <p class="reveal font-mono text-[12.5px] tracking-[.14em] uppercase text-ember-soft mb-3.5">Download</p>
     <h2 class="reveal font-display font-bold tracking-tight text-[clamp(30px,4.4vw,44px)] mb-3.5">Free. Open source. Yours.</h2>
-    <p class="reveal text-fog text-[16.5px] max-w-xl">Prebuilt binaries for all three platforms. Installs alongside official Zed and never auto-updates over it.</p>
+    <p class="reveal text-fog text-[16.5px] max-w-xl">Prebuilt binaries for Apple&nbsp;Silicon macOS, x86_64 Linux and x86_64 Windows. Intel Macs and ARM Linux build from source. Installs alongside official Zed and never auto-updates over it.</p>
 
     <div class="grid md:grid-cols-3 gap-4 mt-11">
       <a class="reveal flex flex-col gap-1 rounded-2xl border border-line bg-gradient-to-b from-panel to-ink-soft p-7
@@ -284,7 +328,7 @@
         href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-macos-aarch64.dmg">
         <span class="text-vio-soft text-2xl mb-2.5">⌘</span>
         <span class="font-display font-semibold text-[17px]">macOS</span>
-        <span class="text-[13px] text-fog">Apple Silicon</span>
+        <span class="text-[13px] text-fog">Apple Silicon only</span>
         <span class="mt-3.5 font-mono text-[11.5px] text-faint">zdbt-macos-aarch64.dmg</span>
         <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
       </a>
@@ -293,7 +337,7 @@
         href="https://github.com/arezki1990/dbt-zed/releases/latest/download/zdbt-linux-x86_64.tar.gz">
         <span class="text-2xl mb-2.5">🐧</span>
         <span class="font-display font-semibold text-[17px]">Linux</span>
-        <span class="text-[13px] text-fog">x86_64</span>
+        <span class="text-[13px] text-fog">x86_64 (Intel/AMD)</span>
         <span class="mt-3.5 font-mono text-[11.5px] text-faint">zdbt-linux-x86_64.tar.gz</span>
         <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
       </a>
@@ -307,10 +351,53 @@
         <span class="mt-1.5 text-[13.5px] font-semibold text-vio-soft">Download →</span>
       </a>
     </div>
-    <p class="reveal mt-5 text-[13px] text-faint">Builds are unsigned for now — on macOS: right-click → Open the first time. Verify integrity with
-      <a class="underline underline-offset-4 text-faint" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a> ·
-      all versions on the <a class="underline underline-offset-4 text-faint" href="https://github.com/arezki1990/dbt-zed/releases">releases page</a> ·
-      bring your own dbt (<a class="underline underline-offset-4 text-faint" href="https://docs.getdbt.com">dbt Fusion</a> recommended).</p>
+    <p class="reveal mt-5 text-[13px] text-faint">Every build is unsigned — the steps below are how you get past that safely.
+      All versions on the <a class="underline underline-offset-4 text-faint" href="https://github.com/arezki1990/dbt-zed/releases">releases page</a>.</p>
+
+    <!-- install & verify -->
+    <div class="grid md:grid-cols-3 gap-4 mt-7">
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-6">
+        <h3 class="font-display font-semibold text-[15px] mb-2.5">macOS — first launch</h3>
+        <p class="text-[13.5px] text-fog mb-3">Apple removed the old right-click&nbsp;→&nbsp;Open bypass in macOS&nbsp;15, so unsigned apps are approved in Settings now.</p>
+        <ol class="text-[13px] text-fog space-y-1.5 list-decimal pl-4 marker:text-faint">
+          <li>Open the <code class="font-mono text-[11.5px] text-vio-soft">.dmg</code>, drag <strong class="text-white">zdbt</strong> to Applications.</li>
+          <li>Launch it. macOS refuses — click <strong class="text-white">Done</strong>.</li>
+          <li><strong class="text-white">System Settings → Privacy &amp; Security</strong>, scroll to Security, click <strong class="text-white">Open Anyway</strong>.</li>
+          <li>Launch again and confirm <strong class="text-white">Open</strong>.</li>
+        </ol>
+        <p class="text-[12.5px] text-faint mt-3">On macOS 14 and older: right-click the app → Open → Open.</p>
+      </div>
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-6">
+        <h3 class="font-display font-semibold text-[15px] mb-2.5">Linux</h3>
+        <p class="text-[13.5px] text-fog mb-3">The tarball unpacks as <code class="font-mono text-[11.5px] text-vio-soft">zed-dev.app</code> — keep the folder intact and symlink the launcher rather than copying it.</p>
+        <pre class="rounded-lg bg-[#0a0714] border border-line-soft p-3 overflow-x-auto font-mono text-[11.5px] leading-[1.75] text-[#d9d5ea]">tar -xzf zdbt-linux-x86_64.tar.gz
+mkdir -p ~/.local/opt
+mv zed-dev.app ~/.local/opt/zdbt
+ln -sf ~/.local/opt/zdbt/bin/zed \
+   ~/.local/bin/zdbt</pre>
+      </div>
+      <div class="reveal rounded-2xl border border-line bg-panel/45 p-6">
+        <h3 class="font-display font-semibold text-[15px] mb-2.5">Windows</h3>
+        <p class="text-[13.5px] text-fog mb-3">A per-user installer — no admin rights needed. Because it is unsigned, SmartScreen will interpose once.</p>
+        <ol class="text-[13px] text-fog space-y-1.5 list-decimal pl-4 marker:text-faint">
+          <li>Run <code class="font-mono text-[11.5px] text-vio-soft">zdbt-windows-x86_64-setup.exe</code>.</li>
+          <li>SmartScreen → <strong class="text-white">More info</strong> → <strong class="text-white">Run anyway</strong>.</li>
+          <li>Installs to <code class="font-mono text-[11.5px] text-vio-soft">%LOCALAPPDATA%\Programs</code>.</li>
+        </ol>
+        <p class="text-[12.5px] text-faint mt-3">Requires Windows 10 1709 or newer.</p>
+      </div>
+    </div>
+
+    <div class="reveal mt-4 rounded-2xl border border-line bg-panel/45 p-6">
+      <h3 class="font-display font-semibold text-[15px] mb-2">Verify your download</h3>
+      <p class="text-[13.5px] text-fog mb-3">Each release ships a
+        <a class="underline underline-offset-4 text-vio-soft" href="https://github.com/arezki1990/dbt-zed/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
+        covering all three artifacts. Pass <code class="font-mono text-[11.5px] text-vio-soft">--ignore-missing</code>, or it reports the two files you didn't download as failures.</p>
+      <pre class="rounded-lg bg-[#0a0714] border border-line-soft p-3 overflow-x-auto font-mono text-[12px] leading-[1.8] text-[#d9d5ea]"><span class="text-[#575170]"># macOS</span>
+shasum -a 256 --ignore-missing -c SHA256SUMS.txt
+<span class="text-[#575170]"># Linux</span>
+sha256sum --ignore-missing -c SHA256SUMS.txt</pre>
+    </div>
 
     <div class="reveal mt-10 rounded-2xl overflow-hidden border border-line bg-[#0a0714] shadow-[0_20px_60px_rgba(0,0,0,.4)]">
       <div class="flex items-center justify-between px-3.5 py-2.5 bg-ink-soft border-b border-line-soft">
