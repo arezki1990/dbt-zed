@@ -6622,6 +6622,7 @@ dependencies = [
  "duckdb",
  "el_engine",
  "futures 0.3.32",
+ "postgres",
  "serde_json",
  "tempfile",
 ]

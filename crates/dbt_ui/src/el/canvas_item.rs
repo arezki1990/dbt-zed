@@ -751,6 +751,60 @@ impl ElPipelineCanvas {
         cx.notify();
     }
 
+    fn set_sync_mode(&mut self, mode: el_engine::spec::Mode, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.mapping {
+            if state.mode != mode {
+                state.mode = mode;
+                state.dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// One menu for both sync pickers: entries are the stream's columns
+    /// (probed + specced). Composite primary keys stay YAML-editable.
+    fn deploy_sync_menu(
+        &mut self,
+        cursor_pick: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = &self.mapping else { return };
+        let names: Vec<SharedString> = state.drafts.iter().map(|draft| draft.name.clone()).collect();
+        let entity = cx.entity().downgrade();
+        let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+            for name in names {
+                let entity = entity.clone();
+                let label = name.clone();
+                menu = menu.entry(label, None, move |_, cx| {
+                    let name = name.to_string();
+                    entity
+                        .update(cx, |this, cx| {
+                            if let Some(state) = &mut this.mapping {
+                                if cursor_pick {
+                                    state.update_key = Some(name.clone());
+                                } else {
+                                    state.primary_key = vec![name.clone()];
+                                }
+                                state.dirty = true;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                });
+            }
+            menu
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.type_menu.take();
+            cx.notify();
+        });
+        self.type_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
     fn render_mapping_sidebar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         let Some(state) = &self.mapping else {
@@ -912,6 +966,111 @@ impl ElPipelineCanvas {
                     )
                     .child(div().flex_1().child(state.target_table.clone())),
             )
+            .child({
+                // Airbyte's per-stream sync settings: mode + primary key +
+                // cursor, written to YAML on Apply like everything else.
+                use el_engine::spec::Mode;
+                let mode = state.mode;
+                let pk_label: SharedString = if state.primary_key.is_empty() {
+                    "Key: choose…".into()
+                } else {
+                    format!("Key: {}", state.primary_key.join(", ")).into()
+                };
+                let cursor_label: SharedString = match &state.update_key {
+                    Some(cursor) => format!("Cursor: {cursor}").into(),
+                    None => "Cursor: choose…".into(),
+                };
+                v_flex()
+                    .w_full()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Label::new("sync")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Button::new("el-sync-full", "Full refresh")
+                                    .label_size(LabelSize::XSmall)
+                                    .toggle_state(mode == Mode::FullRefresh)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_sync_mode(
+                                            el_engine::spec::Mode::FullRefresh,
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("el-sync-inc", "Incremental")
+                                    .label_size(LabelSize::XSmall)
+                                    .toggle_state(mode == Mode::Incremental)
+                                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_sync_mode(
+                                            el_engine::spec::Mode::Incremental,
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                    .when(mode == Mode::Incremental, |flex| {
+                        flex.child(
+                            h_flex()
+                                .w_full()
+                                .px_2()
+                                .pb_1()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    Button::new("el-sync-pk", pk_label)
+                                        .label_size(LabelSize::XSmall)
+                                        .tooltip(ui::Tooltip::text(
+                                            "Rows with the same key are updated in place \
+                                             (composite keys: edit primary_key in YAML)",
+                                        ))
+                                        .on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, window, cx| {
+                                                let position = match event {
+                                                    gpui::ClickEvent::Mouse(event) => {
+                                                        event.up.position
+                                                    }
+                                                    _ => Point::default(),
+                                                };
+                                                this.deploy_sync_menu(
+                                                    false, position, window, cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Button::new("el-sync-cursor", cursor_label)
+                                        .label_size(LabelSize::XSmall)
+                                        .tooltip(ui::Tooltip::text(
+                                            "Only rows past this column's last value are \
+                                             extracted on the next run",
+                                        ))
+                                        .on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, window, cx| {
+                                                let position = match event {
+                                                    gpui::ClickEvent::Mouse(event) => {
+                                                        event.up.position
+                                                    }
+                                                    _ => Point::default(),
+                                                };
+                                                this.deploy_sync_menu(
+                                                    true, position, window, cx,
+                                                );
+                                            },
+                                        )),
+                                ),
+                        )
+                    })
+            })
             .children(state.probe_error.clone().map(|error| {
                 div().px_2().py_1().child(
                     Label::new(error).size(LabelSize::XSmall).color(Color::Warning),

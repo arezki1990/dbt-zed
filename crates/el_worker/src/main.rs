@@ -9,6 +9,7 @@
 //!   seed-demo <path>   create a small demo DuckDB database
 
 mod duckdb_loader;
+mod explore;
 mod snowflake_loader;
 
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ fn main() {
         Some("seed-demo") => seed_demo(&args[1..]),
         Some("snowflake-loader") => snowflake_loader::serve(),
         Some("duckdb-loader") => duckdb_loader::serve(),
+        Some("list") => explore::list(&args[1..]),
+        Some("query") => explore::query(&args[1..]),
         _ => {
             eprintln!(
                 "usage: zdbt-el-worker extract --kind duckdb --db <path> [--schema <s>] \

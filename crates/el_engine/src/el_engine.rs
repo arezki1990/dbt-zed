@@ -10,6 +10,7 @@
 pub mod cast;
 pub mod connectors;
 pub mod env;
+pub mod explore;
 pub mod load;
 pub mod preview;
 pub mod progress;

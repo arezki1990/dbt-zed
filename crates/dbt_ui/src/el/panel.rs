@@ -24,17 +24,38 @@ pub struct ElPanel {
     pipelines: Vec<PathBuf>,
     /// (name, kind) — the credential posture: never values.
     connections: Vec<(SharedString, SharedString)>,
+    /// Connections whose table list is unfolded in the explorer.
+    expanded: std::collections::HashSet<SharedString>,
+    tables: std::collections::HashMap<SharedString, TablesState>,
+    _list_tasks: std::collections::HashMap<SharedString, Task<()>>,
     scroll: UniformListScrollHandle,
     _refresh: Task<()>,
+}
+
+enum TablesState {
+    Loading,
+    Loaded(Vec<(String, String)>),
+    Failed(SharedString),
 }
 
 enum Row {
     Header(SharedString),
     Pipeline(PathBuf),
     Connection(SharedString, SharedString),
+    Table {
+        connection: SharedString,
+        schema: String,
+        table: String,
+    },
+    ConnNote(SharedString, Color),
     NewPipeline,
     Initialize,
     Note(SharedString),
+}
+
+/// Kinds the explorer can browse — the worker's list/query support.
+fn browsable(kind: &str) -> bool {
+    matches!(kind, "duckdb" | "postgres")
 }
 
 impl ElPanel {
@@ -59,6 +80,9 @@ impl ElPanel {
             root: None,
             pipelines: Vec::new(),
             connections: Vec::new(),
+            expanded: Default::default(),
+            tables: Default::default(),
+            _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
             _refresh: Task::ready(()),
         })
@@ -108,9 +132,103 @@ impl ElPanel {
             rows.push(Row::Header("Connections".into()));
             for (name, kind) in &self.connections {
                 rows.push(Row::Connection(name.clone(), kind.clone()));
+                if !self.expanded.contains(name) {
+                    continue;
+                }
+                match self.tables.get(name) {
+                    None | Some(TablesState::Loading) => {
+                        rows.push(Row::ConnNote("Loading tables…".into(), Color::Muted));
+                    }
+                    Some(TablesState::Failed(message)) => {
+                        rows.push(Row::ConnNote(message.clone(), Color::Error));
+                    }
+                    Some(TablesState::Loaded(tables)) if tables.is_empty() => {
+                        rows.push(Row::ConnNote("No tables.".into(), Color::Muted));
+                    }
+                    Some(TablesState::Loaded(tables)) => {
+                        for (schema, table) in tables {
+                            rows.push(Row::Table {
+                                connection: name.clone(),
+                                schema: schema.clone(),
+                                table: table.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
         rows
+    }
+
+    fn toggle_connection(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        if self.expanded.contains(&name) {
+            self.expanded.remove(&name);
+        } else {
+            self.expanded.insert(name.clone());
+            if !self.tables.contains_key(&name) {
+                self.load_tables(name, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_tables(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        self.tables.insert(name.clone(), TablesState::Loading);
+        let connection_name = name.to_string();
+        let task = cx.background_spawn(async move {
+            let worker = super::find_worker().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER."
+                )
+            })?;
+            let connections = el_engine::spec::load_connections(
+                &super::el_dir(&root).join("connections.yml"),
+            )?;
+            let connection = connections
+                .connections
+                .get(&connection_name)
+                .ok_or_else(|| anyhow::anyhow!("connection is gone from connections.yml"))?;
+            let env = el_engine::env::EnvMap::load(&root, None);
+            el_engine::explore::list_tables(&worker, &root, connection, &env)
+        });
+        let key = name.clone();
+        self._list_tasks.insert(
+            key.clone(),
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    let state = match result {
+                        Ok(tables) => TablesState::Loaded(tables),
+                        Err(error) => TablesState::Failed(format!("{error:#}").into()),
+                    };
+                    this.tables.insert(name.clone(), state);
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
+    }
+
+    fn query_table(
+        &mut self,
+        connection: SharedString,
+        schema: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
+                    return;
+                };
+                workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                panel.update(cx, |panel, cx| {
+                    panel.show_query_for_table(connection, &schema, &table, window, cx);
+                });
+            })
+            .ok();
     }
 
     fn open_pipeline(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -263,7 +381,15 @@ impl Render for ElPanel {
                         IconButton::new("el-panel-refresh", IconName::RotateCw)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                // Explicit refresh also invalidates cached
+                                // table listings.
+                                this.tables.clear();
+                                for name in this.expanded.clone() {
+                                    this.load_tables(name, cx);
+                                }
+                                this.refresh(cx);
+                            })),
                     ),
             )
             .child(list)
@@ -310,7 +436,22 @@ impl ElPanel {
                     }))
                     .into_any_element()
             }
-            Row::Connection(name, kind) => base
+            Row::Connection(name, kind) => {
+                let can_browse = browsable(kind);
+                let expanded = self.expanded.contains(name);
+                let chevron = if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                };
+                let toggle_name = name.clone();
+                base.when(can_browse, |row| {
+                    row.cursor_pointer()
+                        .child(Icon::new(chevron).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_connection(toggle_name.clone(), cx);
+                        }))
+                })
                 .child(
                     Icon::new(IconName::DatabaseZap)
                         .size(IconSize::Small)
@@ -323,6 +464,39 @@ impl ElPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
+                .into_any_element()
+            }
+            Row::Table {
+                connection,
+                schema,
+                table,
+            } => {
+                let connection = connection.clone();
+                let schema = schema.clone();
+                let table = table.clone();
+                let label = format!("{schema}.{table}");
+                base.cursor_pointer()
+                    .pl_6()
+                    .child(
+                        Icon::new(IconName::Table)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(label).size(LabelSize::Small).truncate())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.query_table(
+                            connection.clone(),
+                            schema.clone(),
+                            table.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            }
+            Row::ConnNote(text, color) => base
+                .pl_6()
+                .child(Label::new(text.clone()).size(LabelSize::XSmall).color(*color))
                 .into_any_element(),
             Row::NewPipeline => base
                 .cursor_pointer()

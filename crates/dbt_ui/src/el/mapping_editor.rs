@@ -8,7 +8,7 @@ use editor::Editor;
 use gpui::{Context, Entity, SharedString, Window};
 use ui::prelude::*;
 
-use el_engine::spec::{ColumnSpec, Pipeline, Select};
+use el_engine::spec::{ColumnSpec, Mode, Pipeline, Select};
 
 /// The type list offered in the dropdown; anything else stays possible by
 /// editing the YAML (Custom entry arrives with U4 polish).
@@ -43,6 +43,11 @@ pub struct MappingEditorState {
     pub stream_ix: usize,
     pub stream_name: SharedString,
     pub target_table: Entity<Editor>,
+    /// Airbyte's per-stream sync settings: mode, primary key, cursor
+    /// field (our update_key). Names are source-side, like the spec's.
+    pub mode: Mode,
+    pub primary_key: Vec<String>,
+    pub update_key: Option<String>,
     pub drafts: Vec<ColumnDraft>,
     /// True until the background schema probe lands (or fails).
     pub probing: bool,
@@ -96,6 +101,9 @@ impl MappingEditorState {
         Self {
             stream_ix,
             stream_name: stream.name.clone().into(),
+            mode: stream.mode(pipeline.defaults.as_ref()),
+            primary_key: stream.primary_key.clone(),
+            update_key: stream.update_key.clone(),
             target_table: make_editor(
                 stream.target_table.as_deref().unwrap_or(""),
                 &stream.target_table(&pipeline.target),
@@ -153,6 +161,20 @@ impl MappingEditorState {
 
         let target_table = self.target_table.read(cx).text(cx).trim().to_owned();
         stream.target_table = (!target_table.is_empty()).then_some(target_table);
+
+        // Sync settings — incremental needs both halves of the cursor
+        // story before it can run.
+        if self.mode == Mode::Incremental {
+            if self.primary_key.is_empty() {
+                anyhow::bail!("incremental sync needs a primary key — pick one under Sync");
+            }
+            if self.update_key.is_none() {
+                anyhow::bail!("incremental sync needs a cursor column — pick one under Sync");
+            }
+        }
+        stream.mode = Some(self.mode);
+        stream.primary_key = self.primary_key.clone();
+        stream.update_key = self.update_key.clone();
 
         // Exclusions: keep an existing include-list philosophy if present,
         // else use select.exclude.
