@@ -606,26 +606,6 @@ impl ElRunsPanel {
             .children(self.remote_action_error.clone().map(|error| {
                 Label::new(error).size(LabelSize::XSmall).color(Color::Error)
             }))
-            .children(self.remote_detail.clone().map(|name| {
-                // The deploy unit is one pipeline: the popup asks which
-                // profile it should run under on the chosen server.
-                Button::new("el-remote-deploy", "Deploy this pipeline")
-                    .label_size(LabelSize::XSmall)
-                    .tooltip(ui::Tooltip::text(
-                        "Nothing runs on a remote until you deploy it there",
-                    ))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let Some(root) = this.root.clone() else { return };
-                        let name = name.to_string();
-                        this.workspace
-                            .update(cx, |workspace, cx| {
-                                super::deploy_modal::ElDeployModal::deploy(
-                                    workspace, root, name, window, cx,
-                                );
-                            })
-                            .ok();
-                    }))
-            }))
             .child(
                 Button::new("el-remote-logs", "Logs")
                     .label_size(LabelSize::XSmall)
@@ -702,12 +682,15 @@ impl ElRunsPanel {
             .w_full()
             .px_2()
             .gap_2()
-            .child(head(150., "pipeline"))
-            .child(head(70., "streams"))
-            .child(head(150., "schedule"))
-            .child(head(90., "next run"))
-            .child(head(80., "profile"))
-            .child(head(70., "state"));
+            .child(head(140., "pipeline"))
+            .child(head(55., "streams"))
+            .child(head(110., "schedule"))
+            .child(head(80., "next run"))
+            .child(head(70., "profile"))
+            .child(head(80., "created"))
+            .child(head(80., "deployed"))
+            .child(head(80., "last run"))
+            .child(head(60., "state"));
         let mut pipelines = v_flex().w_full().px_1();
         for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
             let name: SharedString = pipeline.name.clone().into();
@@ -734,15 +717,15 @@ impl ElRunsPanel {
                         this.remote_detail = Some(open_name.clone());
                         cx.notify();
                     }))
-                    .child(cell(150., pipeline.name.clone(), Color::Default))
-                    .child(cell(70., pipeline.streams.to_string(), Color::Muted))
+                    .child(cell(140., pipeline.name.clone(), Color::Default))
+                    .child(cell(55., pipeline.streams.to_string(), Color::Muted))
                     .child(cell(
-                        150.,
+                        110.,
                         pipeline.schedule.clone().unwrap_or_else(|| "manual".into()),
                         Color::Muted,
                     ))
                     .child(cell(
-                        90.,
+                        80.,
                         pipeline
                             .next_run_unix
                             .map(|next| relative_time(next, true))
@@ -750,7 +733,7 @@ impl ElRunsPanel {
                         Color::Muted,
                     ))
                     .child(cell(
-                        80.,
+                        70.,
                         pipeline
                             .profile
                             .clone()
@@ -762,7 +745,31 @@ impl ElRunsPanel {
                         },
                     ))
                     .child(cell(
-                        70.,
+                        80.,
+                        pipeline
+                            .created_unix
+                            .map(|at| relative_time(at, false))
+                            .unwrap_or_else(|| "—".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        80.,
+                        pipeline
+                            .deployed_unix
+                            .map(|at| relative_time(at, false))
+                            .unwrap_or_else(|| "—".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        80.,
+                        pipeline
+                            .last_run_unix
+                            .map(|at| relative_time(at, false))
+                            .unwrap_or_else(|| "never".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        60.,
                         if pipeline.running { "running".into() } else { "idle".into() },
                         if pipeline.running { Color::Accent } else { Color::Muted },
                     ))
@@ -828,15 +835,24 @@ impl ElRunsPanel {
                         if pipeline.streams == 1 { "" } else { "s" }
                     ),
                 };
-                match (&pipeline.schedule, pipeline.next_run_unix) {
+                let mut text = match (&pipeline.schedule, pipeline.next_run_unix) {
                     (Some(schedule), Some(next)) => format!(
                         "{streams} — runs on {schedule}, next {}",
                         relative_time(next, true)
-                    )
-                    .into(),
-                    (Some(schedule), None) => format!("{streams} — runs on {schedule}").into(),
-                    (None, _) => format!("{streams} — manual runs only").into(),
+                    ),
+                    (Some(schedule), None) => format!("{streams} — runs on {schedule}"),
+                    (None, _) => format!("{streams} — manual runs only"),
+                };
+                if let Some(at) = pipeline.created_unix {
+                    text.push_str(&format!(" · created {}", relative_time(at, false)));
                 }
+                if let Some(at) = pipeline.deployed_unix {
+                    text.push_str(&format!(" · deployed {}", relative_time(at, false)));
+                }
+                if let Some(at) = pipeline.last_run_unix {
+                    text.push_str(&format!(" · last run {}", relative_time(at, false)));
+                }
+                text.into()
             }
         };
         let header = h_flex()
@@ -1047,7 +1063,9 @@ fn relative_time(unix: u64, future: bool) -> String {
     } else {
         now.saturating_sub(unix)
     };
-    let text = if delta >= 3600 {
+    let text = if delta >= 86_400 {
+        format!("{}d {}h", delta / 86_400, (delta % 86_400) / 3600)
+    } else if delta >= 3600 {
         format!("{}h {}m", delta / 3600, (delta % 3600) / 60)
     } else if delta >= 60 {
         format!("{}m {}s", delta / 60, delta % 60)

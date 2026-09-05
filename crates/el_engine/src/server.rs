@@ -415,12 +415,47 @@ fn manifest_path(config: &ServerConfig) -> PathBuf {
     pipelines_root(config).join("manifest.json")
 }
 
-/// name → deploy-pinned profile. Absent entries run under the daemon's
-/// own active profile.
-fn read_manifest(config: &ServerConfig) -> HashMap<String, String> {
+/// Per-pipeline deployment record: the pinned profile and the dates.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DeployMeta {
+    #[serde(default)]
+    profile: Option<String>,
+    /// First ever deploy of this pipeline here — its creation date.
+    #[serde(default)]
+    first_deployed_unix: u64,
+    /// The latest deploy.
+    #[serde(default)]
+    deployed_unix: u64,
+}
+
+/// Tolerates the v1 format (name → profile string).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ManifestEntry {
+    Dated(DeployMeta),
+    ProfileOnly(String),
+}
+
+fn read_manifest(config: &ServerConfig) -> HashMap<String, DeployMeta> {
     std::fs::read_to_string(manifest_path(config))
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+        .and_then(|text| serde_json::from_str::<HashMap<String, ManifestEntry>>(&text).ok())
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(name, entry)| {
+                    let meta = match entry {
+                        ManifestEntry::Dated(meta) => meta,
+                        ManifestEntry::ProfileOnly(profile) => DeployMeta {
+                            profile: Some(profile),
+                            first_deployed_unix: 0,
+                            deployed_unix: 0,
+                        },
+                    };
+                    (name, meta)
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -472,6 +507,7 @@ fn apply_deploy<'a>(
         bail!("nothing to deploy");
     }
     let mut manifest = read_manifest(&state.config);
+    let now = unix_secs(SystemTime::now());
     let mut names = Vec::new();
     for (name, yaml, profile) in validated {
         let target = dir.join(format!("{name}.yml"));
@@ -480,14 +516,24 @@ fn apply_deploy<'a>(
             .with_context(|| format!("writing {}", staging.display()))?;
         std::fs::rename(&staging, &target)
             .with_context(|| format!("installing {}", target.display()))?;
-        match profile {
-            Some(profile) => {
-                manifest.insert(name.clone(), profile);
-            }
-            None => {
-                manifest.remove(&name);
-            }
-        }
+        let first = manifest
+            .get(&name)
+            .map(|meta| {
+                if meta.first_deployed_unix > 0 {
+                    meta.first_deployed_unix
+                } else {
+                    now
+                }
+            })
+            .unwrap_or(now);
+        manifest.insert(
+            name.clone(),
+            DeployMeta {
+                profile,
+                first_deployed_unix: first,
+                deployed_unix: now,
+            },
+        );
         names.push(name);
     }
     let manifest_target = manifest_path(&state.config);
@@ -513,6 +559,11 @@ struct PipelineInfo {
     next_run_unix: Option<u64>,
     /// The deploy-pinned profile; None = the daemon's own.
     profile: Option<String>,
+    /// First deploy here (creation) and the latest deploy.
+    created_unix: Option<u64>,
+    deployed_unix: Option<u64>,
+    /// The most recent run's start.
+    last_run_unix: Option<u64>,
     streams: usize,
     running: bool,
 }
@@ -724,11 +775,30 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
         }
         ("GET", ["pipelines"]) => {
             let manifest = read_manifest(&state.config);
+            let last_runs: HashMap<String, u64> = {
+                let registry = state.registry.lock().unwrap();
+                let mut last = HashMap::new();
+                for run in &registry.runs {
+                    let at = unix_secs(run.started);
+                    last.entry(run.pipeline.clone())
+                        .and_modify(|existing: &mut u64| *existing = (*existing).max(at))
+                        .or_insert(at);
+                }
+                last
+            };
             let mut pipelines = Vec::new();
             for path in spec::list_pipelines(&pipelines_root(&state.config)) {
                 if let Ok(pipeline) = spec::load_pipeline(&path) {
+                    let meta = manifest.get(&pipeline.pipeline);
                     pipelines.push(PipelineInfo {
-                        profile: manifest.get(&pipeline.pipeline).cloned(),
+                        profile: meta.and_then(|meta| meta.profile.clone()),
+                        created_unix: meta
+                            .map(|meta| meta.first_deployed_unix)
+                            .filter(|at| *at > 0),
+                        deployed_unix: meta
+                            .map(|meta| meta.deployed_unix)
+                            .filter(|at| *at > 0),
+                        last_run_unix: last_runs.get(&pipeline.pipeline).copied(),
                         running: state.is_running(&pipeline.pipeline),
                         next_run_unix: next_fire_unix(
                             pipeline.schedule.as_deref(),
@@ -1004,6 +1074,12 @@ pub struct RemotePipeline {
     pub next_run_unix: Option<u64>,
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub created_unix: Option<u64>,
+    #[serde(default)]
+    pub deployed_unix: Option<u64>,
+    #[serde(default)]
+    pub last_run_unix: Option<u64>,
     pub streams: usize,
     pub running: bool,
 }
