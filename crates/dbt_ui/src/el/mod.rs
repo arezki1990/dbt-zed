@@ -6,11 +6,15 @@ pub mod canvas_item;
 pub mod cli;
 pub mod layout;
 pub mod mapping_editor;
+pub mod panel;
 pub mod run_view;
+pub mod runs_panel;
 pub mod scaffold;
 pub mod spec_io;
 
 pub use canvas_item::ElPipelineCanvas;
+pub use panel::ElPanel;
+pub use runs_panel::ElRunsPanel;
 
 use std::path::{Path, PathBuf};
 

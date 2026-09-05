@@ -788,6 +788,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             dbt_ui::DbtResultsPanel::load(workspace_handle.clone(), cx.clone());
         let dbt_database_panel =
             dbt_ui::DbtDatabasePanel::load(workspace_handle.clone(), cx.clone());
+        let el_panel = dbt_ui::el::ElPanel::load(workspace_handle.clone(), cx.clone());
+        let el_runs_panel = dbt_ui::el::ElRunsPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         async fn add_panel_when_ready(
@@ -813,6 +815,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(dbt_results_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(dbt_database_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(el_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(el_runs_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
         );

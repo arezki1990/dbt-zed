@@ -32,7 +32,6 @@ pub struct DbtDatabasePanel {
     workspace: WeakEntity<Workspace>,
     root: Option<PathBuf>,
     catalog: Option<Arc<DbCatalog>>,
-    pipelines: Vec<PathBuf>,
     load_error: Option<SharedString>,
     loading: bool,
     /// (manifest mtime, catalog mtime) at the last successful load, for the
@@ -64,8 +63,6 @@ enum RowAction {
     Toggle,
     Relation(RelationAction),
     Column { name: SharedString },
-    Pipeline(PathBuf),
-    InitializeEl,
     Note,
 }
 
@@ -162,7 +159,6 @@ impl DbtDatabasePanel {
                 workspace: workspace_handle,
                 root: None,
                 catalog: None,
-                pipelines: Vec::new(),
                 load_error: None,
                 loading: false,
                 loaded_mtimes: (None, None),
@@ -181,12 +177,10 @@ impl DbtDatabasePanel {
         let root = match self.root.clone() {
             Some(root) => Some(root),
             None => {
-                let discovered = self.workspace.upgrade().and_then(|workspace| {
-                    let workspace = workspace.read(cx);
-                    // Standalone EL projects have no dbt_project.yml.
-                    discover_workspace_root(workspace, cx)
-                        .or_else(|| crate::el::discover_el_root(workspace, cx))
-                });
+                let discovered = self
+                    .workspace
+                    .upgrade()
+                    .and_then(|workspace| discover_workspace_root(workspace.read(cx), cx));
                 self.root = discovered.clone();
                 discovered
             }
@@ -194,9 +188,13 @@ impl DbtDatabasePanel {
         let Some(root) = root else {
             return;
         };
-        // The pipelines listing is one read_dir — refresh it every pass so
-        // the section tracks el/ even when the dbt artifacts are unchanged.
-        self.pipelines = el_engine::spec::list_pipelines(&crate::el::el_dir(&root));
+        // Standalone EL projects have no dbt artifacts; stay quiet.
+        if !root.join("dbt_project.yml").is_file() {
+            self.catalog = None;
+            self.load_error = None;
+            self.loading = false;
+            return;
+        }
         let mtimes = artifact_mtimes(&root);
         if self.catalog.is_some() && mtimes == self.loaded_mtimes {
             return;
@@ -243,35 +241,6 @@ impl DbtDatabasePanel {
         let query = self.filter_editor.read(cx).text(cx).trim().to_lowercase();
         let filtering = !query.is_empty();
         let mut rows = Vec::new();
-
-        // EL pipelines section — present whether or not dbt artifacts exist.
-        if !filtering {
-            if self.pipelines.is_empty() {
-                rows.push(RowEntry {
-                    depth: 0,
-                    key: None,
-                    expanded: false,
-                    label: "Initialize EL workspace…".into(),
-                    detail: None,
-                    action: RowAction::InitializeEl,
-                });
-            } else {
-                for path in &self.pipelines {
-                    let name = path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("pipeline");
-                    rows.push(RowEntry {
-                        depth: 0,
-                        key: None,
-                        expanded: false,
-                        label: format!("Pipeline: {name}").into(),
-                        detail: Some("EL".into()),
-                        action: RowAction::Pipeline(path.clone()),
-                    });
-                }
-            }
-        }
 
         let Some(catalog) = &self.catalog else {
             return rows;
@@ -561,8 +530,6 @@ impl DbtDatabasePanel {
             RowAction::Toggle => (Some(IconName::Folder), Color::Default),
             RowAction::Relation(_) => (Some(IconName::Table), Color::Default),
             RowAction::Column { .. } => (None, Color::Muted),
-            RowAction::Pipeline(_) => (Some(IconName::ArrowRightLeft), Color::Default),
-            RowAction::InitializeEl => (Some(IconName::Plus), Color::Muted),
             RowAction::Note => (Some(IconName::Info), Color::Muted),
         };
         if let Some(icon) = icon {
@@ -643,37 +610,6 @@ impl DbtDatabasePanel {
                         }),
                     );
             }
-            RowAction::Pipeline(path) => {
-                let path = path.clone();
-                item = item.cursor_pointer().on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        let (Some(root), path) = (this.root.clone(), path.clone()) else {
-                            return;
-                        };
-                        this.workspace
-                            .update(cx, |workspace, cx| {
-                                crate::el::ElPipelineCanvas::deploy(
-                                    workspace, root, path, window, cx,
-                                );
-                            })
-                            .ok();
-                    },
-                ));
-            }
-            RowAction::InitializeEl => {
-                item = item.cursor_pointer().on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.workspace
-                            .update(cx, |workspace, cx| {
-                                crate::el::initialize_workspace(workspace, window, cx);
-                            })
-                            .ok();
-                        this.loaded_mtimes = (None, None);
-                        this.catalog = None;
-                        this.ensure_loaded(cx);
-                    },
-                ));
-            }
             RowAction::Note => {}
         }
 
@@ -743,8 +679,7 @@ impl Panel for DbtDatabasePanel {
 impl Render for DbtDatabasePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Arc<Vec<RowEntry>> = Arc::new(self.visible_rows(cx));
-        let row_elements: Vec<gpui::AnyElement> = Vec::new();
-        drop(row_elements);
+        let row_count = rows.len();
         let generated = self
             .catalog
             .as_ref()
@@ -813,7 +748,27 @@ impl Render for DbtDatabasePanel {
             );
         }
 
-        if let Some(error) = &self.load_error {
+        if row_count > 0 {
+            // Pipelines (and any catalog rows) always render; a dbt load
+            // error demotes to a banner above them.
+            if let Some(error) = &self.load_error {
+                body = body.child(
+                    div().w_full().px_2().py_1().child(
+                        Label::new(error.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    ),
+                );
+            }
+            body = body.child(list).child(
+                div().absolute().inset_0().child(div()).custom_scrollbars(
+                    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
+                        .tracked_scroll_handle(&self.scroll),
+                    window,
+                    cx,
+                ),
+            );
+        } else if let Some(error) = &self.load_error {
             body = body.child(
                 div()
                     .p_2()
@@ -823,7 +778,7 @@ impl Render for DbtDatabasePanel {
             let message: SharedString = if self.loading {
                 "Loading dbt artifacts…".into()
             } else if self.root.is_none() {
-                "No dbt project found in this workspace.".into()
+                "No project folder open in this workspace.".into()
             } else {
                 "Open the panel to load target/manifest.json.".into()
             };
@@ -833,12 +788,10 @@ impl Render for DbtDatabasePanel {
                 ),
             );
         } else {
-            body = body.child(list).child(
-                div().absolute().inset_0().child(div()).custom_scrollbars(
-                    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
-                        .tracked_scroll_handle(&self.scroll),
-                    window,
-                    cx,
+            drop(list);
+            body = body.child(
+                v_flex().flex_1().items_center().justify_center().child(
+                    Label::new("No matches.").size(LabelSize::Small).color(Color::Muted),
                 ),
             );
         }

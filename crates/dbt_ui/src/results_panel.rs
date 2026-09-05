@@ -189,7 +189,6 @@ pub struct DbtResultsPanel {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// Effective dbt config for the Connection tab, rebuilt on demand.
     connection: Option<Arc<crate::connection::ConnectionInfo>>,
-    el_run_view: gpui::Entity<crate::el::run_view::ElRunView>,
     connection_scroll: ScrollHandle,
     _run: Task<()>,
     _lineage_refresh: Task<()>,
@@ -206,7 +205,6 @@ enum ResultsView {
     Compiled,
     Lineage,
     Connection,
-    ElRuns,
 }
 
 /// What `dbt show` should execute: a whole model, or an ad-hoc SQL chunk
@@ -394,10 +392,6 @@ impl DbtResultsPanel {
         let workspace_handle = cx.entity().downgrade();
         let workspace_entity = cx.entity().clone();
         cx.new(|cx| {
-            let el_run_view = {
-                let workspace = workspace_handle.clone();
-                cx.new(|cx| crate::el::run_view::ElRunView::new(workspace, cx))
-            };
             let search_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_placeholder_text("Search results…", window, cx);
@@ -471,7 +465,6 @@ impl DbtResultsPanel {
                 focus_return: None,
                 context_menu: None,
                 connection: None,
-            el_run_view,
                 connection_scroll: ScrollHandle::new(),
                 _run: Task::ready(()),
                 _lineage_refresh: Task::ready(()),
@@ -713,12 +706,6 @@ impl DbtResultsPanel {
         let client: Arc<dyn http_client::HttpClient> =
             client::Client::global(cx).http_client();
         Some(client)
-    }
-
-    /// The EL run view, for the canvas's Run button.
-    pub(crate) fn el_run_view(&mut self) -> gpui::Entity<crate::el::run_view::ElRunView> {
-        self.view = ResultsView::ElRuns;
-        self.el_run_view.clone()
     }
 
     /// Displays a precomputed table in the Results view — the seam the EL
@@ -1002,14 +989,6 @@ impl DbtResultsPanel {
                                 // Rebuilt on entry so edits to profiles.yml or
                                 // settings show up without restarting.
                                 this.connection = None;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("dbt-view-elruns", "EL Runs")
-                            .toggle_state(self.view == ResultsView::ElRuns)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.view = ResultsView::ElRuns;
                                 cx.notify();
                             })),
                     )
@@ -3139,9 +3118,6 @@ impl DbtResultsPanel {
     }
 
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        if self.view == ResultsView::ElRuns {
-            return self.el_run_view.clone().into_any_element();
-        }
         if self.view == ResultsView::Connection {
             return self.render_connection(cx);
         }

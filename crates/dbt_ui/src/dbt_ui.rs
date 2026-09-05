@@ -44,6 +44,10 @@ actions!(
         RunPipeline,
         /// Cancels the active EL run.
         CancelRun,
+        /// Toggles focus on the EL pipelines panel.
+        ToggleElPanelFocus,
+        /// Toggles focus on the EL runs panel.
+        ToggleElRunsFocus,
     ]
 );
 
@@ -63,6 +67,12 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &InitializeWorkspace, window, cx| {
             el::initialize_workspace(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleElPanelFocus, window, cx| {
+            workspace.toggle_panel_focus::<el::ElPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleElRunsFocus, window, cx| {
+            workspace.toggle_panel_focus::<el::ElRunsPanel>(window, cx);
         });
     })
     .detach();

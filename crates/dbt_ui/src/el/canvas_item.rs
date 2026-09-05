@@ -963,16 +963,12 @@ impl ElPipelineCanvas {
         let root = self.project_root.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                let Some(panel) = workspace.panel::<crate::results_panel::DbtResultsPanel>(cx)
-                else {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
                     return;
                 };
-                workspace.focus_panel::<crate::results_panel::DbtResultsPanel>(window, cx);
-                panel.update(cx, |panel, cx| {
-                    let view = panel.el_run_view();
-                    cx.notify();
-                    view.update(cx, |view, cx| view.start_run(root, pipeline, cx));
-                });
+                workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                let view = panel.read(cx).run_view();
+                view.update(cx, |view, cx| view.start_run(root, pipeline, cx));
             })
             .ok();
     }
