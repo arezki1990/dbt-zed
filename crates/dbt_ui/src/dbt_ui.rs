@@ -7,6 +7,7 @@ pub mod database;
 pub mod database_panel;
 pub mod dbt_install;
 pub mod dbt_settings;
+pub mod el;
 pub mod lineage;
 pub mod lineage_sql;
 pub mod mcp;
@@ -30,6 +31,16 @@ actions!(
     ]
 );
 
+actions!(
+    el,
+    [
+        /// Opens the pipeline canvas for the project's EL pipelines.
+        OpenPipelines,
+        /// Scaffolds the el/ directory: connections, an example pipeline, and YAML completion schemas.
+        InitializeWorkspace,
+    ]
+);
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ShowModelData, window, cx| {
@@ -40,6 +51,12 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ToggleDatabaseFocus, window, cx| {
             workspace.toggle_panel_focus::<DbtDatabasePanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &OpenPipelines, window, cx| {
+            el::open_pipelines(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &InitializeWorkspace, window, cx| {
+            el::initialize_workspace(workspace, window, cx);
         });
     })
     .detach();

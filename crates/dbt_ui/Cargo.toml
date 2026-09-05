@@ -17,6 +17,7 @@ async-compression.workspace = true
 async-tar.workspace = true
 client.workspace = true
 editor.workspace = true
+el_engine.workspace = true
 futures.workspace = true
 gpui.workspace = true
 http_client.workspace = true

@@ -32,6 +32,7 @@ pub struct DbtDatabasePanel {
     workspace: WeakEntity<Workspace>,
     root: Option<PathBuf>,
     catalog: Option<Arc<DbCatalog>>,
+    pipelines: Vec<PathBuf>,
     load_error: Option<SharedString>,
     loading: bool,
     /// (manifest mtime, catalog mtime) at the last successful load, for the
@@ -63,6 +64,8 @@ enum RowAction {
     Toggle,
     Relation(RelationAction),
     Column { name: SharedString },
+    Pipeline(PathBuf),
+    InitializeEl,
     Note,
 }
 
@@ -84,7 +87,7 @@ fn node_key(parts: &[&str]) -> SharedString {
 /// The dbt project root visible in this workspace: the configured
 /// `dbt.project_dir` when valid, else a worktree root holding
 /// dbt_project.yml, else one directory below it.
-fn discover_workspace_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+pub(crate) fn discover_workspace_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
     let settings = DbtSettings::get_global(cx);
     for worktree in workspace.project().read(cx).worktrees(cx) {
         let root = worktree.read(cx).abs_path().to_path_buf();
@@ -159,6 +162,7 @@ impl DbtDatabasePanel {
                 workspace: workspace_handle,
                 root: None,
                 catalog: None,
+                pipelines: Vec::new(),
                 load_error: None,
                 loading: false,
                 loaded_mtimes: (None, None),
@@ -188,6 +192,9 @@ impl DbtDatabasePanel {
         let Some(root) = root else {
             return;
         };
+        // The pipelines listing is one read_dir — refresh it every pass so
+        // the section tracks el/ even when the dbt artifacts are unchanged.
+        self.pipelines = el_engine::spec::list_pipelines(&crate::el::el_dir(&root));
         let mtimes = artifact_mtimes(&root);
         if self.catalog.is_some() && mtimes == self.loaded_mtimes {
             return;
@@ -231,12 +238,42 @@ impl DbtDatabasePanel {
 
     /// The flat visible-row list for the current expansion and filter state.
     fn visible_rows(&self, cx: &App) -> Vec<RowEntry> {
-        let Some(catalog) = &self.catalog else {
-            return Vec::new();
-        };
         let query = self.filter_editor.read(cx).text(cx).trim().to_lowercase();
         let filtering = !query.is_empty();
         let mut rows = Vec::new();
+
+        // EL pipelines section — present whether or not dbt artifacts exist.
+        if !filtering {
+            if self.pipelines.is_empty() {
+                rows.push(RowEntry {
+                    depth: 0,
+                    key: None,
+                    expanded: false,
+                    label: "Initialize EL workspace…".into(),
+                    detail: None,
+                    action: RowAction::InitializeEl,
+                });
+            } else {
+                for path in &self.pipelines {
+                    let name = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("pipeline");
+                    rows.push(RowEntry {
+                        depth: 0,
+                        key: None,
+                        expanded: false,
+                        label: format!("Pipeline: {name}").into(),
+                        detail: Some("EL".into()),
+                        action: RowAction::Pipeline(path.clone()),
+                    });
+                }
+            }
+        }
+
+        let Some(catalog) = &self.catalog else {
+            return rows;
+        };
 
         if !catalog.catalog_present {
             rows.push(RowEntry {
@@ -522,6 +559,8 @@ impl DbtDatabasePanel {
             RowAction::Toggle => (Some(IconName::Folder), Color::Default),
             RowAction::Relation(_) => (Some(IconName::Table), Color::Default),
             RowAction::Column { .. } => (None, Color::Muted),
+            RowAction::Pipeline(_) => (Some(IconName::ArrowRightLeft), Color::Default),
+            RowAction::InitializeEl => (Some(IconName::Plus), Color::Muted),
             RowAction::Note => (Some(IconName::Info), Color::Muted),
         };
         if let Some(icon) = icon {
@@ -601,6 +640,37 @@ impl DbtDatabasePanel {
                             cx.notify();
                         }),
                     );
+            }
+            RowAction::Pipeline(path) => {
+                let path = path.clone();
+                item = item.cursor_pointer().on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        let (Some(root), path) = (this.root.clone(), path.clone()) else {
+                            return;
+                        };
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                crate::el::ElPipelineCanvas::deploy(
+                                    workspace, root, path, window, cx,
+                                );
+                            })
+                            .ok();
+                    },
+                ));
+            }
+            RowAction::InitializeEl => {
+                item = item.cursor_pointer().on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                crate::el::initialize_workspace(workspace, window, cx);
+                            })
+                            .ok();
+                        this.loaded_mtimes = (None, None);
+                        this.catalog = None;
+                        this.ensure_loaded(cx);
+                    },
+                ));
             }
             RowAction::Note => {}
         }

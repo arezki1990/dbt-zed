@@ -651,6 +651,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-k d": "dbt::ShowModelData",
+      "cmd-k l": "el::OpenPipelines",
     },
   },
   {
