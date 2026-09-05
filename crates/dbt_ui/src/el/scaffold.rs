@@ -129,6 +129,37 @@ pub fn initialize_el_workspace(project_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(created)
 }
 
+/// Self-healing for the JSON schemas the canonical YAML header points at:
+/// (re)writes `el/.zdbt/*.schema.json` when missing or empty, so hand-made
+/// EL projects (no Initialize run) still get completion and validation.
+/// Derived artifacts, not user YAML — plain fs writes are fine.
+pub fn ensure_schemas(project_root: &Path) -> Result<bool> {
+    let el = super::el_dir(project_root);
+    if !el.is_dir() {
+        return Ok(false);
+    }
+    let dir = el.join(".zdbt");
+    let mut wrote = false;
+    for (name, schema) in [
+        ("el-pipeline.schema.json", el_engine::spec::pipeline_json_schema()),
+        (
+            "el-connections.schema.json",
+            el_engine::spec::connections_json_schema(),
+        ),
+    ] {
+        let path = dir.join(name);
+        let missing = std::fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(true);
+        if missing {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::write(&path, serde_json::to_string_pretty(&schema)?)
+                .with_context(|| format!("writing {}", path.display()))?;
+            wrote = true;
+        }
+    }
+    Ok(wrote)
+}
+
 /// Adds the two schema associations to the project's `.zed/settings.json`,
 /// preserving everything already there.
 fn merge_yaml_schema_settings(project_root: &Path) -> Result<()> {

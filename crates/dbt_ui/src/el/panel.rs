@@ -103,6 +103,11 @@ impl ElPanel {
             return;
         };
         let el = super::el_dir(&root);
+        // Self-heal the derived JSON schemas the YAML headers point at —
+        // hand-made projects never ran Initialize.
+        if let Err(error) = super::scaffold::ensure_schemas(&root) {
+            log::warn!("el: could not write schemas: {error:#}");
+        }
         self.pipelines = el_engine::spec::list_pipelines(&el);
         match el_engine::spec::load_connections(&el.join("connections.yml")) {
             Ok(connections) => {
