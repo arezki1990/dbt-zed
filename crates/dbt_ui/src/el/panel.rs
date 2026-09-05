@@ -513,15 +513,19 @@ impl Render for ElPanel {
                             })),
                     ),
             )
-            .children((self.profiles.len() > 1 || (!self.profiles.is_empty() && self.profile.is_none())).then(|| {
+            .children((!self.profiles.is_empty()).then(|| {
                 // The environment switcher: same pipelines, different
-                // connections. The active chip is the panel's one accent.
+                // connections. One dropdown, the active profile as its
+                // face — the panel's single accent.
+                let profiles = self.profiles.clone();
+                let active = self.profile.clone();
+                let panel = cx.entity().downgrade();
                 h_flex()
                     .w_full()
                     .px_2()
                     .py_1()
                     .gap_1()
-                    .flex_wrap()
+                    .items_center()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(
@@ -529,17 +533,44 @@ impl Render for ElPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .children(self.profiles.iter().enumerate().map(|(ix, name)| {
-                        let selected = self.profile.as_ref() == Some(name);
-                        let name = name.clone();
-                        Button::new(("el-profile", ix), name.clone())
-                            .label_size(LabelSize::XSmall)
-                            .toggle_state(selected)
-                            .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.switch_profile(name.clone(), cx);
-                            }))
-                    }))
+                    .child(
+                        ui::PopoverMenu::new("el-profile-select")
+                            .trigger(
+                                Button::new(
+                                    "el-profile-trigger",
+                                    active.clone().unwrap_or_else(|| "choose…".into()),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                            )
+                            .menu(move |window, cx| {
+                                let panel = panel.clone();
+                                let profiles = profiles.clone();
+                                let active = active.clone();
+                                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for name in profiles {
+                                        let panel = panel.clone();
+                                        let selected = active.as_ref() == Some(&name);
+                                        let label = name.clone();
+                                        menu = menu.toggleable_entry(
+                                            label,
+                                            selected,
+                                            ui::IconPosition::Start,
+                                            None,
+                                            move |_, cx| {
+                                                panel
+                                                    .update(cx, |this, cx| {
+                                                        this.switch_profile(name.clone(), cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        );
+                                    }
+                                    menu
+                                }))
+                            }),
+                    )
             }))
             .child(list)
     }

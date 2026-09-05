@@ -2,7 +2,7 @@
 # Build from the repo root:
 #   docker build -f docker/el-serve/Dockerfile -t zdbt-el-serve .
 # Run with a project mounted at /project and a token:
-#   docker run -p 7431:7431 -e ZDBT_EL_TOKEN=... -v $PWD:/project zdbt-el-serve
+#   docker run -p 127.0.0.1:7431:7431 -e ZDBT_EL_TOKEN=... -v $PWD:/project zdbt-el-serve
 # In-container the bind is plaintext-with-token (--insecure-http);
 # publish only to localhost (-p 127.0.0.1:7431:7431) or terminate TLS at
 # your ingress for anything reachable from a network.

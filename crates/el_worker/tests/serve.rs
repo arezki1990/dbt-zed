@@ -149,11 +149,18 @@ fn serve_refuses_insecure_remote_binds() {
     assert!(error.contains("--tls-cert"), "got: {error}");
 }
 
-/// The client refuses plaintext for anything that is not loopback.
+/// The client refuses plaintext for anything that is not loopback — and
+/// URL tricks that dress a remote host up as localhost.
 #[test]
 fn client_refuses_plaintext_remotes() {
     assert!(RemoteClient::direct("http://el.example.com:7431", None).is_err());
     assert!(RemoteClient::direct("http://127.0.0.1:7431", None).is_ok());
     assert!(RemoteClient::direct("http://localhost:7431", None).is_ok());
     assert!(RemoteClient::direct("https://el.example.com:7431", None).is_ok());
+    // Userinfo bypasses: "localhost:6" is userinfo, the HOST is evil.com.
+    assert!(RemoteClient::direct("http://localhost:6@evil.com", None).is_err());
+    assert!(RemoteClient::direct("http://localhost:@evil.com/x", None).is_err());
+    // Credentials never belong in the URL, even over https.
+    assert!(RemoteClient::direct("https://user:pw@el.example.com", None).is_err());
+    assert!(RemoteClient::direct("ftp://localhost:7431", None).is_err());
 }

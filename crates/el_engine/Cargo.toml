@@ -24,7 +24,7 @@ postgres = ["dep:postgres", "dep:chrono"]
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
 # The `el serve` daemon: cron scheduling, retries, failure hooks, and the
 # token-guarded HTTP API. Blocking/threaded like the engine — no tokio.
-server = ["dep:tiny_http", "dep:cron", "dep:chrono-tz", "dep:ureq", "dep:chrono"]
+server = ["dep:tiny_http", "dep:cron", "dep:chrono-tz", "dep:ureq", "dep:chrono", "dep:url"]
 
 [dependencies]
 anyhow.workspace = true
@@ -70,6 +70,7 @@ tiny_http = { version = "0.12", features = ["ssl-rustls"], optional = true }
 cron = { version = "0.12", optional = true }
 chrono-tz = { version = "0.10", optional = true }
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"], optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -56,6 +56,9 @@ pub struct ElRunsPanel {
     remote_pipelines: Vec<el_engine::server::RemotePipeline>,
     remote_runs: Vec<el_engine::server::RemoteRun>,
     remote_error: Option<SharedString>,
+    /// A failed Run/Cancel action — kept visible until the next action
+    /// or remote switch (the 2s poll must not wipe it).
+    remote_action_error: Option<SharedString>,
     remote_health: Option<SharedString>,
     remote_logs: Vec<SharedString>,
     remote_log_next: u64,
@@ -115,6 +118,7 @@ impl ElRunsPanel {
                 remote_pipelines: Vec::new(),
                 remote_runs: Vec::new(),
                 remote_error: None,
+                remote_action_error: None,
                 remote_health: None,
                 remote_logs: Vec::new(),
                 remote_log_next: 0,
@@ -328,6 +332,7 @@ impl ElRunsPanel {
         else {
             return;
         };
+        self.remote_action_error = None;
         let task = cx.background_spawn(async move {
             let client = el_engine::server::RemoteClient::connect(&root, &name)?;
             action(&client)
@@ -335,10 +340,12 @@ impl ElRunsPanel {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                if let Err(error) = result {
-                    this.remote_error = Some(format!("{error:#}").into());
+                match result {
+                    Ok(()) => this.start_remote_poll(cx),
+                    Err(error) => {
+                        this.remote_action_error = Some(format!("{error:#}").into());
+                    }
                 }
-                this.start_remote_poll(cx);
                 cx.notify();
             })
             .ok();
@@ -558,6 +565,7 @@ impl ElRunsPanel {
                             this.selected_remote = Some(ix);
                             this.remote_pipelines.clear();
                             this.remote_runs.clear();
+                            this.remote_action_error = None;
                             this.start_remote_poll(cx);
                             cx.notify();
                         }))
@@ -575,6 +583,9 @@ impl ElRunsPanel {
                 Label::new(health).size(LabelSize::XSmall).color(Color::Success)
             }))
             .children(self.remote_error.clone().map(|error| {
+                Label::new(error).size(LabelSize::XSmall).color(Color::Error)
+            }))
+            .children(self.remote_action_error.clone().map(|error| {
                 Label::new(error).size(LabelSize::XSmall).color(Color::Error)
             }))
             .child(
@@ -643,6 +654,7 @@ impl ElRunsPanel {
             let status_color = match run.status.as_str() {
                 "ok" => Color::Success,
                 "failed" => Color::Error,
+                "cancelled" => Color::Warning,
                 _ => Color::Accent,
             };
             let run_id = run.id;

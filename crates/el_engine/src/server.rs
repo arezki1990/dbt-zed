@@ -49,6 +49,7 @@ enum RunStatus {
     Running,
     Ok,
     Failed,
+    Cancelled,
 }
 
 struct RunRecord {
@@ -85,11 +86,13 @@ impl State {
     fn log(&self, line: String) {
         log::info!("el serve: {line}");
         println!("el-serve  {line}");
+        let stamp = chrono::Utc::now().format("%H:%M:%S");
+        let mut lines = self.log_lines.lock().unwrap();
+        // Sequence allocated under the ring's lock: /logs pagination sees
+        // strictly ordered, gap-free entries.
         let seq = self
             .log_next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let stamp = chrono::Utc::now().format("%H:%M:%S");
-        let mut lines = self.log_lines.lock().unwrap();
         lines.push((seq, format!("{stamp}  {line}")));
         let overflow = lines.len().saturating_sub(LOG_LIMIT);
         if overflow > 0 {
@@ -121,13 +124,19 @@ fn load_pipeline_by_name(root: &std::path::Path, name: &str) -> Result<Pipeline>
 /// Starts a run on background threads; returns its id. Refuses when the
 /// pipeline already has a run in flight (Airbyte's skip-if-running).
 fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u64> {
-    if state.is_running(pipeline_name) {
-        bail!("{pipeline_name} is already running");
-    }
     let pipeline = load_pipeline_by_name(&state.config.project_root, pipeline_name)?;
     let cancel = CancelFlag::default();
     let run_id = {
+        // Check-and-insert under ONE lock: two racing POSTs can't both
+        // start the same pipeline.
         let mut registry = state.registry.lock().unwrap();
+        if registry
+            .runs
+            .iter()
+            .any(|run| run.pipeline == pipeline_name && run.status == RunStatus::Running)
+        {
+            bail!("{pipeline_name} is already running");
+        }
         registry.next_id += 1;
         let id = registry.next_id;
         registry.runs.push(RunRecord {
@@ -170,7 +179,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
 
     // Consumer: append every event to the record.
     let consumer_state = Arc::clone(state);
-    std::thread::spawn(move || {
+    let consumer = std::thread::spawn(move || {
         use futures::StreamExt as _;
         while let Some(event) = futures::executor::block_on(rx.next()) {
             let mut registry = consumer_state.registry.lock().unwrap();
@@ -186,11 +195,15 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
     // Engine thread: the blocking run, then verdict + retry + hooks.
     let engine_state = Arc::clone(state);
     let name = pipeline_name.to_owned();
-    std::thread::Builder::new()
+    let engine_thread = std::thread::Builder::new()
         .name(format!("el-run-{name}"))
         .spawn(move || {
             let result = run_pipeline(&request, &tx, &cancel);
             drop(tx);
+            // The record goes terminal only after every event is appended
+            // — a poller that sees done has seen the whole tail.
+            let _ = consumer.join();
+            let was_cancelled = cancel.is_cancelled();
             let failed_error = match &result {
                 Ok(report) if report.streams_failed == 0 => None,
                 Ok(report) => Some(format!("{} stream(s) failed", report.streams_failed)),
@@ -199,13 +212,25 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
             {
                 let mut registry = engine_state.registry.lock().unwrap();
                 if let Some(run) = registry.runs.iter_mut().find(|run| run.id == run_id) {
-                    run.status = if failed_error.is_none() {
+                    run.status = if was_cancelled {
+                        RunStatus::Cancelled
+                    } else if failed_error.is_none() {
                         RunStatus::Ok
                     } else {
                         RunStatus::Failed
                     };
-                    run.error = failed_error.clone();
+                    run.error = if was_cancelled {
+                        Some("cancelled".to_owned())
+                    } else {
+                        failed_error.clone()
+                    };
                 }
+            }
+            if was_cancelled {
+                // A cancel is the operator's verdict: no retries, no
+                // failure hooks.
+                engine_state.log(format!("run {run_id} ({name}) cancelled"));
+                return;
             }
             match &failed_error {
                 None => engine_state.log(format!("run {run_id} ({name}) finished")),
@@ -235,8 +260,15 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
             } else {
                 fire_failure_hooks(&engine_state, &request.pipeline, &error);
             }
-        })
-        .ok();
+        });
+    if let Err(spawn_error) = engine_thread {
+        let mut registry = state.registry.lock().unwrap();
+        if let Some(run) = registry.runs.iter_mut().find(|run| run.id == run_id) {
+            run.status = RunStatus::Failed;
+            run.error = Some(format!("could not start: {spawn_error}"));
+        }
+        anyhow::bail!("could not start the run thread: {spawn_error}");
+    }
     Ok(run_id)
 }
 
@@ -253,10 +285,14 @@ fn fire_failure_hooks(state: &Arc<State>, pipeline: &Pipeline, error: &str) {
                     "error": error,
                 });
                 // The resolved URL may embed a secret — never log it.
+                // ureq errors Display the full URL — never log them.
                 match ureq::post(url.expose()).send_json(body) {
                     Ok(_) => state.log("failure webhook delivered".to_owned()),
-                    Err(send_error) => {
-                        state.log(format!("failure webhook not delivered: {send_error}"))
+                    Err(ureq::Error::Status(code, _)) => {
+                        state.log(format!("failure webhook not delivered: status {code}"))
+                    }
+                    Err(ureq::Error::Transport(_)) => {
+                        state.log("failure webhook not delivered: transport error".to_owned())
                     }
                 }
             }
@@ -283,6 +319,7 @@ fn fire_failure_hooks(state: &Arc<State>, pipeline: &Pipeline, error: &str) {
 /// trigger time inside (previous tick, now]. Skip-if-running.
 fn scheduler_loop(state: Arc<State>) {
     let mut previous = Utc::now();
+    let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         std::thread::sleep(SCHEDULER_TICK);
         let now = Utc::now();
@@ -303,16 +340,39 @@ fn scheduler_loop(state: Arc<State>) {
                     continue;
                 }
             };
-            let timezone: chrono_tz::Tz = pipeline
-                .timezone
-                .as_deref()
-                .and_then(|name| name.parse().ok())
-                .unwrap_or(chrono_tz::UTC);
-            let due = schedule
-                .after(&previous.with_timezone(&timezone))
-                .next()
-                .map(|fire| fire.with_timezone(&Utc) <= now)
-                .unwrap_or(false);
+            let timezone: chrono_tz::Tz = match pipeline.timezone.as_deref() {
+                None => chrono_tz::UTC,
+                Some(name) => match name.parse() {
+                    Ok(timezone) => timezone,
+                    Err(_) => {
+                        if warned.insert(pipeline.pipeline.clone()) {
+                            state.log(format!(
+                                "{} has an unknown timezone {name:?} — using UTC",
+                                pipeline.pipeline
+                            ));
+                        }
+                        chrono_tz::UTC
+                    }
+                },
+            };
+            // cron+chrono can panic across DST edges — a bad schedule must
+            // not kill the scheduler thread.
+            let due = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                schedule
+                    .after(&previous.with_timezone(&timezone))
+                    .next()
+                    .map(|fire| fire.with_timezone(&Utc) <= now)
+                    .unwrap_or(false)
+            }))
+            .unwrap_or_else(|_| {
+                if warned.insert(pipeline.pipeline.clone()) {
+                    state.log(format!(
+                        "{}: schedule evaluation panicked around a timezone                          transition — skipped this tick",
+                        pipeline.pipeline
+                    ));
+                }
+                false
+            });
             if due {
                 match start_run(&state, &pipeline.pipeline, 0) {
                     Ok(run_id) => state.log(format!(
@@ -391,19 +451,61 @@ fn authorized(state: &State, request: &tiny_http::Request) -> bool {
         .map(|header| header.value.as_str().to_owned())
         .unwrap_or_default();
     let provided = provided.strip_prefix("Bearer ").unwrap_or("");
-    // Constant-time comparison: a token is a credential.
-    let expected = expected.as_bytes();
-    let provided = provided.as_bytes();
-    let mut diff = expected.len() ^ provided.len();
-    for ix in 0..expected.len().max(provided.len()) {
-        let a = expected.get(ix).copied().unwrap_or(0);
-        let b = provided.get(ix).copied().unwrap_or(0);
-        diff |= (a ^ b) as usize;
+    // Compare fixed-size digests: constant time, and no signal about the
+    // token's length either.
+    use sha2::Digest as _;
+    let expected = sha2::Sha256::digest(expected.as_bytes());
+    let provided = sha2::Sha256::digest(provided.as_bytes());
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(provided.iter()) {
+        diff |= a ^ b;
     }
     diff == 0
 }
 
+/// True when the header value names this machine: localhost forms only.
+fn is_local_host_header(value: &str) -> bool {
+    let host = value.rsplit_once(':').map(|(host, _)| host).unwrap_or(value);
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+        || value.starts_with("[::1]")
+}
+
 fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
+    // A token-less daemon exists only for loopback development — make the
+    // browser attack surface (CSRF simple-requests, DNS rebinding) fail
+    // closed: local Host required, any cross-site Origin rejected, and
+    // POST bodies must declare JSON (never a no-preflight content type).
+    if state.config.token.is_none() {
+        let header = |name: &'static str| {
+            request
+                .headers()
+                .iter()
+                .find(move |header| header.field.equiv(name))
+                .map(|header| header.value.as_str().to_owned())
+        };
+        let host_ok = header("Host").is_some_and(|host| is_local_host_header(&host));
+        let origin_ok = match header("Origin") {
+            None => true,
+            Some(origin) => {
+                origin == "null"
+                    || url::Url::parse(&origin)
+                        .ok()
+                        .and_then(|origin| origin.host_str().map(str::to_owned))
+                        .is_some_and(|host| is_local_host_header(&host))
+            }
+        };
+        let content_ok = request.method().as_str() != "POST"
+            || header("Content-Type")
+                .is_some_and(|content| content.to_ascii_lowercase().contains("application/json"));
+        if !host_ok || !origin_ok || !content_ok {
+            respond_json(
+                request,
+                403,
+                &serde_json::json!({"error": "cross-origin request refused — set                     ZDBT_EL_TOKEN for network access"}),
+            );
+            return;
+        }
+    }
     if !authorized(state, &request) {
         respond_json(
             request,
@@ -463,13 +565,16 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 .get("since")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-            let lines = state.log_lines.lock().unwrap();
-            let entries: Vec<&String> = lines
-                .iter()
-                .filter(|(seq, _)| *seq >= since)
-                .map(|(_, line)| line)
-                .collect();
-            let next = lines.last().map(|(seq, _)| seq + 1).unwrap_or(since);
+            let (entries, next) = {
+                let lines = state.log_lines.lock().unwrap();
+                let entries: Vec<String> = lines
+                    .iter()
+                    .filter(|(seq, _)| *seq >= since)
+                    .map(|(_, line)| line.clone())
+                    .collect();
+                let next = lines.last().map(|(seq, _)| seq + 1).unwrap_or(since);
+                (entries, next)
+            };
             respond_json(
                 request,
                 200,
@@ -492,13 +597,18 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
             respond_json(request, 200, &pipelines);
         }
         ("GET", ["runs"]) => {
-            let registry = state.registry.lock().unwrap();
-            let runs: Vec<RunInfo> = registry.runs.iter().rev().map(run_info).collect();
+            let runs: Vec<RunInfo> = {
+                let registry = state.registry.lock().unwrap();
+                registry.runs.iter().rev().map(run_info).collect()
+            };
             respond_json(request, 200, &runs);
         }
         ("POST", ["runs"]) => {
             let mut body = String::new();
-            let _ = request.as_reader().read_to_string(&mut body);
+            let _ = request
+                .as_reader()
+                .take(64 * 1024)
+                .read_to_string(&mut body);
             let pipeline = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|value| {
@@ -517,11 +627,17 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
             };
             match start_run(state, &pipeline, 0) {
                 Ok(id) => respond_json(request, 200, &serde_json::json!({"id": id})),
-                Err(error) => respond_json(
-                    request,
-                    409,
-                    &serde_json::json!({"error": format!("{error:#}")}),
-                ),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let status = if message.contains("already running") {
+                        409
+                    } else if message.contains("no pipeline named") {
+                        404
+                    } else {
+                        500
+                    };
+                    respond_json(request, status, &serde_json::json!({"error": message}));
+                }
             }
         }
         ("POST", ["runs", id, "cancel"]) => {
@@ -641,7 +757,9 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         state.config.project_root.display()
     );
     for request in server.incoming_requests() {
-        handle(&state, request);
+        // One thread per request: a slow client never wedges the API.
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || handle(&state, request));
     }
     Ok(())
 }
@@ -699,22 +817,34 @@ pub struct RemoteClient {
     token: Option<crate::env::Secret>,
 }
 
-fn is_loopback_url(url: &str) -> bool {
-    let host = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("")
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or_else(|| {
-            url.split_once("://")
-                .map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or(""))
-                .unwrap_or("")
-        });
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+/// Refuses any remote URL a bearer token must not travel to: parsed with
+/// the same URL grammar the HTTP client uses (no hand string surgery, so
+/// no `http://localhost:6@evil.com` userinfo bypass), credentials in the
+/// URL rejected outright, and plaintext http allowed only when the HOST
+/// is genuinely loopback.
+fn check_remote_url(raw: &str) -> Result<()> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|error| anyhow::anyhow!("invalid remote url: {error}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("remote URLs must not embed credentials — use the token field");
+    }
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match parsed.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                None => false,
+            };
+            if loopback {
+                Ok(())
+            } else {
+                bail!("remote URLs must use https (plain http is allowed for loopback only)")
+            }
+        }
+        other => bail!("unsupported remote url scheme {other:?}"),
+    }
 }
 
 impl RemoteClient {
@@ -728,13 +858,8 @@ impl RemoteClient {
             .remotes
             .get(name)
             .with_context(|| format!("no remote named {name:?} in el/remotes.yml"))?;
-        if !remote.url.starts_with("https://")
-            && !(remote.url.starts_with("http://") && is_loopback_url(&remote.url))
-        {
-            bail!(
-                "remote {name:?} must use https (plain http is allowed for loopback only)"
-            );
-        }
+        check_remote_url(&remote.url)
+            .map_err(|error| anyhow::anyhow!("remote {name:?}: {error:#}"))?;
         let env = crate::env::EnvMap::load(project_root, None);
         let token = match &remote.token {
             Some(template) => Some(
@@ -751,9 +876,7 @@ impl RemoteClient {
 
     /// Direct construction (tests, ad-hoc URLs). Same https rule.
     pub fn direct(url: &str, token: Option<crate::env::Secret>) -> Result<Self> {
-        if !url.starts_with("https://") && !(url.starts_with("http://") && is_loopback_url(url)) {
-            bail!("remote URLs must be https (plain http is allowed for loopback only)");
-        }
+        check_remote_url(url)?;
         Ok(Self {
             base: url.trim_end_matches('/').to_owned(),
             token,
@@ -808,8 +931,10 @@ impl RemoteClient {
     }
 
     pub fn cancel(&self, run_id: u64) -> Result<()> {
-        let _: serde_json::Value =
-            Self::read_json(self.request("POST", &format!("/runs/{run_id}/cancel")).call())?;
+        let _: serde_json::Value = Self::read_json(
+            self.request("POST", &format!("/runs/{run_id}/cancel"))
+                .send_json(serde_json::json!({})),
+        )?;
         Ok(())
     }
 
