@@ -136,6 +136,7 @@ fn run(args: &[String]) -> i32 {
         worker: super::find_worker(),
         driver: None,
         chunk_rows,
+        profile_override: flag(args, "--profile"),
     };
     let cancel = el_engine::CancelFlag::default();
 

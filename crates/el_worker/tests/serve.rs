@@ -50,7 +50,7 @@ fn serve_runs_pipelines_over_the_api() {
     }
     std::fs::write(
         el.join("connections.yml"),
-        "version: 1\nconnections:\n  src: { type: duckdb, path: el/source.duckdb }\n  wh: { type: duckdb, path: el/warehouse.duckdb }\n",
+        "version: 1\nconnections:\n  src: { type: duckdb, path: el/source.duckdb }\n  wh: { type: duckdb, path: el/warehouse.duckdb }\nprofiles:\n  dev:\n    connections: {}\n",
     )
     .unwrap();
     let orders_yaml = "version: 1\npipeline: orders\nsource: src\ntarget: { connection: wh, schema: LANDING }\nstreams:\n- name: orders\n  source: { schema: main, table: orders }\n";
@@ -89,18 +89,34 @@ fn serve_runs_pipelines_over_the_api() {
     let error = format!("{:#}", good.start_run("orders").unwrap_err());
     assert!(error.contains("deploy"), "got: {error}");
 
-    // Deploy, then the pipeline list reflects the deployed set.
+    // Deploy pinned to a profile the server declares; the list reports it.
     let deployed = good
-        .deploy(&[("orders".to_owned(), orders_yaml.to_owned())])
+        .deploy(&[(
+            "orders".to_owned(),
+            orders_yaml.to_owned(),
+            Some("dev".to_owned()),
+        )])
         .unwrap();
     assert_eq!(deployed, ["orders"]);
-    // Broken or ill-named bundles are refused whole.
-    assert!(good.deploy(&[("evil/../name".to_owned(), orders_yaml.to_owned())]).is_err());
-    assert!(good.deploy(&[("orders".to_owned(), "not: [valid".to_owned())]).is_err());
+    // Broken names, YAML, or unknown profiles are refused whole.
+    assert!(good
+        .deploy(&[("evil/../name".to_owned(), orders_yaml.to_owned(), None)])
+        .is_err());
+    assert!(good
+        .deploy(&[("orders".to_owned(), "not: [valid".to_owned(), None)])
+        .is_err());
+    assert!(good
+        .deploy(&[(
+            "orders".to_owned(),
+            orders_yaml.to_owned(),
+            Some("staging".to_owned()),
+        )])
+        .is_err());
     let pipelines = good.pipelines().unwrap();
     assert_eq!(pipelines.len(), 1);
     assert_eq!(pipelines[0].name, "orders");
     assert_eq!(pipelines[0].streams, 1);
+    assert_eq!(pipelines[0].profile.as_deref(), Some("dev"));
 
     // Trigger a run and poll its events to completion.
     let run_id = good.start_run("orders").unwrap();

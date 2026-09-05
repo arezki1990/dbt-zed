@@ -25,6 +25,9 @@ pub struct RunRequest {
     /// ADBC Snowflake driver dylib.
     pub driver: Option<PathBuf>,
     pub chunk_rows: usize,
+    /// Run under this profile regardless of the checkout's selection —
+    /// how deploy-pinned daemon runs pick their environment.
+    pub profile_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -55,9 +58,18 @@ pub fn run_pipeline(
             .collect(),
     });
 
-    let (connections, profile) =
-        crate::spec::load_active_connections(&request.project_root)
-            .context("loading connections.yml")?;
+    let (connections, profile) = match &request.profile_override {
+        Some(profile) => (
+            crate::spec::load_connections_for_profile(
+                &request.project_root,
+                Some(profile),
+            )
+            .context("loading connections.yml")?,
+            Some(profile.clone()),
+        ),
+        None => crate::spec::load_active_connections(&request.project_root)
+            .context("loading connections.yml")?,
+    };
     if let Some(profile) = &profile {
         log::info!("el run: profile {profile}");
     }
@@ -440,6 +452,7 @@ streams:
             worker: None,
             driver: None,
             chunk_rows: 2,
+        profile_override: None,
         };
         let emit = |event: ProgressEvent| {
             let _ = tx.unbounded_send(event);
@@ -500,6 +513,7 @@ streams:
             worker: None,
             driver: None,
             chunk_rows: 10,
+        profile_override: None,
         };
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };

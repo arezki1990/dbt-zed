@@ -193,6 +193,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
         worker: state.config.worker.clone(),
         driver: state.config.driver.clone(),
         chunk_rows: state.config.chunk_rows,
+    profile_override: None,
     };
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
 
@@ -410,22 +411,49 @@ fn scheduler_loop(state: Arc<State>) {
     }
 }
 
+fn manifest_path(config: &ServerConfig) -> PathBuf {
+    pipelines_root(config).join("manifest.json")
+}
+
+/// name → deploy-pinned profile. Absent entries run under the daemon's
+/// own active profile.
+fn read_manifest(config: &ServerConfig) -> HashMap<String, String> {
+    std::fs::read_to_string(manifest_path(config))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 /// Validates and installs a deploy bundle into the deployed snapshot —
-/// every YAML must parse before ANY file changes; writes are atomic.
+/// every YAML must parse and every pinned profile must exist in THIS
+/// server's connections.yml before ANY file changes; writes are atomic.
 fn apply_deploy<'a>(
     state: &Arc<State>,
-    entries: impl Iterator<Item = (&'a str, &'a str)>,
+    entries: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
 ) -> Result<Vec<String>> {
     let dir = pipelines_root(&state.config).join("pipelines");
     std::fs::create_dir_all(&dir).context("creating the deployed dir")?;
-    let mut validated: Vec<(String, String)> = Vec::new();
-    for (name, yaml) in entries {
+    let declared = spec::load_connections(
+        &state.config.project_root.join("el").join("connections.yml"),
+    )
+    .map(|raw| raw.profiles.keys().cloned().collect::<Vec<_>>())
+    .unwrap_or_default();
+    let mut validated: Vec<(String, String, Option<String>)> = Vec::new();
+    for (name, yaml, profile) in entries {
         if name.is_empty()
             || !name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             bail!("pipeline name {name:?} is not a plain identifier");
+        }
+        if let Some(profile) = profile {
+            if !declared.iter().any(|declared| declared == profile) {
+                bail!(
+                    "profile {profile:?} is not defined on this server (has: {})",
+                    declared.join(", ")
+                );
+            }
         }
         // Parse-validate via a scratch file (the spec loader is path-based).
         let scratch = tempfile::NamedTempFile::new().context("deploy scratch")?;
@@ -438,21 +466,38 @@ fn apply_deploy<'a>(
                 pipeline.pipeline
             );
         }
-        validated.push((name.to_owned(), yaml.to_owned()));
+        validated.push((name.to_owned(), yaml.to_owned(), profile.map(str::to_owned)));
     }
     if validated.is_empty() {
         bail!("nothing to deploy");
     }
+    let mut manifest = read_manifest(&state.config);
     let mut names = Vec::new();
-    for (name, yaml) in validated {
+    for (name, yaml, profile) in validated {
         let target = dir.join(format!("{name}.yml"));
         let staging = dir.join(format!("{name}.yml.tmp"));
         std::fs::write(&staging, yaml)
             .with_context(|| format!("writing {}", staging.display()))?;
         std::fs::rename(&staging, &target)
             .with_context(|| format!("installing {}", target.display()))?;
+        match profile {
+            Some(profile) => {
+                manifest.insert(name.clone(), profile);
+            }
+            None => {
+                manifest.remove(&name);
+            }
+        }
         names.push(name);
     }
+    let manifest_target = manifest_path(&state.config);
+    let manifest_staging = manifest_target.with_extension("json.tmp");
+    std::fs::write(
+        &manifest_staging,
+        serde_json::to_string_pretty(&manifest).context("encoding manifest")?,
+    )
+    .context("writing manifest")?;
+    std::fs::rename(&manifest_staging, &manifest_target).context("installing manifest")?;
     Ok(names)
 }
 
@@ -466,6 +511,8 @@ struct PipelineInfo {
     timezone: Option<String>,
     /// When the schedule next fires (unix seconds, UTC).
     next_run_unix: Option<u64>,
+    /// The deploy-pinned profile; None = the daemon's own.
+    profile: Option<String>,
     streams: usize,
     running: bool,
 }
@@ -626,17 +673,23 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 .elapsed()
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or(0);
-            let profile = spec::load_connections(
+            let raw = spec::load_connections(
                 &state.config.project_root.join("el").join("connections.yml"),
             )
-            .ok()
-            .and_then(|raw| spec::active_profile(&state.config.project_root, &raw));
+            .ok();
+            let profile = raw
+                .as_ref()
+                .and_then(|raw| spec::active_profile(&state.config.project_root, raw));
+            let profiles: Vec<String> = raw
+                .map(|raw| raw.profiles.keys().cloned().collect())
+                .unwrap_or_default();
             respond_json(
                 request,
                 200,
                 &serde_json::json!({
                     "ok": true,
                     "profile": profile,
+                    "profiles": profiles,
                     "uptime_secs": uptime,
                     "running": running,
                     "project": state
@@ -670,10 +723,12 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
             );
         }
         ("GET", ["pipelines"]) => {
+            let manifest = read_manifest(&state.config);
             let mut pipelines = Vec::new();
             for path in spec::list_pipelines(&pipelines_root(&state.config)) {
                 if let Ok(pipeline) = spec::load_pipeline(&path) {
                     pipelines.push(PipelineInfo {
+                        profile: manifest.get(&pipeline.pipeline).cloned(),
                         running: state.is_running(&pipeline.pipeline),
                         next_run_unix: next_fire_unix(
                             pipeline.schedule.as_deref(),
@@ -751,6 +806,8 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
             struct DeployEntry {
                 name: String,
                 yaml: String,
+                #[serde(default)]
+                profile: Option<String>,
             }
             #[derive(serde::Deserialize)]
             struct DeployBody {
@@ -768,7 +825,11 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 }
             };
             match apply_deploy(state, parsed.pipelines.iter().map(|entry| {
-                (entry.name.as_str(), entry.yaml.as_str())
+                (
+                    entry.name.as_str(),
+                    entry.yaml.as_str(),
+                    entry.profile.as_deref(),
+                )
             })) {
                 Ok(names) => {
                     state.log(format!("deployed {} pipeline(s): {}", names.len(), names.join(", ")));
@@ -941,6 +1002,8 @@ pub struct RemotePipeline {
     pub schedule: Option<String>,
     #[serde(default)]
     pub next_run_unix: Option<u64>,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub streams: usize,
     pub running: bool,
 }
@@ -1084,13 +1147,19 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// Deploys pipeline YAMLs (name, canonical yaml) to the daemon's
-    /// deployed snapshot. Nothing runs remotely until this is called.
-    pub fn deploy(&self, pipelines: &[(String, String)]) -> Result<Vec<String>> {
+    /// Deploys pipeline YAMLs (name, yaml, pinned profile) to the
+    /// daemon's deployed snapshot. Nothing runs remotely until this is
+    /// called; each pipeline runs under its pinned profile.
+    pub fn deploy(
+        &self,
+        pipelines: &[(String, String, Option<String>)],
+    ) -> Result<Vec<String>> {
         let body = serde_json::json!({
             "pipelines": pipelines
                 .iter()
-                .map(|(name, yaml)| serde_json::json!({"name": name, "yaml": yaml}))
+                .map(|(name, yaml, profile)| {
+                    serde_json::json!({"name": name, "yaml": yaml, "profile": profile})
+                })
                 .collect::<Vec<_>>(),
         });
         let value: serde_json::Value =

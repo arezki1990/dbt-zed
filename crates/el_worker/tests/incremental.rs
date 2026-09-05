@@ -16,6 +16,7 @@ fn run(project: &std::path::Path, pipeline: el_engine::spec::Pipeline) -> (u64, 
         worker: Some(worker()),
         driver: None,
         chunk_rows: 2,
+    profile_override: None,
     };
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     let cancel = el_engine::CancelFlag::default();

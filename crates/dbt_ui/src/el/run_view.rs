@@ -90,6 +90,7 @@ impl ElRunView {
             worker: super::find_worker(),
             driver: None,
             chunk_rows: 50_000,
+        profile_override: None,
         };
         let engine_cancel = cancel.clone();
         // The engine run is blocking: one background thread for its

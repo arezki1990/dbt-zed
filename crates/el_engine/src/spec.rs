@@ -147,6 +147,29 @@ pub fn try_active_profile(
 /// the active profile, flattened into a plain `Connections`, plus the
 /// profile name for display. An unknown active profile is an error —
 /// never a silent fall-through to another environment's credentials.
+/// connections.yml resolved through an EXPLICIT profile (deploy-pinned
+/// runs); unknown profiles are hard errors.
+pub fn load_connections_for_profile(
+    project_root: &Path,
+    profile: Option<&str>,
+) -> Result<Connections, SpecError> {
+    let path = project_root.join("el").join("connections.yml");
+    let raw = load_connections(&path)?;
+    let resolved = raw
+        .resolved(profile)
+        .map_err(|message| SpecError::Parse {
+            path: path.display().to_string(),
+            message,
+        })?;
+    Ok(Connections {
+        version: raw.version,
+        connections: resolved,
+        profiles: IndexMap::new(),
+        default_profile: None,
+        extra: IndexMap::new(),
+    })
+}
+
 pub fn load_active_connections(
     project_root: &Path,
 ) -> Result<(Connections, Option<String>), SpecError> {
