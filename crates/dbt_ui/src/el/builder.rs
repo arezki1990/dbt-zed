@@ -245,6 +245,7 @@ impl BuilderForm {
                 let mut connections = connections.unwrap_or(Connections {
                     version: 1,
                     connections: IndexMap::new(),
+                    extra: IndexMap::new(),
                 });
                 let name = self.text(0, cx);
                 if name.is_empty() {
@@ -259,21 +260,21 @@ impl BuilderForm {
                         if url_or_path.is_empty() {
                             bail!("postgres needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Postgres(DbConn { url: url_or_path })
+                        Connection::Postgres(DbConn { url: url_or_path, extra: Default::default() })
                     }
                     ConnType::Mysql => {
                         if url_or_path.is_empty() {
                             bail!("mysql needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Mysql(DbConn { url: url_or_path })
+                        Connection::Mysql(DbConn { url: url_or_path, extra: Default::default() })
                     }
                     ConnType::Duckdb => {
                         if url_or_path.is_empty() {
                             bail!("duckdb needs a file path");
                         }
-                        Connection::Duckdb(DuckdbConn { path: url_or_path })
+                        Connection::Duckdb(DuckdbConn { path: url_or_path, extra: Default::default() })
                     }
-                    ConnType::Local => Connection::Local {},
+                    ConnType::Local => Connection::Local { extra: Default::default() },
                     ConnType::Snowflake => {
                         let account = self.text(2, cx);
                         let user = self.text(3, cx);
@@ -293,6 +294,7 @@ impl BuilderForm {
                             auth: SnowflakeAuth::KeyPair {
                                 private_key_path: key_path,
                             },
+                            extra: Default::default(),
                         })
                     }
                 };

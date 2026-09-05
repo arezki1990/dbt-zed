@@ -4,6 +4,7 @@
 pub mod builder;
 pub mod canvas_item;
 pub mod cli;
+pub mod connection_modal;
 pub mod layout;
 pub mod mapping_editor;
 pub mod panel;
@@ -79,7 +80,7 @@ pub fn open_pipelines(
     cx: &mut Context<Workspace>,
 ) {
     let Some(root) = discover_el_root(workspace, cx) else {
-        notify(workspace, "No project folder open in this workspace.", cx);
+        toast(workspace, "No project folder open in this workspace.", cx);
         return;
     };
     let pipelines = el_engine::spec::list_pipelines(&el_dir(&root));
@@ -87,7 +88,7 @@ pub fn open_pipelines(
         Some(path) => {
             canvas_item::ElPipelineCanvas::deploy(workspace, root, path.clone(), window, cx)
         }
-        None => notify(
+        None => toast(
             workspace,
             "No EL pipelines yet — run `el: initialize workspace` to scaffold el/.",
             cx,
@@ -103,12 +104,12 @@ pub fn initialize_workspace(
     cx: &mut Context<Workspace>,
 ) {
     let Some(root) = discover_el_root(workspace, cx) else {
-        notify(workspace, "No project folder open in this workspace.", cx);
+        toast(workspace, "No project folder open in this workspace.", cx);
         return;
     };
     match scaffold::initialize_el_workspace(&root) {
         Ok(created) => {
-            notify(
+            toast(
                 workspace,
                 &format!("EL workspace ready — {} file(s) created under el/.", created.len()),
                 cx,
@@ -118,11 +119,11 @@ pub fn initialize_workspace(
                 canvas_item::ElPipelineCanvas::deploy(workspace, root, example, window, cx);
             }
         }
-        Err(error) => notify(workspace, &format!("EL init failed: {error:#}"), cx),
+        Err(error) => toast(workspace, &format!("EL init failed: {error:#}"), cx),
     }
 }
 
-fn notify(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspace>) {
+pub(crate) fn toast(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspace>) {
     struct ElNotification;
     workspace.show_toast(
         workspace::Toast::new(

@@ -179,3 +179,29 @@ fn env_refs_are_names_only() {
     let refs = connections.connections["warehouse"].env_refs();
     assert_eq!(refs, ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PK_PATH"]);
 }
+
+/// Hand-added unknown keys on connections must survive a canonical
+/// rewrite — the connection editor re-serializes the whole file, and a
+/// key the UI doesn't know about is the user's, not garbage.
+#[test]
+fn connection_unknown_keys_survive_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "version: 1
+connections:
+  pg:
+    type: postgres
+    url: ${PG_URL}
+    my_note: keep me
+  duck:
+    type: duckdb
+    path: el/w.duckdb
+    pool_size: 4
+";
+    let loaded = spec::load_connections(&write(dir.path(), "c.yml", yaml)).unwrap();
+    let rewritten = spec::to_canonical_connections_yaml(&loaded);
+    assert!(rewritten.contains("my_note: keep me"), "lost my_note:\n{rewritten}");
+    assert!(rewritten.contains("pool_size: 4"), "lost pool_size:\n{rewritten}");
+    // And a second load of the rewrite still parses to the same map.
+    let reloaded = spec::load_connections(&write(dir.path(), "c2.yml", &rewritten)).unwrap();
+    assert_eq!(reloaded.connections.len(), 2);
+}

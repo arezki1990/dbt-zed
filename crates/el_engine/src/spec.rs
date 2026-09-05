@@ -52,6 +52,9 @@ pub enum WriteWarning {
 pub struct Connections {
     pub version: u32,
     pub connections: IndexMap<String, Connection>,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 /// One named connection. Every string value may contain `${VAR}`
@@ -68,7 +71,11 @@ pub enum Connection {
     S3(ObjectStoreConn),
     Gcs(ObjectStoreConn),
     Azure(ObjectStoreConn),
-    Local {},
+    Local {
+        #[serde(flatten)]
+        #[schemars(skip)]
+        extra: IndexMap<String, serde_yaml_ng::Value>,
+    },
 }
 
 impl Connection {
@@ -82,7 +89,7 @@ impl Connection {
             Connection::S3(_) => "s3",
             Connection::Gcs(_) => "gcs",
             Connection::Azure(_) => "azure",
-            Connection::Local {} => "local",
+            Connection::Local { .. } => "local",
         }
     }
 
@@ -103,6 +110,11 @@ pub struct DbConn {
     /// Full connection URL, e.g. `postgres://user:pass@host:5432/db` —
     /// normally `${SOME_URL}`.
     pub url: String,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 /// A DuckDB database file — the zero-credential source for local testing.
@@ -111,6 +123,11 @@ pub struct DuckdbConn {
     /// Project-relative or absolute path to the .duckdb file; may be
     /// `${VAR}`-templated.
     pub path: String,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -123,6 +140,11 @@ pub struct MssqlConn {
     pub password: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypt: Option<bool>,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -136,6 +158,11 @@ pub struct SnowflakeConn {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
     pub auth: SnowflakeAuth,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -155,6 +182,11 @@ pub struct ObjectStoreConn {
     pub secret_access_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
 // ---------------------------------------------------------------------------

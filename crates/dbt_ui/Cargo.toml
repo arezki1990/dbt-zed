@@ -26,6 +26,7 @@ paths.workspace = true
 smol.workspace = true
 language.workspace = true
 layout-rs.workspace = true
+menu.workspace = true
 project.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

@@ -24,6 +24,8 @@ pub struct ElPanel {
     pipelines: Vec<PathBuf>,
     /// (name, kind) — the credential posture: never values.
     connections: Vec<(SharedString, SharedString)>,
+    /// connections.yml failed to load (parse error — not absence).
+    connections_error: Option<SharedString>,
     /// Connections whose table list is unfolded in the explorer.
     expanded: std::collections::HashSet<SharedString>,
     tables: std::collections::HashMap<SharedString, TablesState>,
@@ -42,6 +44,7 @@ enum Row {
     Header(SharedString),
     Pipeline(PathBuf),
     Connection(SharedString, SharedString),
+    AddConnection,
     Table {
         connection: SharedString,
         schema: String,
@@ -80,6 +83,7 @@ impl ElPanel {
             root: None,
             pipelines: Vec::new(),
             connections: Vec::new(),
+            connections_error: None,
             expanded: Default::default(),
             tables: Default::default(),
             _list_tasks: Default::default(),
@@ -100,17 +104,31 @@ impl ElPanel {
         };
         let el = super::el_dir(&root);
         self.pipelines = el_engine::spec::list_pipelines(&el);
-        self.connections = el_engine::spec::load_connections(&el.join("connections.yml"))
-            .map(|connections| {
-                connections
+        match el_engine::spec::load_connections(&el.join("connections.yml")) {
+            Ok(connections) => {
+                self.connections = connections
                     .connections
                     .iter()
                     .map(|(name, connection)| {
                         (name.clone().into(), connection.kind().to_owned().into())
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect();
+                self.connections_error = None;
+            }
+            Err(el_engine::spec::SpecError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.connections = Vec::new();
+                self.connections_error = None;
+            }
+            Err(error) => {
+                // A broken file is not an empty file — say so instead of
+                // rendering a list that invites a destructive rewrite.
+                self.connections = Vec::new();
+                self.connections_error =
+                    Some(format!("connections.yml could not be read: {error}").into());
+            }
+        }
         cx.notify();
     }
 
@@ -128,7 +146,12 @@ impl ElPanel {
             rows.push(Row::Pipeline(path.clone()));
         }
         rows.push(Row::NewPipeline);
-        if !self.connections.is_empty() {
+        if let Some(error) = &self.connections_error {
+            rows.push(Row::Header("Connections".into()));
+            rows.push(Row::ConnNote(error.clone(), Color::Error));
+            return rows;
+        }
+        {
             rows.push(Row::Header("Connections".into()));
             for (name, kind) in &self.connections {
                 rows.push(Row::Connection(name.clone(), kind.clone()));
@@ -156,6 +179,7 @@ impl ElPanel {
                     }
                 }
             }
+            rows.push(Row::AddConnection);
         }
         rows
     }
@@ -208,6 +232,36 @@ impl ElPanel {
                 .ok();
             }),
         );
+    }
+
+    /// Called by the connection modal after a successful write: drops
+    /// stale table caches (names may have changed) and re-reads the spec.
+    pub fn connections_changed(&mut self, cx: &mut Context<Self>) {
+        self.tables.clear();
+        self.expanded.clear();
+        self.refresh(cx);
+    }
+
+    fn edit_connection(
+        &mut self,
+        editing: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.root.clone() else { return };
+        let panel = cx.entity().downgrade();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                super::connection_modal::ElConnectionModal::deploy(
+                    workspace,
+                    panel,
+                    root,
+                    editing.map(|name| name.to_string()),
+                    window,
+                    cx,
+                );
+            })
+            .ok();
     }
 
     fn query_table(
@@ -464,8 +518,30 @@ impl ElPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
+                .child({
+                    let name = name.clone();
+                    IconButton::new(("el-conn-edit", ix), IconName::Pencil)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Edit connection"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.edit_connection(Some(name.clone()), window, cx);
+                        }))
+                })
                 .into_any_element()
             }
+            Row::AddConnection => base
+                .cursor_pointer()
+                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    Label::new("Add connection")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.edit_connection(None, window, cx)
+                }))
+                .into_any_element(),
             Row::Table {
                 connection,
                 schema,

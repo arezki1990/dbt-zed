@@ -26,6 +26,34 @@ pub async fn write_spec(
     write_text(workspace, project, spec_path, text, cx).await
 }
 
+/// Pre-flight for multi-file writes: refuses before ANYTHING is written
+/// when any target buffer holds unsaved edits, so a rename can't strand a
+/// half-updated spec set.
+pub async fn check_clean(
+    project: Entity<Project>,
+    paths: &[PathBuf],
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    for path in paths {
+        let Some(project_path) = project.update(cx, |project, cx| {
+            project.project_path_for_absolute_path(path, cx)
+        }) else {
+            continue; // outside the project — the write itself will say so
+        };
+        let open = project.update(cx, |project, cx| project.open_buffer(project_path, cx));
+        let buffer = open.await.context("opening spec buffer")?;
+        if buffer.update(cx, |buffer, _| buffer.is_dirty()) {
+            anyhow::bail!(
+                "{} has unsaved edits — save or revert it first, then apply again",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("a spec file")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Same buffer-routed write for any canonical spec text (connections.yml).
 pub async fn write_text(
     workspace: WeakEntity<Workspace>,
