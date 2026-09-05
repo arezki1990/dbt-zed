@@ -8,6 +8,7 @@
 //!            --chunk-rows <n> --out-dir <dir>
 //!   seed-demo <path>   create a small demo DuckDB database
 
+mod duckdb_loader;
 mod snowflake_loader;
 
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ fn main() {
         Some("extract") => extract(&args[1..]),
         Some("seed-demo") => seed_demo(&args[1..]),
         Some("snowflake-loader") => snowflake_loader::serve(),
+        Some("duckdb-loader") => duckdb_loader::serve(),
         _ => {
             eprintln!(
                 "usage: zdbt-el-worker extract --kind duckdb --db <path> [--schema <s>] \
@@ -57,10 +59,6 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 fn extract(args: &[String]) -> Result<()> {
     let kind = flag(args, "--kind").context("--kind required")?;
-    if kind != "duckdb" {
-        bail!("unsupported source kind {kind:?} (this worker build supports: duckdb)");
-    }
-    let db = PathBuf::from(flag(args, "--db").context("--db required")?);
     let schema = flag(args, "--schema");
     let table = flag(args, "--table").context("--table required")?;
     let chunk_rows: usize = flag(args, "--chunk-rows")
@@ -69,7 +67,25 @@ fn extract(args: &[String]) -> Result<()> {
         .context("--chunk-rows must be a number")?;
     let out_dir = PathBuf::from(flag(args, "--out-dir").context("--out-dir required")?);
 
-    let mut extractor = DuckdbExtractor::new(&db, schema.as_deref(), &table, chunk_rows)?;
+    let mut extractor: Box<dyn el_engine::connectors::Extractor> = match kind.as_str() {
+        "duckdb" => {
+            let db = PathBuf::from(flag(args, "--db").context("--db required")?);
+            Box::new(DuckdbExtractor::new(&db, schema.as_deref(), &table, chunk_rows)?)
+        }
+        "postgres" => {
+            let url = std::env::var("ZDBT_EL_SRC_URL")
+                .context("ZDBT_EL_SRC_URL is not set in the worker environment")?;
+            Box::new(el_engine::connectors::postgres::PostgresExtractor::new(
+                &url,
+                schema.as_deref(),
+                &table,
+                chunk_rows,
+            )?)
+        }
+        other => bail!(
+            "unsupported source kind {other:?} (this worker build supports: duckdb, postgres)"
+        ),
+    };
     let schema = extractor.schema()?;
     emit(&WorkerEvent::Schema {
         columns: schema

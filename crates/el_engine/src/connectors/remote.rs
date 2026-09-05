@@ -121,6 +121,48 @@ impl RemoteExtractor {
     }
 }
 
+impl RemoteExtractor {
+    /// URL (with credentials) travels via the child environment, never argv.
+    pub fn spawn_postgres(
+        worker: &std::path::Path,
+        url: crate::env::Secret,
+        schema: Option<&str>,
+        table: &str,
+        chunk_rows: usize,
+    ) -> Result<Self> {
+        let scratch = tempfile::tempdir().context("creating worker scratch dir")?;
+        let mut command = Command::new(worker);
+        command
+            .arg("extract")
+            .arg("--kind")
+            .arg("postgres")
+            .arg("--table")
+            .arg(table)
+            .arg("--chunk-rows")
+            .arg(chunk_rows.to_string())
+            .arg("--out-dir")
+            .arg(scratch.path())
+            .env("ZDBT_EL_SRC_URL", url.expose())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(schema) = schema {
+            command.arg("--schema").arg(schema);
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawning connector worker {}", worker.display()))?;
+        let stdout = child.stdout.take().context("worker stdout")?;
+        Ok(Self {
+            child,
+            stdout: std::io::BufReader::new(stdout),
+            schema: None,
+            done: false,
+            _scratch: scratch,
+        })
+    }
+}
+
 impl Drop for RemoteExtractor {
     fn drop(&mut self) {
         let _ = self.child.kill();

@@ -17,9 +17,31 @@ use std::path::{Path, PathBuf};
 use gpui::{Context, Window};
 use workspace::Workspace;
 
-/// The EL directory for a dbt project root — `el/` beside dbt_project.yml.
+/// The EL directory for a project root — `el/` beside dbt_project.yml, or
+/// standalone: EL projects need no dbt project at all.
 pub fn el_dir(project_root: &Path) -> PathBuf {
     project_root.join("el")
+}
+
+/// The EL project root in this workspace: a dbt root when present, else
+/// any worktree already holding `el/`, else the first worktree (so
+/// Initialize can create a standalone EL project).
+pub fn discover_el_root(
+    workspace: &Workspace,
+    cx: &gpui::App,
+) -> Option<PathBuf> {
+    if let Some(root) = crate::database_panel::discover_workspace_root(workspace, cx) {
+        return Some(root);
+    }
+    let mut first = None;
+    for worktree in workspace.project().read(cx).worktrees(cx) {
+        let root = worktree.read(cx).abs_path().to_path_buf();
+        if root.join("el").is_dir() {
+            return Some(root);
+        }
+        first.get_or_insert(root);
+    }
+    first
 }
 
 /// Locates the on-demand connector worker binary: an explicit env
@@ -52,8 +74,8 @@ pub fn open_pipelines(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(root) = crate::database_panel::discover_workspace_root(workspace, cx) else {
-        notify(workspace, "No dbt project found in this workspace.", cx);
+    let Some(root) = discover_el_root(workspace, cx) else {
+        notify(workspace, "No project folder open in this workspace.", cx);
         return;
     };
     let pipelines = el_engine::spec::list_pipelines(&el_dir(&root));
@@ -76,8 +98,8 @@ pub fn initialize_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(root) = crate::database_panel::discover_workspace_root(workspace, cx) else {
-        notify(workspace, "No dbt project found in this workspace.", cx);
+    let Some(root) = discover_el_root(workspace, cx) else {
+        notify(workspace, "No project folder open in this workspace.", cx);
         return;
     };
     match scaffold::initialize_el_workspace(&root) {

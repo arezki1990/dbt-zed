@@ -181,10 +181,12 @@ impl DbtDatabasePanel {
         let root = match self.root.clone() {
             Some(root) => Some(root),
             None => {
-                let discovered = self
-                    .workspace
-                    .upgrade()
-                    .and_then(|workspace| discover_workspace_root(workspace.read(cx), cx));
+                let discovered = self.workspace.upgrade().and_then(|workspace| {
+                    let workspace = workspace.read(cx);
+                    // Standalone EL projects have no dbt_project.yml.
+                    discover_workspace_root(workspace, cx)
+                        .or_else(|| crate::el::discover_el_root(workspace, cx))
+                });
                 self.root = discovered.clone();
                 discovered
             }

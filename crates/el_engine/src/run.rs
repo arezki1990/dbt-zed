@@ -139,13 +139,27 @@ fn build_loader(
     env: &EnvMap,
 ) -> Result<Box<dyn Loader>> {
     let target_name = &request.pipeline.target.connection;
-    let Some(Connection::Snowflake(conn)) = connections.connections.get(target_name) else {
-        bail!("target connection {target_name:?} is not a snowflake connection");
-    };
     let Some(worker) = request.worker.clone() else {
         bail!(
             "connector support is not installed — the loader runs in the zdbt worker binary"
         );
+    };
+    // DuckDB warehouse: fully local, zero credentials — the test target.
+    if let Some(Connection::Duckdb(conn)) = connections.connections.get(target_name) {
+        let path = crate::env::resolve_templates(&conn.path, env)
+            .map_err(|missing| anyhow!("{missing}"))?;
+        let path = std::path::PathBuf::from(path.expose());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            request.project_root.join(path)
+        };
+        return Ok(Box::new(
+            crate::load::duckdb_sidecar::DuckdbSidecarLoader::spawn(&worker, &path)?,
+        ));
+    }
+    let Some(Connection::Snowflake(conn)) = connections.connections.get(target_name) else {
+        bail!("target connection {target_name:?} is not a snowflake or duckdb connection");
     };
     let Some(driver) = crate::load::adbc_sidecar::find_driver(request.driver.as_deref()) else {
         bail!(

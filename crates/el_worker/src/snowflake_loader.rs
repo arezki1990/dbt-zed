@@ -40,6 +40,11 @@ pub fn serve() -> Result<()> {
             }
         };
         match request {
+            Request::OpenDuckdb { .. } => {
+                respond(&Response::error(
+                    "this is the snowflake loader — duckdb requests go to duckdb-loader",
+                ));
+            }
             Request::Shutdown => {
                 respond(&Response::ok());
                 break;

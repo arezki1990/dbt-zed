@@ -443,10 +443,10 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
                 pipeline.target.connection
             ),
         ),
-        Some(conn) if conn.kind() != "snowflake" => issue(
+        Some(conn) if !matches!(conn.kind(), "snowflake" | "duckdb") => issue(
             None,
             format!(
-                "target connection {:?} is {} — the target must be snowflake",
+                "target connection {:?} is {} — targets must be snowflake or duckdb",
                 pipeline.target.connection,
                 conn.kind()
             ),

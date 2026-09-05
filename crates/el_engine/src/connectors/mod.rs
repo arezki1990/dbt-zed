@@ -6,6 +6,8 @@
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod files;
 pub mod remote;
 
@@ -71,7 +73,12 @@ pub fn make_extractor(
                     .context("resolving duckdb path")?;
                 duckdb_extractor(ctx, &db_path, schema.as_deref(), table, chunk_rows)
             }
-            Some(other) if matches!(other.kind(), "postgres" | "mysql" | "mssql") => bail!(
+            Some(Connection::Postgres(conn)) => {
+                let url = crate::env::resolve_templates(&conn.url, ctx.env)
+                    .map_err(|missing| anyhow::anyhow!("{missing}"))?;
+                postgres_extractor(ctx, url, schema.as_deref(), table, chunk_rows)
+            }
+            Some(other) if matches!(other.kind(), "mysql" | "mssql") => bail!(
                 "stream {:?}: {} sources are not implemented yet — coming in the next phase",
                 stream.name,
                 other.kind()
@@ -118,5 +125,40 @@ fn duckdb_extractor(
     };
     Ok(Box::new(remote::RemoteExtractor::spawn_duckdb(
         worker, db_path, schema, table, chunk_rows,
+    )?))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_extractor(
+    _ctx: &SourceContext,
+    url: crate::env::Secret,
+    schema: Option<&str>,
+    table: &str,
+    chunk_rows: usize,
+) -> Result<Box<dyn Extractor>> {
+    Ok(Box::new(postgres::PostgresExtractor::new(
+        url.expose(),
+        schema,
+        table,
+        chunk_rows,
+    )?))
+}
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_extractor(
+    ctx: &SourceContext,
+    url: crate::env::Secret,
+    schema: Option<&str>,
+    table: &str,
+    chunk_rows: usize,
+) -> Result<Box<dyn Extractor>> {
+    let Some(worker) = ctx.worker else {
+        bail!(
+            "database connector support is not installed — install the zdbt connector \
+             worker to extract from Postgres sources"
+        );
+    };
+    Ok(Box::new(remote::RemoteExtractor::spawn_postgres(
+        worker, url, schema, table, chunk_rows,
     )?))
 }

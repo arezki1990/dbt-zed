@@ -29,6 +29,10 @@ pub enum Request {
         schema: Option<String>,
         auth: AuthMethod,
     },
+    /// Opens a local DuckDB warehouse file instead of Snowflake.
+    OpenDuckdb {
+        path: PathBuf,
+    },
     Exec {
         sql: String,
     },

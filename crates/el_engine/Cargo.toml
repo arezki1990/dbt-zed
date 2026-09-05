@@ -17,6 +17,8 @@ default = []
 # Deliberately NOT default: database connectors compile into the
 # on-demand `el_worker` binary, never into the main app.
 duckdb = ["dep:duckdb", "dep:chrono"]
+# Postgres source connector (worker-only, same on-demand rule).
+postgres = ["dep:postgres", "dep:chrono"]
 # The ADBC driver-manager half of the spike, kept off the default build so
 # the polars cost can be measured in isolation.
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
@@ -57,6 +59,7 @@ polars = { version = "=0.55.2", default-features = false, features = [
 adbc_core = { version = "=0.24.0", optional = true }
 chrono = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
+postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 adbc_driver_manager = { version = "=0.24.0", optional = true }
 
 [dev-dependencies]

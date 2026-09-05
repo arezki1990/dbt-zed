@@ -3,6 +3,8 @@
 //! on-demand worker process (`adbc_sidecar`). Tests use `MockLoader`.
 
 pub mod adbc_sidecar;
+pub mod duckdb_sidecar;
+pub mod duckdb_sql;
 pub mod protocol;
 pub mod snowflake_sql;
 
