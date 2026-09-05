@@ -254,17 +254,25 @@ impl ElPipelineCanvas {
                     cx.notify();
                 }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 if this.drag_moved {
                     return;
                 }
-                let stream_ix = match this.layout.nodes.get(ix).map(|node| &node.kind) {
-                    Some(ElNodeKind::Stream { stream_ix })
-                    | Some(ElNodeKind::Map { stream_ix }) => Some(*stream_ix),
-                    _ => None,
-                };
-                if let Some(stream_ix) = stream_ix {
-                    this.open_mapping(stream_ix, window, cx);
+                match this.layout.nodes.get(ix).map(|node| node.kind.clone()) {
+                    Some(ElNodeKind::Stream { stream_ix }) => {
+                        this.preview_to_grid(stream_ix, false, window, cx);
+                    }
+                    Some(ElNodeKind::Map { stream_ix }) => {
+                        this.open_mapping(stream_ix, window, cx);
+                    }
+                    Some(ElNodeKind::Target) => {
+                        let position = match event {
+                            gpui::ClickEvent::Mouse(event) => event.up.position,
+                            _ => Point::default(),
+                        };
+                        this.preview_target(position, window, cx);
+                    }
+                    None => {}
                 }
             }))
             .child(
@@ -278,37 +286,7 @@ impl ElPipelineCanvas {
                                 .truncate(),
                         ),
                     )
-                    .children(match node.kind {
-                        // Data straight off the node: the stream's source
-                        // rows, or what the warehouse actually holds.
-                        ElNodeKind::Stream { stream_ix } => Some(
-                            IconButton::new(("el-node-preview", ix), IconName::Eye)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Preview data"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.preview_to_grid(stream_ix, false, window, cx);
-                                })),
-                        ),
-                        ElNodeKind::Target => Some(
-                            IconButton::new(("el-node-preview", ix), IconName::Eye)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Preview loaded table"))
-                                .on_click(cx.listener(
-                                    move |this, event: &gpui::ClickEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        let position = match event {
-                                            gpui::ClickEvent::Mouse(event) => event.up.position,
-                                            _ => Point::default(),
-                                        };
-                                        this.preview_target(position, window, cx);
-                                    },
-                                )),
-                        ),
-                        ElNodeKind::Map { .. } => None,
-                    }),
+                    ,
             )
             .child(
                 div()
