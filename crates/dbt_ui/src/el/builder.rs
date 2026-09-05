@@ -88,7 +88,22 @@ pub struct BuilderForm {
     pub connection_names: Vec<(SharedString, SharedString)>, // (name, kind)
     fields: Vec<Field>,
     pub format: FileFormat,
+    /// The source connection's live table list — check several, each
+    /// becomes a stream.
+    pub tables: TablesPick,
     pub error: Option<SharedString>,
+}
+
+/// The multi-select table picker's state for the Add-stream form.
+pub enum TablesPick {
+    /// File/local source, or no worker: type the table or path by hand.
+    Manual,
+    Loading,
+    Loaded {
+        items: Vec<(String, String)>,
+        selected: std::collections::HashSet<usize>,
+    },
+    Failed(SharedString),
 }
 
 /// What Apply produced: either or both files to write.
@@ -173,6 +188,7 @@ impl BuilderForm {
             connection_names,
             fields,
             format: FileFormat::Csv,
+            tables: TablesPick::Manual,
             error: None,
         }
     }
@@ -195,6 +211,46 @@ impl BuilderForm {
         match self.kind {
             BuilderKind::Source => {
                 let mut pipeline = pipeline.ok_or_else(|| anyhow::anyhow!("no pipeline open"))?;
+                if let Some(picked) = &self.picked_connection {
+                    pipeline.source = picked.to_string();
+                }
+                // Checked tables win: one stream per selection.
+                if let TablesPick::Loaded { items, selected } = &self.tables {
+                    if !selected.is_empty() {
+                        let mut added = 0usize;
+                        for ix in 0..items.len() {
+                            if !selected.contains(&ix) {
+                                continue;
+                            }
+                            let (schema, table) = &items[ix];
+                            if pipeline.streams.iter().any(|stream| stream.name == *table) {
+                                continue; // already a stream — skip quietly
+                            }
+                            pipeline.streams.push(StreamSpec {
+                                name: table.clone(),
+                                source: SourceObject::Table {
+                                    schema: Some(schema.clone()),
+                                    table: table.clone(),
+                                },
+                                mode: None,
+                                primary_key: vec![],
+                                update_key: None,
+                                target_table: None,
+                                select: None,
+                                columns: vec![],
+                                extra: IndexMap::new(),
+                            });
+                            added += 1;
+                        }
+                        if added == 0 {
+                            bail!("every checked table is already in the pipeline");
+                        }
+                        return Ok(BuilderOutcome {
+                            pipeline: Some(pipeline),
+                            connections: None,
+                        });
+                    }
+                }
                 let name = self.text(0, cx);
                 if name.is_empty() {
                     bail!("the stream needs a name");
@@ -206,9 +262,6 @@ impl BuilderForm {
                 let table_or_path = self.text(2, cx);
                 if table_or_path.is_empty() {
                     bail!("give the source a table or a file path");
-                }
-                if let Some(picked) = &self.picked_connection {
-                    pipeline.source = picked.to_string();
                 }
                 let source_kind = connections
                     .as_ref()
@@ -403,8 +456,14 @@ impl BuilderForm {
                         .label_size(LabelSize::XSmall)
                         .toggle_state(self.picked_connection.as_ref() == Some(&name))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(form) = &mut this.builder_mut() {
+                            let is_source = if let Some(form) = &mut this.builder_mut() {
                                 form.picked_connection = Some(name.clone());
+                                form.kind == BuilderKind::Source
+                            } else {
+                                false
+                            };
+                            if is_source {
+                                this.kick_builder_tables(cx);
                             }
                             cx.notify();
                         })),
@@ -415,7 +474,11 @@ impl BuilderForm {
         }
 
         // Format picker for file sources.
-        if self.kind == BuilderKind::Source {
+        let list_driven = matches!(
+            (&self.kind, &self.tables),
+            (BuilderKind::Source, TablesPick::Loading | TablesPick::Loaded { .. })
+        );
+        if self.kind == BuilderKind::Source && !list_driven {
             let mut formats = h_flex().w_full().px_2().pt_1().gap_1();
             for (format, label) in [
                 (FileFormat::Csv, "csv"),
@@ -437,10 +500,102 @@ impl BuilderForm {
             card = card.child(formats);
         }
 
+        let mut card = card;
+        if self.kind == BuilderKind::Source {
+            match &self.tables {
+                TablesPick::Manual => {}
+                TablesPick::Loading => {
+                    card = card.child(div().px_2().pt_2().child(
+                        Label::new("Loading tables…")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ));
+                }
+                TablesPick::Failed(message) => {
+                    card = card.child(div().px_2().pt_2().child(
+                        Label::new(message.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error),
+                    ));
+                }
+                TablesPick::Loaded { items, selected } => {
+                    let mut list = v_flex()
+                        .id("el-builder-tables")
+                        .w_full()
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .mt_2()
+                        .mx_2()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border);
+                    for (ix, (schema, table)) in items.iter().enumerate() {
+                        let checked = selected.contains(&ix);
+                        list = list.child(
+                            h_flex()
+                                .id(("el-builder-table", ix))
+                                .w_full()
+                                .px_2()
+                                .py_0p5()
+                                .gap_1()
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(colors.element_hover))
+                                .child(
+                                    Icon::new(if checked {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Circle
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(if checked { Color::Accent } else { Color::Muted }),
+                                )
+                                .child(
+                                    Label::new(format!("{schema}.{table}"))
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(form) = this.builder_mut() {
+                                        if let TablesPick::Loaded { selected, .. } =
+                                            &mut form.tables
+                                        {
+                                            if !selected.remove(&ix) {
+                                                selected.insert(ix);
+                                            }
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    let count = selected.len();
+                    card = card
+                        .child(div().px_2().pt_2().child(
+                            Label::new("Check tables — each becomes a stream.")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ))
+                        .child(list)
+                        .when(count > 0, |card| {
+                            card.child(div().px_2().pt_1().child(
+                                Label::new(format!("{count} selected"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ))
+                        });
+                }
+            }
+        }
+
         let mut fields = v_flex().w_full().p_2().gap_1();
+        let manual_source = self.kind == BuilderKind::Source && list_driven;
         let show_snowflake_fields =
             self.kind != BuilderKind::Connection || self.conn_type == ConnType::Snowflake;
         for (ix, field) in self.fields.iter().enumerate() {
+            if manual_source {
+                break;
+            }
             // Connection form: url/path for simple kinds, account/user/key
             // for snowflake.
             if self.kind == BuilderKind::Connection {
@@ -500,7 +655,15 @@ impl BuilderForm {
                         .on_click(cx.listener(|this, _, _, cx| this.close_builder(cx))),
                 )
                 .child(
-                    Button::new("el-builder-apply", "Add")
+                    Button::new(
+                        "el-builder-apply",
+                        match &self.tables {
+                            TablesPick::Loaded { selected, .. } if selected.len() > 1 => {
+                                SharedString::from(format!("Add {} streams", selected.len()))
+                            }
+                            _ => "Add".into(),
+                        },
+                    )
                         .label_size(LabelSize::Small)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.apply_builder(window, cx)

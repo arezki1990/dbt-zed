@@ -59,6 +59,7 @@ pub struct ElPipelineCanvas {
     _probe: Task<()>,
     _write: Task<()>,
     _preview: Task<()>,
+    _tables: Task<()>,
     _subscription: gpui::Subscription,
 }
 
@@ -124,6 +125,7 @@ impl ElPipelineCanvas {
             _probe: Task::ready(()),
             _write: Task::ready(()),
             _preview: Task::ready(()),
+            _tables: Task::ready(()),
             _subscription: subscription,
         };
         this.reload(cx);
@@ -351,6 +353,14 @@ impl ElPipelineCanvas {
             .min_h_0()
             .overflow_hidden()
             .bg(colors.editor_background)
+            .on_drop(cx.listener(
+                |this, dragged: &super::DraggedTable, window, cx| {
+                    this.drop_table(dragged.clone(), window, cx);
+                },
+            ))
+            .drag_over::<super::DraggedTable>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -737,6 +747,81 @@ impl ElPipelineCanvas {
                 });
             })
             .ok();
+    }
+
+    /// A table dropped from the EL panel becomes a stream. The dropped
+    /// table must come from this pipeline's source connection — except on
+    /// an empty pipeline, which adopts the dropped connection as source.
+    fn drop_table(
+        &mut self,
+        dragged: super::DraggedTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = &self.loaded else {
+            self.toast("Fix the pipeline's errors first.".into(), cx);
+            return;
+        };
+        let mut pipeline = (*loaded.pipeline).clone();
+        if pipeline.source != dragged.connection.as_ref() {
+            if pipeline.streams.is_empty() {
+                pipeline.source = dragged.connection.to_string();
+            } else {
+                self.toast(
+                    format!(
+                        "This pipeline reads from {} — drop one of its tables, or start \
+                         an empty pipeline for {}.",
+                        pipeline.source, dragged.connection
+                    ),
+                    cx,
+                );
+                return;
+            }
+        }
+        if pipeline
+            .streams
+            .iter()
+            .any(|stream| stream.name == dragged.table)
+        {
+            self.toast(format!("{} is already in the pipeline.", dragged.table), cx);
+            return;
+        }
+        pipeline.streams.push(el_engine::spec::StreamSpec {
+            name: dragged.table.clone(),
+            source: el_engine::spec::SourceObject::Table {
+                schema: Some(dragged.schema.clone()),
+                table: dragged.table.clone(),
+            },
+            mode: None,
+            primary_key: vec![],
+            update_key: None,
+            target_table: None,
+            select: None,
+            columns: vec![],
+            extra: Default::default(),
+        });
+        self.write_pipeline(pipeline, window, cx);
+    }
+
+    /// Buffer-routed write of an updated pipeline, then reload.
+    fn write_pipeline(
+        &mut self,
+        pipeline: Pipeline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        let spec_path = self.spec_path.clone();
+        self._write = cx.spawn_in(window, async move |this, cx| {
+            let result =
+                super::spec_io::write_spec(workspace, project, spec_path, pipeline, cx).await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => this.reload(cx),
+                Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+            })
+            .ok();
+        });
     }
 
     fn set_sync_mode(&mut self, mode: el_engine::spec::Mode, cx: &mut Context<Self>) {
@@ -1133,7 +1218,86 @@ impl ElPipelineCanvas {
             window,
             cx,
         ));
+        if kind == BuilderKind::Source {
+            self.kick_builder_tables(cx);
+        }
         cx.notify();
+    }
+
+    /// Fills the Add-stream form's table checklist from the picked source
+    /// connection, through the worker. File/local sources (or a missing
+    /// worker) stay on manual entry.
+    pub(crate) fn kick_builder_tables(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.builder else { return };
+        if form.kind != BuilderKind::Source {
+            return;
+        }
+        let connection_name = form
+            .picked_connection
+            .as_ref()
+            .map(|name| name.to_string())
+            .or_else(|| {
+                self.loaded
+                    .as_ref()
+                    .map(|loaded| loaded.pipeline.source.clone())
+            });
+        let Some(connection_name) = connection_name else { return };
+        let kind = loaded_connections(&self.project_root)
+            .and_then(|connections| {
+                connections
+                    .connections
+                    .get(&connection_name)
+                    .map(el_engine::spec::Connection::kind)
+            })
+            .unwrap_or("");
+        if !matches!(kind, "duckdb" | "postgres") {
+            if let Some(form) = self.builder_mut() {
+                form.tables = super::builder::TablesPick::Manual;
+            }
+            return;
+        }
+        let Some(worker) = super::find_worker() else {
+            if let Some(form) = self.builder_mut() {
+                form.tables = super::builder::TablesPick::Failed(
+                    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER."
+                        .into(),
+                );
+            }
+            return;
+        };
+        if let Some(form) = self.builder_mut() {
+            form.tables = super::builder::TablesPick::Loading;
+        }
+        let root = self.project_root.clone();
+        let task = cx.background_spawn(async move {
+            let connections = el_engine::spec::load_connections(
+                &super::el_dir(&root).join("connections.yml"),
+            )?;
+            let connection = connections
+                .connections
+                .get(&connection_name)
+                .ok_or_else(|| anyhow::anyhow!("connection is gone from connections.yml"))?;
+            let env = el_engine::env::EnvMap::load(&root, None);
+            el_engine::explore::list_tables(&worker, &root, connection, &env)
+        });
+        self._tables = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(form) = this.builder_mut() {
+                    form.tables = match result {
+                        Ok(items) => super::builder::TablesPick::Loaded {
+                            items,
+                            selected: Default::default(),
+                        },
+                        Err(error) => {
+                            super::builder::TablesPick::Failed(format!("{error:#}").into())
+                        }
+                    };
+                }
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     pub(crate) fn builder_mut(&mut self) -> Option<&mut BuilderForm> {

@@ -61,6 +61,26 @@ fn browsable(kind: &str) -> bool {
     matches!(kind, "duckdb" | "postgres")
 }
 
+/// The pill that follows the cursor while a table is dragged.
+struct DraggedTablePreview(SharedString);
+
+impl gpui::Render for DraggedTablePreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_focused)
+            .bg(colors.elevated_surface_background)
+            .shadow_md()
+            .child(Icon::new(IconName::Table).size(IconSize::XSmall).color(Color::Muted))
+            .child(Label::new(self.0.clone()).size(LabelSize::Small))
+    }
+}
+
 impl ElPanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -556,6 +576,12 @@ impl ElPanel {
                 let schema = schema.clone();
                 let table = table.clone();
                 let label = format!("{schema}.{table}");
+                let dragged = super::DraggedTable {
+                    connection: connection.clone(),
+                    schema: schema.clone(),
+                    table: table.clone(),
+                };
+                let drag_label: SharedString = label.clone().into();
                 base.cursor_pointer()
                     .pl_6()
                     .child(
@@ -564,6 +590,11 @@ impl ElPanel {
                             .color(Color::Muted),
                     )
                     .child(Label::new(label).size(LabelSize::Small).truncate())
+                    // Drag onto a pipeline canvas to add it as a stream.
+                    .on_drag(dragged, move |_, _, _, cx| {
+                        let drag_label = drag_label.clone();
+                        cx.new(|_| DraggedTablePreview(drag_label))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.query_table(
                             connection.clone(),

@@ -19,8 +19,17 @@ pub use runs_panel::ElRunsPanel;
 
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, Window};
+use gpui::{Context, SharedString, Window};
 use workspace::Workspace;
+
+/// A table dragged out of the EL panel's explorer — dropped on a pipeline
+/// canvas it becomes a stream.
+#[derive(Clone)]
+pub struct DraggedTable {
+    pub connection: SharedString,
+    pub schema: String,
+    pub table: String,
+}
 
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or
 /// standalone: EL projects need no dbt project at all.
