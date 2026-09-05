@@ -61,10 +61,17 @@ pub struct ElRunsPanel {
     remote_action_error: Option<SharedString>,
     remote_health: Option<SharedString>,
     remote_logs: Vec<SharedString>,
+    /// Logs live in a read-only editor so they can be selected/copied.
+    remote_log_editor: Entity<Editor>,
+    remote_logs_dirty: bool,
     remote_log_next: u64,
     remote_show_logs: bool,
     /// A pipeline opened in the detail view; None = overview.
     remote_detail: Option<SharedString>,
+    /// A run opened in the run-detail view (its per-stream breakdown).
+    remote_run_detail: Option<u64>,
+    remote_run_events: Vec<el_engine::ProgressEvent>,
+    remote_run_cursor: usize,
     /// Height of the pipelines section; the splitter drags it.
     remote_split: f32,
     /// (pointer y at drag start, split at drag start).
@@ -90,16 +97,39 @@ impl ElRunsPanel {
     }
 
     pub fn new(
-        _workspace: &mut Workspace,
+        workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_handle = cx.entity().downgrade();
+        let languages = workspace.project().read(cx).languages().clone();
         let sql = cx.new(|cx| {
             let mut editor = Editor::auto_height(3, 8, window, cx);
             editor.set_placeholder_text("SELECT …", window, cx);
             editor
         });
+        let remote_log_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+        // Give the query editor SQL syntax highlighting.
+        {
+            let sql = sql.clone();
+            cx.spawn(async move |_, cx| {
+                let Ok(language) = languages.language_for_name("dbt SQL").await else {
+                    return;
+                };
+                sql.update(cx, |editor, cx| {
+                    if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                        buffer.update(cx, |buffer, cx| {
+                            buffer.set_language(Some(language), cx)
+                        });
+                    }
+                });
+            })
+            .detach();
+        }
         cx.new(|cx| {
             let run_view = cx.new(|cx| ElRunView::new(workspace_handle.clone(), cx));
             Self {
@@ -127,9 +157,14 @@ impl ElRunsPanel {
                 remote_action_error: None,
                 remote_health: None,
                 remote_logs: Vec::new(),
+                remote_log_editor,
+                remote_logs_dirty: false,
                 remote_log_next: 0,
                 remote_show_logs: false,
                 remote_detail: None,
+                remote_run_detail: None,
+                remote_run_events: Vec::new(),
+                remote_run_cursor: 0,
                 remote_split: 170.,
                 remote_split_drag: None,
                 remote_epoch: 0,
@@ -166,6 +201,7 @@ impl ElRunsPanel {
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
         self.remote_detail = None;
+        self.remote_run_detail = None;
         self.result = None;
         self.query_error = None;
         self.elapsed = None;
@@ -260,6 +296,12 @@ impl ElRunsPanel {
                 let root = root.clone();
                 let name = name.clone();
                 let since = log_cursor;
+                let watched_run = this
+                    .read_with(cx, |this, _| {
+                        this.remote_run_detail.map(|id| (id, this.remote_run_cursor))
+                    })
+                    .ok()
+                    .flatten();
                 let fetch = cx
                     .background_spawn(async move {
                         let client = el_engine::server::RemoteClient::connect(&root, &name)?;
@@ -267,10 +309,16 @@ impl ElRunsPanel {
                         let runs = client.runs()?;
                         let health = client.health().ok();
                         let logs = client.logs(since).ok();
-                        anyhow::Ok((pipelines, runs, health, logs))
+                        let run_events = match watched_run {
+                            Some((run_id, cursor)) => {
+                                client.events(run_id, cursor).ok().map(|page| (run_id, page))
+                            }
+                            None => None,
+                        };
+                        anyhow::Ok((pipelines, runs, health, logs, run_events))
                     })
                     .await;
-                if let Ok((_, _, _, Some((_, next)))) = &fetch {
+                if let Ok((_, _, _, Some((_, next)), _)) = &fetch {
                     log_cursor = *next;
                 }
                 let keep_going = this
@@ -279,7 +327,13 @@ impl ElRunsPanel {
                             return false;
                         }
                         match fetch {
-                            Ok((pipelines, runs, health, logs)) => {
+                            Ok((pipelines, runs, health, logs, run_events)) => {
+                                if let Some((run_id, page)) = run_events {
+                                    if this.remote_run_detail == Some(run_id) {
+                                        this.remote_run_events.extend(page.events);
+                                        this.remote_run_cursor = page.next;
+                                    }
+                                }
                                 this.remote_pipelines = pipelines;
                                 this.remote_runs = runs;
                                 this.remote_error = None;
@@ -311,6 +365,9 @@ impl ElRunsPanel {
                                 });
                                 if let Some((lines, next)) = logs {
                                     this.remote_log_next = next;
+                                    if !lines.is_empty() {
+                                        this.remote_logs_dirty = true;
+                                    }
                                     this.remote_logs
                                         .extend(lines.into_iter().map(SharedString::from));
                                     let overflow =
@@ -536,7 +593,7 @@ impl ElRunsPanel {
                 )
                 .into_any_element()
         } else if let Some(result) = &self.result {
-            render_grid(result, &self.result_scroll, "el-query-grid")
+            render_grid(result, &self.result_scroll, "el-query-grid", cx.theme().colors().element_background)
         } else if self.connections.is_empty() {
             v_flex()
                 .flex_1()
@@ -573,8 +630,27 @@ impl ElRunsPanel {
 }
 
 impl ElRunsPanel {
-    fn render_remote(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_remote(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
+        if self.remote_logs_dirty {
+            self.remote_logs_dirty = false;
+            let text = self
+                .remote_logs
+                .iter()
+                .map(|line| line.as_ref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.remote_log_editor.update(cx, |editor, cx| {
+                editor.set_read_only(false);
+                editor.set_text(text, window, cx);
+                editor.set_read_only(true);
+                editor.move_to_end(&Default::default(), window, cx);
+            });
+        }
         let chips = h_flex().gap_1().flex_wrap().children(
             self.remotes
                 .iter()
@@ -590,6 +666,7 @@ impl ElRunsPanel {
                             this.remote_runs.clear();
                             this.remote_action_error = None;
                             this.remote_detail = None;
+                            this.remote_run_detail = None;
                             this.start_remote_poll(cx);
                             cx.notify();
                         }))
@@ -635,6 +712,8 @@ impl ElRunsPanel {
                         .color(Color::Muted),
                 )
                 .into_any_element()
+        } else if let Some(run_id) = self.remote_run_detail {
+            self.render_remote_run_detail(run_id, cx)
         } else if let Some(detail) = self.remote_detail.clone() {
             self.render_remote_detail(&detail, cx)
         } else {
@@ -642,28 +721,24 @@ impl ElRunsPanel {
         };
 
         if self.remote_show_logs {
-            let mut log_pane = v_flex()
+            let log_pane = v_flex()
                 .id("el-remote-logs-pane")
                 .h(px(140.))
                 .flex_shrink_0()
-                .overflow_y_scroll()
                 .border_t_1()
                 .border_color(colors.border)
                 .bg(colors.editor_background)
                 .px_2()
-                .py_1();
-            if self.remote_logs.is_empty() {
-                log_pane = log_pane.child(
+                .py_1()
+                .child(if self.remote_logs.is_empty() {
                     Label::new("No daemon activity yet.")
                         .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-            }
-            for line in self.remote_logs.iter().rev().take(200) {
-                log_pane = log_pane.child(
-                    Label::new(line.clone()).size(LabelSize::XSmall).color(Color::Muted),
-                );
-            }
+                        .color(Color::Muted)
+                        .into_any_element()
+                } else {
+                    // A read-only editor: selectable, copyable logs.
+                    self.remote_log_editor.clone().into_any_element()
+                });
             return v_flex()
                 .size_full()
                 .child(toolbar)
@@ -966,6 +1041,233 @@ impl ElRunsPanel {
             .into_any_element()
     }
 
+    /// One run's page: verdict facts and the per-stream breakdown
+    /// reconstructed from its event log (live while it runs).
+    fn render_remote_run_detail(
+        &mut self,
+        run_id: u64,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let run = self.remote_runs.iter().find(|run| run.id == run_id);
+        let is_running = run.is_some_and(|run| run.status == "running");
+        let status = run.map(|run| run.status.clone()).unwrap_or_else(|| "?".into());
+        let status_color = match status.as_str() {
+            "ok" => Color::Success,
+            "failed" => Color::Error,
+            "cancelled" => Color::Warning,
+            _ => Color::Accent,
+        };
+        let facts: SharedString = match run {
+            None => "no longer in the server's history".into(),
+            Some(run) => {
+                let mut text = format!(
+                    "started {} · {}",
+                    relative_time(run.started_unix, false),
+                    duration_text(run.started_unix, run.finished_unix)
+                );
+                if !is_running {
+                    text.push_str(&format!(" · {} rows", run.rows_written));
+                }
+                if run.attempt > 0 {
+                    text.push_str(&format!(" · retry {}", run.attempt));
+                }
+                text.into()
+            }
+        };
+        let header = h_flex()
+            .w_full()
+            .px_1()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                IconButton::new("el-run-back", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Back"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_run_detail = None;
+                        this.remote_run_events.clear();
+                        this.remote_run_cursor = 0;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Label::new(format!(
+                    "run #{run_id} · {}",
+                    run.map(|run| run.pipeline.clone()).unwrap_or_default()
+                ))
+                .size(LabelSize::Small),
+            )
+            .child(Label::new(status).size(LabelSize::XSmall).color(status_color))
+            .child(Label::new(facts).size(LabelSize::XSmall).color(Color::Muted))
+            .child(div().flex_1())
+            .children(is_running.then(|| {
+                Button::new("el-run-detail-cancel", "Cancel")
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remote_action(move |client| client.cancel(run_id), cx);
+                    }))
+            }));
+
+        // Fold the event log into per-stream rows.
+        #[derive(Default)]
+        struct StreamAgg {
+            phase: Option<String>,
+            read: u64,
+            written: u64,
+            casts: u64,
+            error: Option<String>,
+            done: bool,
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut agg: std::collections::HashMap<String, StreamAgg> = Default::default();
+        for event in &self.remote_run_events {
+            use el_engine::ProgressEvent as E;
+            match event {
+                E::RunStarted { streams, .. } => {
+                    for stream in streams {
+                        if !order.contains(stream) {
+                            order.push(stream.clone());
+                            agg.entry(stream.clone()).or_default();
+                        }
+                    }
+                }
+                E::StreamStarted { stream } => {
+                    agg.entry(stream.clone()).or_default().phase =
+                        Some("connect".to_owned());
+                }
+                E::Chunk {
+                    stream,
+                    phase,
+                    rows_read,
+                    rows_written,
+                    cast_failures,
+                } => {
+                    let entry = agg.entry(stream.clone()).or_default();
+                    entry.phase = Some(format!("{phase:?}").to_lowercase());
+                    entry.read = *rows_read;
+                    entry.written = *rows_written;
+                    entry.casts = *cast_failures;
+                }
+                E::StreamFinished {
+                    stream,
+                    rows_read,
+                    rows_written,
+                    cast_failures,
+                } => {
+                    let entry = agg.entry(stream.clone()).or_default();
+                    entry.phase = None;
+                    entry.read = *rows_read;
+                    entry.written = *rows_written;
+                    entry.casts = *cast_failures;
+                    entry.done = true;
+                }
+                E::StreamFailed { stream, error } => {
+                    let entry = agg.entry(stream.clone()).or_default();
+                    entry.phase = None;
+                    entry.error = Some(error.clone());
+                }
+                E::RunFinished { .. } => {}
+            }
+        }
+
+        let head = |width: f32, text: &'static str| {
+            div().w(px(width)).flex_shrink_0().child(
+                Label::new(text).size(LabelSize::XSmall).color(Color::Accent),
+            )
+        };
+        let stream_header = h_flex()
+            .w_full()
+            .px_2()
+            .gap_2()
+            .child(head(150., "stream"))
+            .child(head(80., "phase"))
+            .child(head(90., "rows read"))
+            .child(head(90., "rows written"))
+            .child(head(80., "cast fails"))
+            .child(
+                Label::new("status").size(LabelSize::XSmall).color(Color::Accent),
+            );
+        let mut rows = v_flex()
+            .id("el-run-streams")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_1();
+        if order.is_empty() {
+            rows = rows.child(div().px_1().py_1().child(
+                Label::new("Waiting for the run's events…")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ));
+        }
+        let cell = |width: f32, text: String, color: Color| {
+            div().w(px(width)).flex_shrink_0().overflow_hidden().child(
+                Label::new(text).size(LabelSize::XSmall).color(color).truncate(),
+            )
+        };
+        for (ix, stream) in order.iter().enumerate() {
+            let entry = agg.get(stream);
+            let (phase, read, written, casts, error, done) = entry
+                .map(|entry| {
+                    (
+                        entry.phase.clone(),
+                        entry.read,
+                        entry.written,
+                        entry.casts,
+                        entry.error.clone(),
+                        entry.done,
+                    )
+                })
+                .unwrap_or((None, 0, 0, 0, None, false));
+            let (status_text, status_color) = match (&error, done, &phase) {
+                (Some(error), _, _) => (error.clone(), Color::Error),
+                (None, true, _) => ("done".to_owned(), Color::Success),
+                (None, false, Some(_)) => ("running".to_owned(), Color::Accent),
+                (None, false, None) => ("queued".to_owned(), Color::Muted),
+            };
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .h(px(24.))
+                    .px_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_sm()
+                    .when(ix % 2 == 1, |row| row.bg(colors.element_background))
+                    .child(cell(150., stream.clone(), Color::Default))
+                    .child(cell(
+                        80.,
+                        phase.unwrap_or_else(|| "—".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(90., read.to_string(), Color::Muted))
+                    .child(cell(90., written.to_string(), Color::Default))
+                    .child(cell(
+                        80.,
+                        casts.to_string(),
+                        if casts > 0 { Color::Warning } else { Color::Muted },
+                    ))
+                    .child(
+                        Label::new(status_text)
+                            .size(LabelSize::XSmall)
+                            .color(status_color)
+                            .truncate(),
+                    ),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(stream_header)
+            .child(rows)
+            .into_any_element()
+    }
+
     /// The run-history table, striped; `filter` narrows to one pipeline.
     fn render_runs_table(
         &mut self,
@@ -1035,6 +1337,7 @@ impl ElRunsPanel {
                 )
             };
             let mut row = h_flex()
+                .id(("el-run-row", run.id as usize))
                 .w_full()
                 .h(px(24.))
                 .px_1()
@@ -1042,6 +1345,14 @@ impl ElRunsPanel {
                 .items_center()
                 .rounded_sm()
                 .when(stripe, |row| row.bg(colors.element_background))
+                .hover(|style| style.bg(colors.element_hover))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.remote_run_detail = Some(run_id);
+                    this.remote_run_events.clear();
+                    this.remote_run_cursor = 0;
+                    cx.notify();
+                }))
                 .child(cell(44., format!("#{}", run.id), Color::Muted));
             if show_pipeline {
                 row = row.child(cell(130., run.pipeline.clone(), Color::Default));
@@ -1152,6 +1463,7 @@ fn render_grid(
     table: &PreviewTable,
     scroll: &UniformListScrollHandle,
     list_id: &'static str,
+    stripe: gpui::Hsla,
 ) -> gpui::AnyElement {
     const COL_WIDTH: f32 = 170.;
     let columns = table.columns.clone();
@@ -1169,12 +1481,13 @@ fn render_grid(
     let list = gpui::uniform_list(list_id, count, {
         move |range, _, _| {
             range
-                .filter_map(|ix| rows.get(ix))
-                .map(|row| {
+                .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
+                .map(|(ix, row)| {
                     h_flex()
                         .w(total)
                         .h(px(24.))
                         .flex_shrink_0()
+                        .when(ix % 2 == 1, |row| row.bg(stripe))
                         .children(row.iter().map(|cell| {
                             div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
                                 Label::new(cell.clone()).size(LabelSize::XSmall).truncate(),
@@ -1252,7 +1565,7 @@ impl Panel for ElRunsPanel {
 }
 
 impl Render for ElRunsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let body: gpui::AnyElement = match &self.preview {
             Some(preview) => {
@@ -1280,7 +1593,7 @@ impl Render for ElRunsPanel {
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(render_grid(preview, &self.preview_scroll, "el-preview-rows"))
+                    .child(render_grid(preview, &self.preview_scroll, "el-preview-rows", colors.element_background))
                     .into_any_element()
             }
             None => {
@@ -1320,7 +1633,7 @@ impl Render for ElRunsPanel {
                 let content: gpui::AnyElement = match self.surface {
                     Surface::Runs => self.run_view.clone().into_any_element(),
                     Surface::Query => self.render_query(cx),
-                    Surface::Remote => self.render_remote(cx),
+                    Surface::Remote => self.render_remote(window, cx),
                 };
                 v_flex()
                     .size_full()
