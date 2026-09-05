@@ -65,14 +65,27 @@ impl PostgresExtractor {
         chunk_rows: usize,
         cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
+        // Bound the WHOLE handshake, not just the TCP connect: a proxy
+        // that accepts then blackholes must become an error, not a hang.
         let mut client = {
             use std::str::FromStr as _;
             let mut config = postgres::Config::from_str(url).context("parsing postgres url")?;
-            // An unreachable host must fail, not hang the run forever.
             config.connect_timeout(std::time::Duration::from_secs(10));
-            config
-                .connect(NoTls)
-                .context("connecting to postgres (10s timeout; TLS comes later)")?
+            let (tx, rx) = std::sync::mpsc::channel();
+            let attempt = std::thread::spawn(move || {
+                let _ = tx.send(config.connect(NoTls));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(result) => {
+                    result.context("connecting to postgres (TLS comes in a later phase)")?
+                }
+                Err(_) => {
+                    drop(attempt);
+                    anyhow::bail!(
+                        "connecting to postgres timed out after 15s — is the database up?"
+                    )
+                }
+            }
         };
 
         let relation = match schema {

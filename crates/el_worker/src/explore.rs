@@ -13,15 +13,25 @@ fn emit(event: &ExploreEvent) {
     }
 }
 
-/// Connect with a hard 10s timeout — an unreachable database must
-/// become an error, never an indefinite hang.
+/// Connect with a hard 15s deadline on the WHOLE handshake — a proxy
+/// that accepts TCP then blackholes (wedged Docker) hangs past any
+/// socket-level connect_timeout, so the attempt runs on its own thread
+/// and is abandoned at the deadline.
 fn pg_connect(url: &str) -> Result<postgres::Client> {
     use std::str::FromStr as _;
     let mut config = postgres::Config::from_str(url).context("parsing postgres url")?;
     config.connect_timeout(std::time::Duration::from_secs(10));
-    config
-        .connect(postgres::NoTls)
-        .context("connecting to postgres (10s timeout)")
+    let (tx, rx) = std::sync::mpsc::channel();
+    let attempt = std::thread::spawn(move || {
+        let _ = tx.send(config.connect(postgres::NoTls));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        Ok(result) => result.context("connecting to postgres"),
+        Err(_) => {
+            drop(attempt); // the thread dies with the process
+            anyhow::bail!("connecting to postgres timed out after 15s — is the database up?")
+        }
+    }
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
