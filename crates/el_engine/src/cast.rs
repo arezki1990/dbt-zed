@@ -200,6 +200,15 @@ impl CastPlan {
         Ok(CastOutcome { df: out, failures })
     }
 
+    /// Source column names in plan order — pairs with target_columns for
+    /// rename-aware lookups.
+    pub fn source_names(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .map(|column| column.source_name.clone())
+            .collect()
+    }
+
     /// The ordered (target column name, Snowflake type) list — target DDL
     /// order and the schema-drift fingerprint input.
     pub fn target_columns(&self) -> Vec<(String, SnowflakeType)> {

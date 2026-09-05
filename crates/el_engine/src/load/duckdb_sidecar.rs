@@ -105,6 +105,13 @@ impl Loader for DuckdbSidecarLoader {
     fn begin(&mut self, plan: &StreamPlan) -> Result<()> {
         self.staged_rows = 0;
         self.exec(duckdb_sql::create_schema(&plan.schema))?;
+        if plan.mode == crate::spec::Mode::Incremental {
+            self.exec(duckdb_sql::create_target_if_not_exists(
+                &plan.schema,
+                &plan.target_table,
+                &plan.columns,
+            ))?;
+        }
         self.exec(duckdb_sql::create_staging(
             &plan.schema,
             &plan.target_table,
@@ -138,10 +145,31 @@ impl Loader for DuckdbSidecarLoader {
     }
 
     fn commit(&mut self, plan: &StreamPlan) -> Result<LoadReport> {
-        self.exec(duckdb_sql::swap(&plan.schema, &plan.target_table))?;
+        let mut watermark_scalar = None;
+        if plan.mode == crate::spec::Mode::Incremental {
+            let (update_key, _) = plan
+                .update_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("incremental commit without update_key"))?;
+            self.exec(duckdb_sql::upsert(
+                &plan.schema,
+                &plan.target_table,
+                &plan.primary_key,
+                update_key,
+            ))?;
+            let response = self.request(&Request::QueryScalar {
+                sql: duckdb_sql::max_scalar(&plan.schema, &plan.target_table, update_key),
+            })?;
+            watermark_scalar = response
+                .scalar
+                .and_then(|value| value.as_str().map(str::to_owned));
+        } else {
+            self.exec(duckdb_sql::swap(&plan.schema, &plan.target_table))?;
+        }
         self.exec(duckdb_sql::drop_staging(&plan.schema, &plan.target_table))?;
         Ok(LoadReport {
             rows_written: self.staged_rows,
+            watermark_scalar,
         })
     }
 

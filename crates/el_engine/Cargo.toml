@@ -31,7 +31,9 @@ log.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_yaml_ng.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 # Exact-pinned: the 0.5x Rust API churns between minor versions.

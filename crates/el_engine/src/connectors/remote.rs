@@ -41,6 +41,7 @@ impl RemoteExtractor {
         schema: Option<&str>,
         table: &str,
         chunk_rows: usize,
+        cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
         let scratch = tempfile::tempdir().context("creating worker scratch dir")?;
         let mut command = Command::new(worker);
@@ -61,6 +62,13 @@ impl RemoteExtractor {
             .stderr(Stdio::piped());
         if let Some(schema) = schema {
             command.arg("--schema").arg(schema);
+        }
+        if let Some((column, value)) = &cursor {
+            command
+                .arg("--update-key")
+                .arg(column)
+                .arg("--cursor")
+                .arg(serde_json::to_string(value).context("encoding cursor")?);
         }
         let mut child = command
             .spawn()
@@ -129,6 +137,7 @@ impl RemoteExtractor {
         schema: Option<&str>,
         table: &str,
         chunk_rows: usize,
+        cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
         let scratch = tempfile::tempdir().context("creating worker scratch dir")?;
         let mut command = Command::new(worker);
@@ -148,6 +157,13 @@ impl RemoteExtractor {
             .stderr(Stdio::piped());
         if let Some(schema) = schema {
             command.arg("--schema").arg(schema);
+        }
+        if let Some((column, value)) = &cursor {
+            command
+                .arg("--update-key")
+                .arg(column)
+                .arg("--cursor")
+                .arg(serde_json::to_string(value).context("encoding cursor")?);
         }
         let mut child = command
             .spawn()

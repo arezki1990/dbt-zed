@@ -135,6 +135,14 @@ impl Drop for AdbcSidecarLoader {
 impl Loader for AdbcSidecarLoader {
     fn begin(&mut self, plan: &StreamPlan) -> Result<()> {
         self.staged_rows = 0;
+        if plan.mode == crate::spec::Mode::Incremental {
+            self.exec(snowflake_sql::create_target_if_not_exists(
+                plan.database.as_deref(),
+                &plan.schema,
+                &plan.target_table,
+                &plan.columns,
+            ))?;
+        }
         self.exec(snowflake_sql::create_staging(
             plan.database.as_deref(),
             &plan.schema,
@@ -171,11 +179,38 @@ impl Loader for AdbcSidecarLoader {
     }
 
     fn commit(&mut self, plan: &StreamPlan) -> Result<LoadReport> {
-        self.exec(snowflake_sql::clone_swap(
-            plan.database.as_deref(),
-            &plan.schema,
-            &plan.target_table,
-        ))?;
+        let mut watermark_scalar = None;
+        if plan.mode == crate::spec::Mode::Incremental {
+            let (update_key, _) = plan
+                .update_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("incremental commit without update_key"))?;
+            self.exec(snowflake_sql::merge(
+                plan.database.as_deref(),
+                &plan.schema,
+                &plan.target_table,
+                &plan.columns,
+                &plan.primary_key,
+                update_key,
+            ))?;
+            let response = self.request(&Request::QueryScalar {
+                sql: snowflake_sql::max_scalar(
+                    plan.database.as_deref(),
+                    &plan.schema,
+                    &plan.target_table,
+                    update_key,
+                ),
+            })?;
+            watermark_scalar = response
+                .scalar
+                .and_then(|value| value.as_str().map(str::to_owned));
+        } else {
+            self.exec(snowflake_sql::clone_swap(
+                plan.database.as_deref(),
+                &plan.schema,
+                &plan.target_table,
+            ))?;
+        }
         self.exec(snowflake_sql::drop_staging(
             plan.database.as_deref(),
             &plan.schema,
@@ -183,6 +218,7 @@ impl Loader for AdbcSidecarLoader {
         ))?;
         Ok(LoadReport {
             rows_written: self.staged_rows,
+            watermark_scalar,
         })
     }
 

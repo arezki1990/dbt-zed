@@ -71,7 +71,7 @@ fn preview(
     cancel: &CancelFlag,
 ) -> Result<PreviewResult> {
     let limit = limit.clamp(1, 10_000);
-    let mut extractor = crate::connectors::make_extractor(ctx, stream, limit)?;
+    let mut extractor = crate::connectors::make_extractor(ctx, stream, limit, None)?;
     let schema = extractor.schema()?;
     let plan = CastPlan::build(&schema, stream)?;
 

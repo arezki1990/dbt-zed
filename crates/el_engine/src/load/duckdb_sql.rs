@@ -71,6 +71,56 @@ pub fn swap(schema: &str, target_table: &str) -> String {
     )
 }
 
+pub fn create_target_if_not_exists(
+    schema: &str,
+    target_table: &str,
+    columns: &[(String, SnowflakeType)],
+) -> String {
+    let column_list = columns
+        .iter()
+        .map(|(name, sf_type)| format!("{} {}", quote_ident(name), ddl_type(sf_type)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({column_list})",
+        fqn(schema, target_table)
+    )
+}
+
+/// Incremental commit as delete-then-insert with staged dedupe (DuckDB
+/// supports QUALIFY): deterministic and version-proof.
+pub fn upsert(
+    schema: &str,
+    target_table: &str,
+    primary_key: &[String],
+    update_key: &str,
+) -> String {
+    let staging = fqn(schema, &staging_table_name(target_table));
+    let target = fqn(schema, target_table);
+    let pk_list = primary_key
+        .iter()
+        .map(|key| quote_ident(key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let on = primary_key
+        .iter()
+        .map(|key| format!("{target}.{k} = s.{k}", k = quote_ident(key)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "DELETE FROM {target} USING {staging} s WHERE {on};          INSERT INTO {target} SELECT * FROM (         SELECT * FROM {staging}          QUALIFY ROW_NUMBER() OVER (PARTITION BY {pk_list} ORDER BY {uk} DESC) = 1)",
+        uk = quote_ident(update_key),
+    )
+}
+
+pub fn max_scalar(schema: &str, table: &str, column: &str) -> String {
+    format!(
+        "SELECT CAST(MAX({}) AS VARCHAR) FROM {}",
+        quote_ident(column),
+        fqn(schema, table)
+    )
+}
+
 pub fn drop_staging(schema: &str, target_table: &str) -> String {
     format!(
         "DROP TABLE IF EXISTS {}",

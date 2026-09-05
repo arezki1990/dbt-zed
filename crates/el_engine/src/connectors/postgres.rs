@@ -63,6 +63,7 @@ impl PostgresExtractor {
         schema: Option<&str>,
         table: &str,
         chunk_rows: usize,
+        cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
         let mut client = Client::connect(url, NoTls)
             .context("connecting to postgres (TLS connections come in a later phase)")?;
@@ -98,10 +99,18 @@ impl PostgresExtractor {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let suffix = match &cursor {
+            Some((column, value)) => format!(
+                " WHERE {c} > {lit} ORDER BY {c}",
+                c = quote_ident(column),
+                lit = value.to_sql_literal()
+            ),
+            None => String::new(),
+        };
         Ok(Self {
             client,
             columns,
-            query: format!("SELECT {select_list} FROM {relation}"),
+            query: format!("SELECT {select_list} FROM {relation}{suffix}"),
             chunk_rows: chunk_rows.max(1),
             started: false,
             done: false,
@@ -305,7 +314,7 @@ mod tests {
             .unwrap();
         drop(client);
 
-        let mut extractor = PostgresExtractor::new(&url, None, "zdbt_el_smoke", 2).unwrap();
+        let mut extractor = PostgresExtractor::new(&url, None, "zdbt_el_smoke", 2, None).unwrap();
         let schema = extractor.schema().unwrap();
         assert_eq!(schema.get("amount").unwrap(), &DataType::String);
         let mut total = 0;

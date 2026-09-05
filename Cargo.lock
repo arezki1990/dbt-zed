@@ -6600,10 +6600,12 @@ dependencies = [
  "log",
  "polars",
  "postgres",
+ "rusqlite",
  "schemars 1.0.4",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.17",
 ]
@@ -6619,6 +6621,7 @@ dependencies = [
  "arrow-ipc",
  "duckdb",
  "el_engine",
+ "futures 0.3.32",
  "serde_json",
  "tempfile",
 ]

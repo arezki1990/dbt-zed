@@ -71,6 +71,80 @@ pub fn drop_staging(database: Option<&str>, schema: &str, target_table: &str) ->
     )
 }
 
+/// First incremental run: the target must exist before MERGE.
+pub fn create_target_if_not_exists(
+    database: Option<&str>,
+    schema: &str,
+    target_table: &str,
+    columns: &[(String, SnowflakeType)],
+) -> String {
+    let column_list = columns
+        .iter()
+        .map(|(name, sf_type)| format!("{} {}", quote_ident(name), ddl_type(sf_type)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({column_list})",
+        fqn(database, schema, target_table)
+    )
+}
+
+/// Incremental commit: staging deduped per key (latest cursor wins) is
+/// merged into the target.
+pub fn merge(
+    database: Option<&str>,
+    schema: &str,
+    target_table: &str,
+    columns: &[(String, SnowflakeType)],
+    primary_key: &[String],
+    update_key: &str,
+) -> String {
+    let staging = fqn(database, schema, &staging_table_name(target_table));
+    let target = fqn(database, schema, target_table);
+    let pk_list = primary_key
+        .iter()
+        .map(|key| quote_ident(key))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let on = primary_key
+        .iter()
+        .map(|key| format!("t.{k} = s.{k}", k = quote_ident(key)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let non_pk: Vec<&(String, SnowflakeType)> = columns
+        .iter()
+        .filter(|(name, _)| !primary_key.iter().any(|key| key == name))
+        .collect();
+    let update_set = non_pk
+        .iter()
+        .map(|(name, _)| format!("{c} = s.{c}", c = quote_ident(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let all_cols = columns
+        .iter()
+        .map(|(name, _)| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = columns
+        .iter()
+        .map(|(name, _)| format!("s.{}", quote_ident(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "MERGE INTO {target} t USING (         SELECT * FROM {staging}          QUALIFY ROW_NUMBER() OVER (PARTITION BY {pk_list} ORDER BY {uk} DESC) = 1         ) s ON {on}          WHEN MATCHED THEN UPDATE SET {update_set}          WHEN NOT MATCHED THEN INSERT ({all_cols}) VALUES ({insert_vals})",
+        uk = quote_ident(update_key),
+    )
+}
+
+/// The cursor read back from the TARGET after commit.
+pub fn max_scalar(database: Option<&str>, schema: &str, table: &str, column: &str) -> String {
+    format!(
+        "SELECT MAX({}) FROM {}",
+        quote_ident(column),
+        fqn(database, schema, table)
+    )
+}
+
 pub fn count_rows(database: Option<&str>, schema: &str, table: &str) -> String {
     format!("SELECT COUNT(*) FROM {}", fqn(database, schema, table))
 }

@@ -87,26 +87,37 @@ pub fn run_pipeline(
         worker: request.worker.as_deref(),
     };
 
+    let state = crate::state::StateStore::open(&request.project_root)
+        .context("opening incremental state store")?;
+
     let mut report = RunReport::default();
     for stream in &pipeline.streams {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        if stream.mode(pipeline.defaults.as_ref()) == Mode::Incremental {
-            emit(ProgressEvent::StreamFailed {
-                stream: stream.name.clone(),
-                error: "incremental mode ships in the next phase — run as full_refresh".into(),
-            });
-            report.streams_failed += 1;
-            continue;
-        }
         emit(ProgressEvent::StreamStarted {
             stream: stream.name.clone(),
         });
-        match run_stream(&ctx, pipeline, stream, loader.as_mut(), request, &emit, cancel) {
+        match run_stream(
+            &ctx,
+            pipeline,
+            stream,
+            loader.as_mut(),
+            request,
+            &state,
+            &emit,
+            cancel,
+        ) {
             Ok((rows_read, rows_written, cast_failures)) => {
                 report.streams_ok += 1;
                 report.rows_written += rows_written;
+                let _ = state.record_run(
+                    &pipeline.pipeline,
+                    &stream.name,
+                    "ok",
+                    rows_read,
+                    rows_written,
+                );
                 emit(ProgressEvent::StreamFinished {
                     stream: stream.name.clone(),
                     rows_read,
@@ -116,6 +127,7 @@ pub fn run_pipeline(
             }
             Err(error) => {
                 report.streams_failed += 1;
+                let _ = state.record_run(&pipeline.pipeline, &stream.name, "failed", 0, 0);
                 emit(ProgressEvent::StreamFailed {
                     stream: stream.name.clone(),
                     error: format!("{error:#}"),
@@ -213,10 +225,18 @@ fn run_stream(
     stream: &crate::spec::StreamSpec,
     loader: &mut dyn Loader,
     request: &RunRequest,
+    state: &crate::state::StateStore,
     emit: &dyn Fn(ProgressEvent),
     cancel: &CancelFlag,
 ) -> Result<(u64, u64, u64)> {
-    let mut extractor = crate::connectors::make_extractor(ctx, stream, request.chunk_rows)?;
+    let mode = stream.mode(pipeline.defaults.as_ref());
+    // The incremental cursor from the last successful commit. Stream name
+    // is the cursor's identity: rename the stream, reset the cursor.
+    let resume = (mode == Mode::Incremental)
+        .then(|| state.watermark(&pipeline.pipeline, &stream.name))
+        .flatten();
+    let mut extractor =
+        crate::connectors::make_extractor(ctx, stream, request.chunk_rows, resume.as_ref())?;
     emit(ProgressEvent::Chunk {
         stream: stream.name.clone(),
         phase: Phase::Connect,
@@ -227,11 +247,40 @@ fn run_stream(
     let schema = extractor.schema()?;
     let plan = CastPlan::build(&schema, stream)?;
 
+    // Target-side names for pk/cursor: renames apply.
+    let target_name_of = |source: &str| -> String {
+        plan.target_columns()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .zip(plan.source_names())
+            .find(|(_, src)| src == source)
+            .map(|(target, _)| target)
+            .unwrap_or_else(|| source.to_owned())
+    };
+    let update_key = stream.update_key.as_ref().map(|source| {
+        let target = target_name_of(source);
+        let sf_type = plan
+            .target_columns()
+            .iter()
+            .find(|(name, _)| name == &target)
+            .map(|(_, sf_type)| sf_type.clone())
+            .unwrap_or_else(|| crate::types::SnowflakeType::from_polars(
+                &polars::prelude::DataType::String,
+            ));
+        (target, sf_type)
+    });
     let stream_plan = StreamPlan {
         database: pipeline.target.database.clone(),
         schema: pipeline.target.schema.clone(),
         target_table: stream.target_table(&pipeline.target),
         columns: plan.target_columns(),
+        mode,
+        primary_key: stream
+            .primary_key
+            .iter()
+            .map(|key| target_name_of(key))
+            .collect(),
+        update_key,
     };
 
     loader.begin(&stream_plan)?;
@@ -290,7 +339,25 @@ fn run_stream(
                 cast_failures,
             });
             match loader.commit(&stream_plan) {
-                Ok(commit) => Ok((rows_read, commit.rows_written, cast_failures)),
+                Ok(commit) => {
+                    // Persist the cursor read back FROM THE TARGET — a
+                    // crash between load and this write only re-extracts
+                    // rows the MERGE absorbs.
+                    if let (Some(scalar), Some((_, sf_type))) =
+                        (&commit.watermark_scalar, &stream_plan.update_key)
+                    {
+                        if let Some(watermark) =
+                            crate::state::WatermarkValue::parse_scalar(scalar, sf_type)
+                        {
+                            let _ = state.set_watermark(
+                                &pipeline.pipeline,
+                                &stream.name,
+                                &watermark,
+                            );
+                        }
+                    }
+                    Ok((rows_read, commit.rows_written, cast_failures))
+                }
                 Err(error) => {
                     // A failed commit must not leak the staging table.
                     let _ = loader.abort(&stream_plan);
@@ -374,16 +441,21 @@ streams:
         let emit = |event: ProgressEvent| {
             let _ = tx.unbounded_send(event);
         };
+        let state_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };
+        let state = crate::state::StateStore::open(dir.path()).unwrap();
         let (rows_read, rows_written, cast_failures) = run_stream(
             &ctx,
             &pipeline,
             &pipeline.streams[0],
             &mut loader,
             &request,
+            &state,
             &emit,
             &cancel,
         )
         .unwrap();
+        unsafe { std::env::remove_var("ZDBT_EL_STATE_DIR") };
 
         assert_eq!(rows_read, 3);
         assert_eq!(rows_written, 3);
@@ -426,15 +498,20 @@ streams:
             driver: None,
             chunk_rows: 10,
         };
+        let state_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };
+        let state = crate::state::StateStore::open(dir.path()).unwrap();
         let result = run_stream(
             &ctx,
             &pipeline,
             &pipeline.streams[0],
             &mut loader,
             &request,
+            &state,
             &|_| {},
             &cancel,
         );
+        unsafe { std::env::remove_var("ZDBT_EL_STATE_DIR") };
         assert!(result.is_err());
         assert!(
             loader.statements.last().unwrap().contains("DROP TABLE"),

@@ -11,6 +11,7 @@ pub mod snowflake_sql;
 use anyhow::Result;
 use polars::prelude::DataFrame;
 
+use crate::spec::Mode;
 use crate::types::SnowflakeType;
 
 /// One stream's load plan, resolved from the spec.
@@ -20,10 +21,19 @@ pub struct StreamPlan {
     pub target_table: String,
     /// Ordered target columns — OUR DDL, never driver inference.
     pub columns: Vec<(String, SnowflakeType)>,
+    pub mode: Mode,
+    /// Target-side names (post-rename).
+    pub primary_key: Vec<String>,
+    /// Target-side cursor column and its type, for MERGE ordering and the
+    /// post-commit MAX() read-back.
+    pub update_key: Option<(String, SnowflakeType)>,
 }
 
 pub struct LoadReport {
     pub rows_written: u64,
+    /// The cursor read back from the TARGET after an incremental commit,
+    /// as the warehouse printed it.
+    pub watermark_scalar: Option<String>,
 }
 
 pub trait Loader: Send {
@@ -71,6 +81,26 @@ impl Loader for MockLoader {
         if self.fail_on_commit {
             anyhow::bail!("mock commit failure");
         }
+        if plan.mode == Mode::Incremental {
+            let (update_key, _) = plan.update_key.as_ref().expect("validated");
+            self.statements.push(snowflake_sql::merge(
+                plan.database.as_deref(),
+                &plan.schema,
+                &plan.target_table,
+                &plan.columns,
+                &plan.primary_key,
+                update_key,
+            ));
+            self.statements.push(snowflake_sql::drop_staging(
+                plan.database.as_deref(),
+                &plan.schema,
+                &plan.target_table,
+            ));
+            return Ok(LoadReport {
+                rows_written: self.staged_rows,
+                watermark_scalar: Some("2026-01-07".to_owned()),
+            });
+        }
         self.statements.push(snowflake_sql::clone_swap(
             plan.database.as_deref(),
             &plan.schema,
@@ -83,6 +113,7 @@ impl Loader for MockLoader {
         ));
         Ok(LoadReport {
             rows_written: self.staged_rows,
+            watermark_scalar: None,
         })
     }
 

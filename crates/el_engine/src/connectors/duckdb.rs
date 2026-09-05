@@ -39,6 +39,8 @@ pub struct DuckdbExtractor {
     chunk_rows: usize,
     offset: usize,
     exhausted: bool,
+    /// Incremental cursor: WHERE <col> > <literal>, ordered by <col>.
+    cursor: Option<(String, crate::state::WatermarkValue)>,
 }
 
 fn quote_ident(name: &str) -> String {
@@ -51,6 +53,7 @@ impl DuckdbExtractor {
         schema: Option<&str>,
         table: &str,
         chunk_rows: usize,
+        cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
         let config = duckdb::Config::default()
             .access_mode(duckdb::AccessMode::ReadOnly)
@@ -107,6 +110,7 @@ impl DuckdbExtractor {
             chunk_rows: chunk_rows.max(1),
             offset: 0,
             exhausted: false,
+            cursor,
         })
     }
 
@@ -169,9 +173,17 @@ impl super::Extractor for DuckdbExtractor {
             .map(|column| column.select_expr.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        // ORDER BY ALL keeps LIMIT/OFFSET pagination deterministic.
+        // ORDER BY keeps LIMIT/OFFSET pagination deterministic; with a
+        // cursor, order by it and skip already-loaded rows.
+        let (where_clause, order_by) = match &self.cursor {
+            Some((column, value)) => (
+                format!("WHERE {} > {} ", quote_ident(column), value.to_sql_literal()),
+                format!("ORDER BY {}", quote_ident(column)),
+            ),
+            None => (String::new(), "ORDER BY ALL".to_owned()),
+        };
         let sql = format!(
-            "SELECT {select_list} FROM {} ORDER BY ALL LIMIT {} OFFSET {}",
+            "SELECT {select_list} FROM {} {where_clause}{order_by} LIMIT {} OFFSET {}",
             self.relation, self.chunk_rows, self.offset
         );
 
@@ -348,7 +360,7 @@ INSERT INTO main.people VALUES
         let db = dir.path().join("t.duckdb");
         seed(&db);
 
-        let mut extractor = DuckdbExtractor::new(&db, Some("main"), "people", 100).unwrap();
+        let mut extractor = DuckdbExtractor::new(&db, Some("main"), "people", 100, None).unwrap();
         let schema = extractor.schema().unwrap();
         let dtype = |name: &str| schema.get(name).unwrap().clone();
         assert_eq!(dtype("id"), DataType::Int64);
@@ -384,7 +396,7 @@ INSERT INTO main.people VALUES
         let db = dir.path().join("t.duckdb");
         seed(&db);
 
-        let mut extractor = DuckdbExtractor::new(&db, None, "people", 2).unwrap();
+        let mut extractor = DuckdbExtractor::new(&db, None, "people", 2, None).unwrap();
         let first = extractor.next_chunk().unwrap().unwrap();
         let second = extractor.next_chunk().unwrap().unwrap();
         assert_eq!(first.height(), 2);
@@ -400,7 +412,7 @@ INSERT INTO main.people VALUES
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("t.duckdb");
         seed(&db);
-        let mut extractor = DuckdbExtractor::new(&db, None, "people", 100).unwrap();
+        let mut extractor = DuckdbExtractor::new(&db, None, "people", 100, None).unwrap();
         let schema = extractor.schema().unwrap();
         let chunk = extractor.next_chunk().unwrap().unwrap();
 

@@ -66,11 +66,25 @@ fn extract(args: &[String]) -> Result<()> {
         .parse()
         .context("--chunk-rows must be a number")?;
     let out_dir = PathBuf::from(flag(args, "--out-dir").context("--out-dir required")?);
+    let cursor: Option<(String, el_engine::state::WatermarkValue)> =
+        match (flag(args, "--update-key"), flag(args, "--cursor")) {
+            (Some(column), Some(json)) => Some((
+                column,
+                serde_json::from_str(&json).context("bad --cursor json")?,
+            )),
+            _ => None,
+        };
 
     let mut extractor: Box<dyn el_engine::connectors::Extractor> = match kind.as_str() {
         "duckdb" => {
             let db = PathBuf::from(flag(args, "--db").context("--db required")?);
-            Box::new(DuckdbExtractor::new(&db, schema.as_deref(), &table, chunk_rows)?)
+            Box::new(DuckdbExtractor::new(
+                &db,
+                schema.as_deref(),
+                &table,
+                chunk_rows,
+                cursor,
+            )?)
         }
         "postgres" => {
             let url = std::env::var("ZDBT_EL_SRC_URL")
@@ -80,6 +94,7 @@ fn extract(args: &[String]) -> Result<()> {
                 schema.as_deref(),
                 &table,
                 chunk_rows,
+                cursor,
             )?)
         }
         other => bail!(

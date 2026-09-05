@@ -15,6 +15,7 @@ pub mod preview;
 pub mod progress;
 pub mod run;
 pub mod spec;
+pub mod state;
 pub mod types;
 
 /// Re-exported so downstream binaries (the connector worker) never pin a

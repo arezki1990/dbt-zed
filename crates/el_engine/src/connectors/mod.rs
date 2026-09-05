@@ -52,12 +52,19 @@ impl SourceContext<'_> {
     }
 }
 
-/// Builds the extractor for a stream.
+/// Builds the extractor for a stream. `resume` is the incremental cursor:
+/// extraction continues past it via `WHERE update_key > resume`.
 pub fn make_extractor(
     ctx: &SourceContext,
     stream: &StreamSpec,
     chunk_rows: usize,
+    resume: Option<&crate::state::WatermarkValue>,
 ) -> Result<Box<dyn Extractor>> {
+    let cursor = stream
+        .update_key
+        .as_deref()
+        .zip(resume)
+        .map(|(column, value)| (column.to_owned(), value.clone()));
     match &stream.source {
         SourceObject::Path { path, format, csv } => Ok(Box::new(files::FileExtractor::new(
             ctx.project_root,
@@ -71,12 +78,12 @@ pub fn make_extractor(
                 let db_path = ctx
                     .resolve_path(&conn.path)
                     .context("resolving duckdb path")?;
-                duckdb_extractor(ctx, &db_path, schema.as_deref(), table, chunk_rows)
+                duckdb_extractor(ctx, &db_path, schema.as_deref(), table, chunk_rows, cursor)
             }
             Some(Connection::Postgres(conn)) => {
                 let url = crate::env::resolve_templates(&conn.url, ctx.env)
                     .map_err(|missing| anyhow::anyhow!("{missing}"))?;
-                postgres_extractor(ctx, url, schema.as_deref(), table, chunk_rows)
+                postgres_extractor(ctx, url, schema.as_deref(), table, chunk_rows, cursor)
             }
             Some(other) if matches!(other.kind(), "mysql" | "mssql") => bail!(
                 "stream {:?}: {} sources are not implemented yet — coming in the next phase",
@@ -103,9 +110,10 @@ fn duckdb_extractor(
     schema: Option<&str>,
     table: &str,
     chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
 ) -> Result<Box<dyn Extractor>> {
     Ok(Box::new(duckdb::DuckdbExtractor::new(
-        db_path, schema, table, chunk_rows,
+        db_path, schema, table, chunk_rows, cursor,
     )?))
 }
 
@@ -116,6 +124,7 @@ fn duckdb_extractor(
     schema: Option<&str>,
     table: &str,
     chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
 ) -> Result<Box<dyn Extractor>> {
     let Some(worker) = ctx.worker else {
         bail!(
@@ -124,7 +133,7 @@ fn duckdb_extractor(
         );
     };
     Ok(Box::new(remote::RemoteExtractor::spawn_duckdb(
-        worker, db_path, schema, table, chunk_rows,
+        worker, db_path, schema, table, chunk_rows, cursor,
     )?))
 }
 
@@ -135,12 +144,14 @@ fn postgres_extractor(
     schema: Option<&str>,
     table: &str,
     chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
 ) -> Result<Box<dyn Extractor>> {
     Ok(Box::new(postgres::PostgresExtractor::new(
         url.expose(),
         schema,
         table,
         chunk_rows,
+        cursor,
     )?))
 }
 
@@ -151,6 +162,7 @@ fn postgres_extractor(
     schema: Option<&str>,
     table: &str,
     chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
 ) -> Result<Box<dyn Extractor>> {
     let Some(worker) = ctx.worker else {
         bail!(
@@ -159,6 +171,6 @@ fn postgres_extractor(
         );
     };
     Ok(Box::new(remote::RemoteExtractor::spawn_postgres(
-        worker, url, schema, table, chunk_rows,
+        worker, url, schema, table, chunk_rows, cursor,
     )?))
 }

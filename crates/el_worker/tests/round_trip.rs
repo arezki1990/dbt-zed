@@ -12,7 +12,7 @@ fn worker_round_trip() {
 
     let worker = std::path::Path::new(env!("CARGO_BIN_EXE_zdbt-el-worker"));
     let mut extractor =
-        RemoteExtractor::spawn_duckdb(worker, &db, Some("main"), "demo_orders", 2).unwrap();
+        RemoteExtractor::spawn_duckdb(worker, &db, Some("main"), "demo_orders", 2, None).unwrap();
 
     let schema = extractor.schema().unwrap();
     assert!(schema.len() >= 4, "{schema:?}");
