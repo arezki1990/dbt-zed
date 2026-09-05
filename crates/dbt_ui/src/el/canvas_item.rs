@@ -1214,10 +1214,14 @@ impl Render for ElPipelineCanvas {
         } else {
             let canvas = self.render_canvas(cx);
             let content = if self.mapping.is_some() {
+                // h_flex() sets items_center, which disables cross-axis
+                // stretch — the canvas collapsed to zero height behind the
+                // sidebar. Stretch explicitly.
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex_1().min_w_0().h_full().child(canvas))
+                    .items_stretch()
+                    .child(div().flex().flex_1().min_w_0().child(canvas))
                     .child(self.render_mapping_sidebar(cx))
                     .into_any_element()
             } else {
