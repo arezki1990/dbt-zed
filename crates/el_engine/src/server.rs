@@ -436,11 +436,17 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 .elapsed()
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or(0);
+            let profile = spec::load_connections(
+                &state.config.project_root.join("el").join("connections.yml"),
+            )
+            .ok()
+            .and_then(|raw| spec::active_profile(&state.config.project_root, &raw));
             respond_json(
                 request,
                 200,
                 &serde_json::json!({
                     "ok": true,
+                    "profile": profile,
                     "uptime_secs": uptime,
                     "running": running,
                     "project": state

@@ -51,10 +51,106 @@ pub enum WriteWarning {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Connections {
     pub version: u32,
+    /// Base connections — used as-is when no profile is active, and as
+    /// the fallback for names a profile does not override.
+    pub connections: IndexMap<String, Connection>,
+    /// Environment profiles (dev / recette / prod …): each maps logical
+    /// connection names to that environment's real connections. Pipelines
+    /// never change across profiles — only what the names point to.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub profiles: IndexMap<String, ProfileSpec>,
+    /// The profile used when neither ZDBT_EL_PROFILE nor the local
+    /// selection picks one. Committed — the team's declared default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileSpec {
     pub connections: IndexMap<String, Connection>,
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+impl Connections {
+    /// The connection set for `profile`: base entries overridden (and
+    /// extended) by the profile's. None = base only.
+    pub fn resolved(&self, profile: Option<&str>) -> Result<IndexMap<String, Connection>, String> {
+        let Some(profile) = profile else {
+            return Ok(self.connections.clone());
+        };
+        let Some(spec) = self.profiles.get(profile) else {
+            return Err(format!(
+                "profile {profile:?} is not defined in connections.yml (has: {})",
+                self.profiles
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        };
+        let mut resolved = self.connections.clone();
+        for (name, connection) in &spec.connections {
+            resolved.insert(name.clone(), connection.clone());
+        }
+        Ok(resolved)
+    }
+}
+
+/// Where the local profile selection lives — per-checkout state, never
+/// committed (the IDE writes it on switch).
+pub fn profile_selection_path(project_root: &Path) -> std::path::PathBuf {
+    project_root.join("el").join(".zdbt").join("profile")
+}
+
+/// The active profile name: ZDBT_EL_PROFILE env wins, then the local
+/// selection file, then the file's default_profile. None = base only.
+pub fn active_profile(project_root: &Path, connections: &Connections) -> Option<String> {
+    if let Ok(name) = std::env::var("ZDBT_EL_PROFILE") {
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    if let Ok(name) = std::fs::read_to_string(profile_selection_path(project_root)) {
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    connections.default_profile.clone()
+}
+
+/// One-stop loader for run surfaces: connections.yml resolved through
+/// the active profile, flattened into a plain `Connections`, plus the
+/// profile name for display. An unknown active profile is an error —
+/// never a silent fall-through to another environment's credentials.
+pub fn load_active_connections(
+    project_root: &Path,
+) -> Result<(Connections, Option<String>), SpecError> {
+    let path = project_root.join("el").join("connections.yml");
+    let raw = load_connections(&path)?;
+    let profile = active_profile(project_root, &raw);
+    let resolved = raw
+        .resolved(profile.as_deref())
+        .map_err(|message| SpecError::Parse {
+            path: path.display().to_string(),
+            message,
+        })?;
+    Ok((
+        Connections {
+            version: raw.version,
+            connections: resolved,
+            profiles: IndexMap::new(),
+            default_profile: None,
+            extra: IndexMap::new(),
+        },
+        profile,
+    ))
 }
 
 /// One named connection. Every string value may contain `${VAR}`

@@ -48,10 +48,9 @@ pub fn preview_stream(
         .find(|stream| stream.name == stream_name)
         .with_context(|| format!("no stream named {stream_name:?} in the pipeline"))?;
     // Connections + env resolve the same way a real run will.
-    let connections = crate::spec::load_connections(
-        &project_root.join("el").join("connections.yml"),
-    )
-    .ok();
+    let connections = crate::spec::load_active_connections(project_root)
+        .ok()
+        .map(|(connections, _)| connections);
     let env = EnvMap::load(project_root, None);
     let ctx = SourceContext {
         project_root,

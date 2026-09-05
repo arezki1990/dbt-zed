@@ -55,10 +55,12 @@ pub fn run_pipeline(
             .collect(),
     });
 
-    let connections = crate::spec::load_connections(
-        &request.project_root.join("el").join("connections.yml"),
-    )
-    .context("loading connections.yml")?;
+    let (connections, profile) =
+        crate::spec::load_active_connections(&request.project_root)
+            .context("loading connections.yml")?;
+    if let Some(profile) = &profile {
+        log::info!("el run: profile {profile}");
+    }
     let env = EnvMap::load(&request.project_root, None);
 
     // Fail fast on anything validation can catch.

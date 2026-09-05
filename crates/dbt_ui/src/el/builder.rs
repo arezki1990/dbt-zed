@@ -298,6 +298,8 @@ impl BuilderForm {
                 let mut connections = connections.unwrap_or(Connections {
                     version: 1,
                     connections: IndexMap::new(),
+                    profiles: IndexMap::new(),
+                    default_profile: None,
                     extra: IndexMap::new(),
                 });
                 let name = self.text(0, cx);

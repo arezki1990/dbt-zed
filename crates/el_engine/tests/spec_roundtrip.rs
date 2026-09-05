@@ -205,3 +205,64 @@ connections:
     let reloaded = spec::load_connections(&write(dir.path(), "c2.yml", &rewritten)).unwrap();
     assert_eq!(reloaded.connections.len(), 2);
 }
+
+/// Profiles: same logical names, per-environment connections. Base is the
+/// fallback; the active profile overrides and extends; unknown profiles
+/// are hard errors (never a silent fall-through to another environment).
+#[test]
+fn profiles_resolve_and_guard() {
+    let yaml = "version: 1
+default_profile: dev
+connections:
+  wh: { type: duckdb, path: el/base.duckdb }
+  files: { type: local }
+profiles:
+  dev:
+    connections:
+      pg: { type: postgres, url: '${PG_DEV}' }
+  prod:
+    connections:
+      wh: { type: snowflake, account: '${SF_ACCOUNT}', user: '${SF_USER}',
+            auth: { method: key_pair, private_key_path: '${SF_KEY}' } }
+      pg: { type: postgres, url: '${PG_PROD}' }
+";
+    let dir = tempfile::tempdir().unwrap();
+    let raw = spec::load_connections(&write(dir.path(), "c.yml", yaml)).unwrap();
+
+    // Base only.
+    let base = raw.resolved(None).unwrap();
+    assert_eq!(base["wh"].kind(), "duckdb");
+    assert!(!base.contains_key("pg"));
+
+    // dev: base wh survives, pg added.
+    let dev = raw.resolved(Some("dev")).unwrap();
+    assert_eq!(dev["wh"].kind(), "duckdb");
+    assert_eq!(dev["pg"].kind(), "postgres");
+    assert_eq!(dev["files"].kind(), "local");
+
+    // prod: wh overridden to snowflake.
+    let prod = raw.resolved(Some("prod")).unwrap();
+    assert_eq!(prod["wh"].kind(), "snowflake");
+
+    // Unknown profile = error naming the real ones.
+    let error = raw.resolved(Some("staging")).unwrap_err();
+    assert!(error.contains("staging") && error.contains("dev"), "{error}");
+
+    // default_profile drives selection when nothing else picks.
+    assert_eq!(
+        spec::active_profile(dir.path(), &raw).as_deref(),
+        Some("dev")
+    );
+    // The local selection file outranks the default.
+    std::fs::create_dir_all(dir.path().join("el/.zdbt")).unwrap();
+    std::fs::write(dir.path().join("el/.zdbt/profile"), "prod\n").unwrap();
+    assert_eq!(
+        spec::active_profile(dir.path(), &raw).as_deref(),
+        Some("prod")
+    );
+
+    // Round-trip keeps the profiles block.
+    let rewritten = spec::to_canonical_connections_yaml(&raw);
+    assert!(rewritten.contains("profiles:"), "{rewritten}");
+    assert!(rewritten.contains("default_profile: dev"), "{rewritten}");
+}

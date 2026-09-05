@@ -187,18 +187,17 @@ impl ElRunsPanel {
         });
         self.root = root.clone();
         let Some(root) = root else { return };
-        self.connections =
-            el_engine::spec::load_connections(&super::el_dir(&root).join("connections.yml"))
-                .map(|connections| {
-                    connections
-                        .connections
-                        .iter()
-                        .map(|(name, connection)| {
-                            (name.clone().into(), connection.kind().to_owned().into())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+        self.connections = el_engine::spec::load_active_connections(&root)
+            .map(|(connections, _)| {
+                connections
+                    .connections
+                    .iter()
+                    .map(|(name, connection)| {
+                        (name.clone().into(), connection.kind().to_owned().into())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         if self.selected.map_or(true, |ix| ix >= self.connections.len()) {
             self.selected = (!self.connections.is_empty()).then_some(0);
         }
@@ -273,8 +272,15 @@ impl ElRunsPanel {
                                     } else {
                                         format!("{uptime}s")
                                     };
-                                    format!("connected — up {uptime}, {running} running")
-                                        .into()
+                                    let profile = value
+                                        .get("profile")
+                                        .and_then(|name| name.as_str())
+                                        .map(|name| format!(", profile {name}"))
+                                        .unwrap_or_default();
+                                    format!(
+                                        "connected — up {uptime}, {running} running{profile}"
+                                    )
+                                    .into()
                                 });
                                 if let Some((lines, next)) = logs {
                                     this.remote_log_next = next;
@@ -376,9 +382,7 @@ impl ElRunsPanel {
         cx.notify();
         let task = cx.background_spawn(async move {
             let started = std::time::Instant::now();
-            let connections = el_engine::spec::load_connections(
-                &super::el_dir(&root).join("connections.yml"),
-            )?;
+            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
             let connection = connections
                 .connections
                 .get(&connection_name)

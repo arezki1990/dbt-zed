@@ -26,6 +26,9 @@ pub struct ElPanel {
     connections: Vec<(SharedString, SharedString)>,
     /// connections.yml failed to load (parse error — not absence).
     connections_error: Option<SharedString>,
+    /// The active profile (dev/recette/prod…) and all declared ones.
+    profile: Option<SharedString>,
+    profiles: Vec<SharedString>,
     /// Connections whose table list is unfolded in the explorer.
     expanded: std::collections::HashSet<SharedString>,
     tables: std::collections::HashMap<SharedString, TablesState>,
@@ -104,6 +107,8 @@ impl ElPanel {
             pipelines: Vec::new(),
             connections: Vec::new(),
             connections_error: None,
+            profile: None,
+            profiles: Vec::new(),
             expanded: Default::default(),
             tables: Default::default(),
             _list_tasks: Default::default(),
@@ -129,8 +134,12 @@ impl ElPanel {
             log::warn!("el: could not write schemas: {error:#}");
         }
         self.pipelines = el_engine::spec::list_pipelines(&el);
-        match el_engine::spec::load_connections(&el.join("connections.yml")) {
-            Ok(connections) => {
+        match el_engine::spec::load_active_connections(&root) {
+            Ok((connections, profile)) => {
+                self.profile = profile.map(Into::into);
+                self.profiles = el_engine::spec::load_connections(&el.join("connections.yml"))
+                    .map(|raw| raw.profiles.keys().map(|name| name.clone().into()).collect())
+                    .unwrap_or_default();
                 self.connections = connections
                     .connections
                     .iter()
@@ -155,6 +164,36 @@ impl ElPanel {
             }
         }
         cx.notify();
+    }
+
+    /// Switches the checkout's active profile: writes the local selection
+    /// file (never the shared YAML), drops caches, and reloads every open
+    /// canvas so validation and labels track the new environment.
+    fn switch_profile(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let path = el_engine::spec::profile_selection_path(&root);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(&path, name.as_ref()) {
+            self.connections_error =
+                Some(format!("could not save the profile selection: {error}").into());
+            cx.notify();
+            return;
+        }
+        self.tables.clear();
+        self.expanded.clear();
+        self.refresh(cx);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let canvases: Vec<_> =
+                    workspace.items_of_type::<super::ElPipelineCanvas>(cx).collect();
+                for canvas in canvases {
+                    canvas.update(cx, |canvas, cx| canvas.reload(cx));
+                }
+                super::toast(workspace, &format!("Profile: {name}"), cx);
+            })
+            .ok();
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -231,9 +270,7 @@ impl ElPanel {
                     "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER."
                 )
             })?;
-            let connections = el_engine::spec::load_connections(
-                &super::el_dir(&root).join("connections.yml"),
-            )?;
+            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
             let connection = connections
                 .connections
                 .get(&connection_name)
@@ -456,6 +493,11 @@ impl Render for ElPanel {
                     .border_color(colors.border)
                     .child(Label::new("EL").size(LabelSize::Small))
                     .child(div().flex_1())
+                    .children(self.profile.clone().map(|profile| {
+                        Label::new(profile)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent)
+                    }))
                     .child(
                         IconButton::new("el-panel-refresh", IconName::RotateCw)
                             .icon_size(IconSize::Small)
@@ -471,6 +513,34 @@ impl Render for ElPanel {
                             })),
                     ),
             )
+            .children((self.profiles.len() > 1 || (!self.profiles.is_empty() && self.profile.is_none())).then(|| {
+                // The environment switcher: same pipelines, different
+                // connections. The active chip is the panel's one accent.
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .flex_wrap()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new("profile")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(self.profiles.iter().enumerate().map(|(ix, name)| {
+                        let selected = self.profile.as_ref() == Some(name);
+                        let name = name.clone();
+                        Button::new(("el-profile", ix), name.clone())
+                            .label_size(LabelSize::XSmall)
+                            .toggle_state(selected)
+                            .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.switch_profile(name.clone(), cx);
+                            }))
+                    }))
+            }))
             .child(list)
     }
 }

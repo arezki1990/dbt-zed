@@ -141,7 +141,7 @@ impl ElPipelineCanvas {
         }
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
         self.spec_mtime = std::fs::metadata(&self.spec_path)
             .and_then(|meta| meta.modified())
             .ok();
@@ -474,8 +474,12 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
     })
 }
 
+/// Connections as the ACTIVE PROFILE sees them — the canvas validates and
+/// labels against what a run would actually use.
 fn loaded_connections(project_root: &std::path::Path) -> Option<Connections> {
-    el_engine::spec::load_connections(&super::el_dir(project_root).join("connections.yml")).ok()
+    el_engine::spec::load_active_connections(project_root)
+        .ok()
+        .map(|(connections, _)| connections)
 }
 
 impl ElPipelineCanvas {
@@ -1270,9 +1274,7 @@ impl ElPipelineCanvas {
         }
         let root = self.project_root.clone();
         let task = cx.background_spawn(async move {
-            let connections = el_engine::spec::load_connections(
-                &super::el_dir(&root).join("connections.yml"),
-            )?;
+            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
             let connection = connections
                 .connections
                 .get(&connection_name)

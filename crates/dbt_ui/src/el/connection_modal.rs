@@ -89,6 +89,8 @@ fn load_connections_strict(root: &std::path::Path) -> Result<Connections> {
             Ok(Connections {
                 version: 1,
                 connections: IndexMap::new(),
+                profiles: IndexMap::new(),
+                default_profile: None,
                 extra: IndexMap::new(),
             })
         }
