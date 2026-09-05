@@ -38,6 +38,10 @@ pub struct ServerConfig {
     /// Permit plaintext HTTP beyond loopback (token still required) — for
     /// private networks and containers where TLS terminates at ingress.
     pub allow_insecure_http: bool,
+    /// Run pipelines straight from the checkout's el/pipelines (git-ops
+    /// deployments). Default OFF: the daemon runs only the explicitly
+    /// DEPLOYED set — nothing goes live until a developer deploys it.
+    pub track_checkout: bool,
     pub worker: Option<PathBuf>,
     pub driver: Option<PathBuf>,
     pub chunk_rows: usize,
@@ -111,21 +115,34 @@ impl State {
     }
 }
 
-fn load_pipeline_by_name(root: &std::path::Path, name: &str) -> Result<Pipeline> {
-    for path in spec::list_pipelines(&root.join("el")) {
+/// The directory whose `pipelines/` the daemon executes: the deployed
+/// snapshot by default, the live checkout only with --track-checkout.
+fn pipelines_root(config: &ServerConfig) -> PathBuf {
+    if config.track_checkout {
+        config.project_root.join("el")
+    } else {
+        config.project_root.join("el").join(".zdbt").join("deployed")
+    }
+}
+
+fn load_pipeline_by_name(config: &ServerConfig, name: &str) -> Result<Pipeline> {
+    for path in spec::list_pipelines(&pipelines_root(config)) {
         if let Ok(pipeline) = spec::load_pipeline(&path) {
             if pipeline.pipeline == name {
                 return Ok(pipeline);
             }
         }
     }
-    bail!("no pipeline named {name:?} under el/pipelines/")
+    bail!(
+        "no pipeline named {name:?} is deployed{}",
+        if config.track_checkout { " under el/pipelines/" } else { " — deploy it first" }
+    )
 }
 
 /// Starts a run on background threads; returns its id. Refuses when the
 /// pipeline already has a run in flight (Airbyte's skip-if-running).
 fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u64> {
-    let pipeline = load_pipeline_by_name(&state.config.project_root, pipeline_name)?;
+    let pipeline = load_pipeline_by_name(&state.config, pipeline_name)?;
     let cancel = CancelFlag::default();
     let run_id = {
         // Check-and-insert under ONE lock: two racing POSTs can't both
@@ -326,7 +343,7 @@ fn scheduler_loop(state: Arc<State>) {
     loop {
         std::thread::sleep(SCHEDULER_TICK);
         let now = Utc::now();
-        for path in spec::list_pipelines(&state.config.project_root.join("el")) {
+        for path in spec::list_pipelines(&pipelines_root(&state.config)) {
             let Ok(pipeline) = spec::load_pipeline(&path) else {
                 continue;
             };
@@ -391,6 +408,52 @@ fn scheduler_loop(state: Arc<State>) {
         }
         previous = now;
     }
+}
+
+/// Validates and installs a deploy bundle into the deployed snapshot —
+/// every YAML must parse before ANY file changes; writes are atomic.
+fn apply_deploy<'a>(
+    state: &Arc<State>,
+    entries: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<Vec<String>> {
+    let dir = pipelines_root(&state.config).join("pipelines");
+    std::fs::create_dir_all(&dir).context("creating the deployed dir")?;
+    let mut validated: Vec<(String, String)> = Vec::new();
+    for (name, yaml) in entries {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("pipeline name {name:?} is not a plain identifier");
+        }
+        // Parse-validate via a scratch file (the spec loader is path-based).
+        let scratch = tempfile::NamedTempFile::new().context("deploy scratch")?;
+        std::fs::write(scratch.path(), yaml).context("writing deploy scratch")?;
+        let pipeline = spec::load_pipeline(scratch.path())
+            .map_err(|error| anyhow::anyhow!("{name}: {error}"))?;
+        if pipeline.pipeline != name {
+            bail!(
+                "{name}: the YAML names pipeline {:?} — deploy under its own name",
+                pipeline.pipeline
+            );
+        }
+        validated.push((name.to_owned(), yaml.to_owned()));
+    }
+    if validated.is_empty() {
+        bail!("nothing to deploy");
+    }
+    let mut names = Vec::new();
+    for (name, yaml) in validated {
+        let target = dir.join(format!("{name}.yml"));
+        let staging = dir.join(format!("{name}.yml.tmp"));
+        std::fs::write(&staging, yaml)
+            .with_context(|| format!("writing {}", staging.display()))?;
+        std::fs::rename(&staging, &target)
+            .with_context(|| format!("installing {}", target.display()))?;
+        names.push(name);
+    }
+    Ok(names)
 }
 
 // --------------------------------------------------------------------------
@@ -608,7 +671,7 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
         }
         ("GET", ["pipelines"]) => {
             let mut pipelines = Vec::new();
-            for path in spec::list_pipelines(&state.config.project_root.join("el")) {
+            for path in spec::list_pipelines(&pipelines_root(&state.config)) {
                 if let Ok(pipeline) = spec::load_pipeline(&path) {
                     pipelines.push(PipelineInfo {
                         running: state.is_running(&pipeline.pipeline),
@@ -667,6 +730,55 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                     };
                     respond_json(request, status, &serde_json::json!({"error": message}));
                 }
+            }
+        }
+        ("POST", ["deploy"]) => {
+            if state.config.track_checkout {
+                respond_json(
+                    request,
+                    409,
+                    &serde_json::json!({"error": "this daemon tracks its checkout — \
+                        deploy by updating the checkout (git)"}),
+                );
+                return;
+            }
+            let mut body = String::new();
+            let _ = request
+                .as_reader()
+                .take(4 * 1024 * 1024)
+                .read_to_string(&mut body);
+            #[derive(serde::Deserialize)]
+            struct DeployEntry {
+                name: String,
+                yaml: String,
+            }
+            #[derive(serde::Deserialize)]
+            struct DeployBody {
+                pipelines: Vec<DeployEntry>,
+            }
+            let parsed: DeployBody = match serde_json::from_str(&body) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    respond_json(
+                        request,
+                        400,
+                        &serde_json::json!({"error": format!("bad deploy body: {error}")}),
+                    );
+                    return;
+                }
+            };
+            match apply_deploy(state, parsed.pipelines.iter().map(|entry| {
+                (entry.name.as_str(), entry.yaml.as_str())
+            })) {
+                Ok(names) => {
+                    state.log(format!("deployed {} pipeline(s): {}", names.len(), names.join(", ")));
+                    respond_json(request, 200, &serde_json::json!({"deployed": names}));
+                }
+                Err(error) => respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({"error": format!("{error:#}")}),
+                ),
             }
         }
         ("POST", ["runs", id, "cancel"]) => {
@@ -802,6 +914,7 @@ impl ServerConfig {
             token: std::env::var("ZDBT_EL_TOKEN").ok().filter(|t| !t.is_empty()),
             tls: None,
             allow_insecure_http: false,
+            track_checkout: false,
             worker: None,
             driver: None,
             chunk_rows: 50_000,
@@ -969,6 +1082,29 @@ impl RemoteClient {
                 .send_json(serde_json::json!({})),
         )?;
         Ok(())
+    }
+
+    /// Deploys pipeline YAMLs (name, canonical yaml) to the daemon's
+    /// deployed snapshot. Nothing runs remotely until this is called.
+    pub fn deploy(&self, pipelines: &[(String, String)]) -> Result<Vec<String>> {
+        let body = serde_json::json!({
+            "pipelines": pipelines
+                .iter()
+                .map(|(name, yaml)| serde_json::json!({"name": name, "yaml": yaml}))
+                .collect::<Vec<_>>(),
+        });
+        let value: serde_json::Value =
+            Self::read_json(self.request("POST", "/deploy").send_json(body))?;
+        Ok(value
+            .get("deployed")
+            .and_then(|names| names.as_array())
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub fn health(&self) -> Result<serde_json::Value> {

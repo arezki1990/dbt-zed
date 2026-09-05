@@ -15,7 +15,8 @@ fn main() -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "zdbt-el-serve --project <root> [--listen <addr:port>] \
-             [--tls-cert <pem> --tls-key <pem>] [--insecure-http] [--worker <path>]\n\
+             [--tls-cert <pem> --tls-key <pem>] [--insecure-http] [--track-checkout] \
+             [--worker <path>]\n\
              Token: ZDBT_EL_TOKEN env (required beyond loopback)."
         );
         return Ok(());
@@ -32,6 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut config = el_engine::server::ServerConfig::new(project, listen);
     config.allow_insecure_http = args.iter().any(|arg| arg == "--insecure-http");
+    config.track_checkout = args.iter().any(|arg| arg == "--track-checkout");
     config.tls = match (flag(&args, "--tls-cert"), flag(&args, "--tls-key")) {
         (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
         (None, None) => None,

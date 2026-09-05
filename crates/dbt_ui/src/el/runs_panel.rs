@@ -65,6 +65,11 @@ pub struct ElRunsPanel {
     remote_show_logs: bool,
     /// A pipeline opened in the detail view; None = overview.
     remote_detail: Option<SharedString>,
+    /// The daemon's active profile (from /health) — shown when confirming
+    /// a deploy so the developer knows which environment receives it.
+    remote_profile: Option<String>,
+    /// Deploy needs a second click: first arms, second sends.
+    deploy_armed: bool,
     remote_epoch: u64,
     _remote_poll: Task<()>,
 }
@@ -126,6 +131,8 @@ impl ElRunsPanel {
                 remote_log_next: 0,
                 remote_show_logs: false,
                 remote_detail: None,
+                remote_profile: None,
+                deploy_armed: false,
                 remote_epoch: 0,
                 _remote_poll: Task::ready(()),
             }
@@ -160,6 +167,7 @@ impl ElRunsPanel {
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
         self.remote_detail = None;
+        self.deploy_armed = false;
         self.result = None;
         self.query_error = None;
         self.elapsed = None;
@@ -277,6 +285,11 @@ impl ElRunsPanel {
                                 this.remote_pipelines = pipelines;
                                 this.remote_runs = runs;
                                 this.remote_error = None;
+                                this.remote_profile = health
+                                    .as_ref()
+                                    .and_then(|value| value.get("profile"))
+                                    .and_then(|name| name.as_str())
+                                    .map(str::to_owned);
                                 this.remote_health = health.map(|value| {
                                     let uptime = value
                                         .get("uptime_secs")
@@ -331,6 +344,76 @@ impl ElRunsPanel {
                     .await;
             }
         });
+    }
+
+    /// Deploys local pipeline YAMLs to the selected remote — all of them,
+    /// or just `only`. Two-click armed elsewhere; this sends.
+    fn deploy_to_remote(&mut self, only: Option<String>, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let Some(remote) = self
+            .selected_remote
+            .and_then(|ix| self.remotes.get(ix))
+            .map(|name| name.to_string())
+        else {
+            return;
+        };
+        self.deploy_armed = false;
+        self.remote_action_error = None;
+        let workspace = self.workspace.clone();
+        let task = cx.background_spawn(async move {
+            use anyhow::Context as _;
+            let mut bundle: Vec<(String, String)> = Vec::new();
+            for path in el_engine::spec::list_pipelines(&super::el_dir(&root)) {
+                let pipeline = el_engine::spec::load_pipeline(&path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "{} could not be read ({error}) — fix it before deploying",
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("a pipeline file")
+                    )
+                })?;
+                if only.as_ref().is_some_and(|name| pipeline.pipeline != *name) {
+                    continue;
+                }
+                let yaml =
+                    std::fs::read_to_string(&path).context("reading pipeline file")?;
+                bundle.push((pipeline.pipeline, yaml));
+            }
+            if bundle.is_empty() {
+                anyhow::bail!("nothing to deploy");
+            }
+            let client = el_engine::server::RemoteClient::connect(&root, &remote)?;
+            let deployed = client.deploy(&bundle)?;
+            anyhow::Ok((remote, deployed))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((remote, deployed)) => {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                super::toast(
+                                    workspace,
+                                    &format!(
+                                        "Deployed {} pipeline(s) to {remote}.",
+                                        deployed.len()
+                                    ),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        this.start_remote_poll(cx);
+                    }
+                    Err(error) => {
+                        this.remote_action_error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Fire-and-refresh action against the selected remote.
@@ -584,6 +667,7 @@ impl ElRunsPanel {
                             this.remote_runs.clear();
                             this.remote_action_error = None;
                             this.remote_detail = None;
+                            this.deploy_armed = false;
                             this.start_remote_poll(cx);
                             cx.notify();
                         }))
@@ -606,6 +690,49 @@ impl ElRunsPanel {
             .children(self.remote_action_error.clone().map(|error| {
                 Label::new(error).size(LabelSize::XSmall).color(Color::Error)
             }))
+            .child({
+                let remote = self
+                    .selected_remote
+                    .and_then(|ix| self.remotes.get(ix))
+                    .cloned()
+                    .unwrap_or_else(|| "remote".into());
+                let profile = self
+                    .remote_profile
+                    .clone()
+                    .unwrap_or_else(|| "base connections".into());
+                let only = self.remote_detail.clone();
+                let label: SharedString = if self.deploy_armed {
+                    match &only {
+                        Some(name) => {
+                            format!("Confirm: {name} → {remote} ({profile})").into()
+                        }
+                        None => format!("Confirm: all → {remote} ({profile})").into(),
+                    }
+                } else if only.is_some() {
+                    "Deploy this pipeline".into()
+                } else {
+                    "Deploy pipelines".into()
+                };
+                Button::new("el-remote-deploy", label)
+                    .label_size(LabelSize::XSmall)
+                    .style(if self.deploy_armed {
+                        ButtonStyle::Tinted(ui::TintColor::Warning)
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .tooltip(ui::Tooltip::text(
+                        "Nothing runs on a remote until you deploy it there",
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.deploy_armed {
+                            let only = this.remote_detail.as_ref().map(|s| s.to_string());
+                            this.deploy_to_remote(only, cx);
+                        } else {
+                            this.deploy_armed = true;
+                        }
+                        cx.notify();
+                    }))
+            })
             .child(
                 Button::new("el-remote-logs", "Logs")
                     .label_size(LabelSize::XSmall)
@@ -711,6 +838,7 @@ impl ElRunsPanel {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remote_detail = Some(open_name.clone());
+                        this.deploy_armed = false;
                         cx.notify();
                     }))
                     .child(cell(150., pipeline.name.clone(), Color::Default))
@@ -813,6 +941,7 @@ impl ElRunsPanel {
                     .tooltip(ui::Tooltip::text("Back to pipelines"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remote_detail = None;
+                        this.deploy_armed = false;
                         cx.notify();
                     })),
             )

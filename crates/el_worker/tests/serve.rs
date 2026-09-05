@@ -53,11 +53,8 @@ fn serve_runs_pipelines_over_the_api() {
         "version: 1\nconnections:\n  src: { type: duckdb, path: el/source.duckdb }\n  wh: { type: duckdb, path: el/warehouse.duckdb }\n",
     )
     .unwrap();
-    std::fs::write(
-        el.join("pipelines").join("orders.yml"),
-        "version: 1\npipeline: orders\nsource: src\ntarget: { connection: wh, schema: LANDING }\nstreams:\n- name: orders\n  source: { schema: main, table: orders }\n",
-    )
-    .unwrap();
+    let orders_yaml = "version: 1\npipeline: orders\nsource: src\ntarget: { connection: wh, schema: LANDING }\nstreams:\n- name: orders\n  source: { schema: main, table: orders }\n";
+    std::fs::write(el.join("pipelines").join("orders.yml"), orders_yaml).unwrap();
 
     let port = free_port();
     let listen: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -86,7 +83,20 @@ fn serve_runs_pipelines_over_the_api() {
     let anonymous = RemoteClient::direct(&url, None).unwrap();
     assert!(anonymous.pipelines().is_err());
 
-    // The pipeline list reflects the project.
+    // NOTHING is live until the developer deploys: the checkout's
+    // pipelines are invisible to the daemon.
+    assert_eq!(good.pipelines().unwrap().len(), 0);
+    let error = format!("{:#}", good.start_run("orders").unwrap_err());
+    assert!(error.contains("deploy"), "got: {error}");
+
+    // Deploy, then the pipeline list reflects the deployed set.
+    let deployed = good
+        .deploy(&[("orders".to_owned(), orders_yaml.to_owned())])
+        .unwrap();
+    assert_eq!(deployed, ["orders"]);
+    // Broken or ill-named bundles are refused whole.
+    assert!(good.deploy(&[("evil/../name".to_owned(), orders_yaml.to_owned())]).is_err());
+    assert!(good.deploy(&[("orders".to_owned(), "not: [valid".to_owned())]).is_err());
     let pipelines = good.pipelines().unwrap();
     assert_eq!(pipelines.len(), 1);
     assert_eq!(pipelines[0].name, "orders");

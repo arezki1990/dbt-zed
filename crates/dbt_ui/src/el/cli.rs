@@ -16,7 +16,7 @@ pub fn main(args: &[String]) -> i32 {
                 "usage: zdbt el run <pipeline.yml | name> [--project <root>] [--chunk-rows <n>]\n       \
                  zdbt el ls [--project <root>]\n       \
                  zdbt el serve [--listen <addr:port>] [--project <root>] \
-                 [--tls-cert <pem> --tls-key <pem>] [--insecure-http]"
+                 [--tls-cert <pem> --tls-key <pem>] [--insecure-http] [--track-checkout]"
             );
             2
         }
@@ -41,6 +41,7 @@ fn serve(args: &[String]) -> i32 {
     let mut config = el_engine::server::ServerConfig::new(root, listen);
     config.worker = super::find_worker();
     config.allow_insecure_http = args.iter().any(|arg| arg == "--insecure-http");
+    config.track_checkout = args.iter().any(|arg| arg == "--track-checkout");
     config.tls = match (flag(args, "--tls-cert"), flag(args, "--tls-key")) {
         (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
         (None, None) => None,
