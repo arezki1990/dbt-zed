@@ -65,6 +65,10 @@ pub struct ElRunsPanel {
     remote_show_logs: bool,
     /// A pipeline opened in the detail view; None = overview.
     remote_detail: Option<SharedString>,
+    /// Height of the pipelines section; the splitter drags it.
+    remote_split: f32,
+    /// (pointer y at drag start, split at drag start).
+    remote_split_drag: Option<(f32, f32)>,
     remote_epoch: u64,
     _remote_poll: Task<()>,
 }
@@ -126,6 +130,8 @@ impl ElRunsPanel {
                 remote_log_next: 0,
                 remote_show_logs: false,
                 remote_detail: None,
+                remote_split: 170.,
+                remote_split_drag: None,
                 remote_epoch: 0,
                 _remote_poll: Task::ready(()),
             }
@@ -790,11 +796,64 @@ impl ElRunsPanel {
             );
         }
 
+        let dragging = self.remote_split_drag.is_some();
         v_flex()
             .flex_1()
             .min_h_0()
-            .child(pipeline_header)
-            .child(pipelines)
+            .when(dragging, |flex| {
+                flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start_y, start_split)) = this.remote_split_drag {
+                        this.remote_split =
+                            (start_split + f32::from(event.position.y) - start_y)
+                                .clamp(56., 480.);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.remote_split_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.remote_split_drag = None;
+                        cx.notify();
+                    }),
+                )
+            })
+            .child(
+                v_flex()
+                    .id("el-remote-pipelines-pane")
+                    .h(px(self.remote_split))
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .child(pipeline_header)
+                    .child(pipelines),
+            )
+            .child(
+                // The splitter: drag to trade space between the tables.
+                div()
+                    .id("el-remote-split")
+                    .w_full()
+                    .h(px(5.))
+                    .flex_shrink_0()
+                    .cursor(gpui::CursorStyle::ResizeRow)
+                    .bg(colors.border)
+                    .hover(|style| style.bg(colors.border_focused))
+                    .when(dragging, |bar| bar.bg(colors.border_focused))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.remote_split_drag =
+                                Some((f32::from(event.position.y), this.remote_split));
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(
                 div().px_2().pt_1().child(
                     Label::new("Recent runs")
