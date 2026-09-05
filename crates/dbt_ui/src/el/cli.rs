@@ -10,12 +10,50 @@ pub fn main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("run") => run(&args[1..]),
         Some("ls") => list(&args[1..]),
+        Some("serve") => serve(&args[1..]),
         _ => {
             eprintln!(
                 "usage: zdbt el run <pipeline.yml | name> [--project <root>] [--chunk-rows <n>]\n       \
-                 zdbt el ls [--project <root>]"
+                 zdbt el ls [--project <root>]\n       \
+                 zdbt el serve [--listen <addr:port>] [--project <root>] \
+                 [--tls-cert <pem> --tls-key <pem>] [--insecure-http]"
             );
             2
+        }
+    }
+}
+
+/// `zdbt el serve`: the scheduling daemon with the JSON API. Token from
+/// ZDBT_EL_TOKEN; non-loopback binds require the token AND TLS.
+fn serve(args: &[String]) -> i32 {
+    let Some(root) = project_root(args) else {
+        eprintln!("no project found — run inside an EL project or pass --project");
+        return 2;
+    };
+    let listen = flag(args, "--listen").unwrap_or_else(|| "127.0.0.1:7431".to_owned());
+    let listen: std::net::SocketAddr = match listen.parse() {
+        Ok(listen) => listen,
+        Err(_) => {
+            eprintln!("--listen must be addr:port, e.g. 127.0.0.1:7431");
+            return 2;
+        }
+    };
+    let mut config = el_engine::server::ServerConfig::new(root, listen);
+    config.worker = super::find_worker();
+    config.allow_insecure_http = args.iter().any(|arg| arg == "--insecure-http");
+    config.tls = match (flag(args, "--tls-cert"), flag(args, "--tls-key")) {
+        (Some(cert), Some(key)) => Some((PathBuf::from(cert), PathBuf::from(key))),
+        (None, None) => None,
+        _ => {
+            eprintln!("--tls-cert and --tls-key go together");
+            return 2;
+        }
+    };
+    match el_engine::server::serve(config) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("el serve failed: {error:#}");
+            1
         }
     }
 }

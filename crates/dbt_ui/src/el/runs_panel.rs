@@ -26,6 +26,7 @@ const QUERY_ROW_CAP: usize = 500;
 enum Surface {
     Runs,
     Query,
+    Remote,
 }
 
 pub struct ElRunsPanel {
@@ -49,6 +50,18 @@ pub struct ElRunsPanel {
     elapsed: Option<Duration>,
     query_error: Option<SharedString>,
     _query: Task<()>,
+    // Remote surface state (from el/remotes.yml).
+    remotes: Vec<SharedString>,
+    selected_remote: Option<usize>,
+    remote_pipelines: Vec<el_engine::server::RemotePipeline>,
+    remote_runs: Vec<el_engine::server::RemoteRun>,
+    remote_error: Option<SharedString>,
+    remote_health: Option<SharedString>,
+    remote_logs: Vec<SharedString>,
+    remote_log_next: u64,
+    remote_show_logs: bool,
+    remote_epoch: u64,
+    _remote_poll: Task<()>,
 }
 
 pub struct PreviewTable {
@@ -97,6 +110,17 @@ impl ElRunsPanel {
                 elapsed: None,
                 query_error: None,
                 _query: Task::ready(()),
+                remotes: Vec::new(),
+                selected_remote: None,
+                remote_pipelines: Vec::new(),
+                remote_runs: Vec::new(),
+                remote_error: None,
+                remote_health: None,
+                remote_logs: Vec::new(),
+                remote_log_next: 0,
+                remote_show_logs: false,
+                remote_epoch: 0,
+                _remote_poll: Task::ready(()),
             }
         })
     }
@@ -178,6 +202,142 @@ impl ElRunsPanel {
         if self.selected.map_or(true, |ix| ix >= self.connections.len()) {
             self.selected = (!self.connections.is_empty()).then_some(0);
         }
+        self.remotes = el_engine::spec::load_remotes(
+            &super::el_dir(&root).join("remotes.yml"),
+        )
+        .map(|remotes| remotes.remotes.keys().map(|name| name.clone().into()).collect())
+        .unwrap_or_default();
+        if self.selected_remote.map_or(true, |ix| ix >= self.remotes.len()) {
+            self.selected_remote = (!self.remotes.is_empty()).then_some(0);
+        }
+    }
+
+    /// Restarts the remote poll loop: fetch pipelines + runs now, then
+    /// every two seconds while the Remote surface stays visible.
+    fn start_remote_poll(&mut self, cx: &mut Context<Self>) {
+        self.remote_epoch += 1;
+        self.remote_health = None;
+        self.remote_logs.clear();
+        self.remote_log_next = 0;
+        let epoch = self.remote_epoch;
+        let Some(root) = self.root.clone() else { return };
+        let Some(name) = self
+            .selected_remote
+            .and_then(|ix| self.remotes.get(ix))
+            .map(|name| name.to_string())
+        else {
+            return;
+        };
+        self._remote_poll = cx.spawn(async move |this, cx| {
+            let mut log_cursor = 0u64;
+            loop {
+                let root = root.clone();
+                let name = name.clone();
+                let since = log_cursor;
+                let fetch = cx
+                    .background_spawn(async move {
+                        let client = el_engine::server::RemoteClient::connect(&root, &name)?;
+                        let pipelines = client.pipelines()?;
+                        let runs = client.runs()?;
+                        let health = client.health().ok();
+                        let logs = client.logs(since).ok();
+                        anyhow::Ok((pipelines, runs, health, logs))
+                    })
+                    .await;
+                if let Ok((_, _, _, Some((_, next)))) = &fetch {
+                    log_cursor = *next;
+                }
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.remote_epoch != epoch {
+                            return false;
+                        }
+                        match fetch {
+                            Ok((pipelines, runs, health, logs)) => {
+                                this.remote_pipelines = pipelines;
+                                this.remote_runs = runs;
+                                this.remote_error = None;
+                                this.remote_health = health.map(|value| {
+                                    let uptime = value
+                                        .get("uptime_secs")
+                                        .and_then(|secs| secs.as_u64())
+                                        .unwrap_or(0);
+                                    let running = value
+                                        .get("running")
+                                        .and_then(|count| count.as_u64())
+                                        .unwrap_or(0);
+                                    let uptime = if uptime >= 3600 {
+                                        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
+                                    } else if uptime >= 60 {
+                                        format!("{}m", uptime / 60)
+                                    } else {
+                                        format!("{uptime}s")
+                                    };
+                                    format!("connected — up {uptime}, {running} running")
+                                        .into()
+                                });
+                                if let Some((lines, next)) = logs {
+                                    this.remote_log_next = next;
+                                    this.remote_logs
+                                        .extend(lines.into_iter().map(SharedString::from));
+                                    let overflow =
+                                        this.remote_logs.len().saturating_sub(400);
+                                    if overflow > 0 {
+                                        this.remote_logs.drain(..overflow);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                this.remote_health = None;
+                                this.remote_error = Some(format!("{error:#}").into());
+                            }
+                        }
+                        cx.notify();
+                        this.surface == Surface::Remote
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(2))
+                    .await;
+            }
+        });
+    }
+
+    /// Fire-and-refresh action against the selected remote.
+    fn remote_action(
+        &mut self,
+        action: impl FnOnce(&el_engine::server::RemoteClient) -> anyhow::Result<()>
+            + Send
+            + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.root.clone() else { return };
+        let Some(name) = self
+            .selected_remote
+            .and_then(|ix| self.remotes.get(ix))
+            .map(|name| name.to_string())
+        else {
+            return;
+        };
+        let task = cx.background_spawn(async move {
+            let client = el_engine::server::RemoteClient::connect(&root, &name)?;
+            action(&client)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.remote_error = Some(format!("{error:#}").into());
+                }
+                this.start_remote_poll(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn run_query(&mut self, cx: &mut Context<Self>) {
@@ -378,6 +538,216 @@ impl ElRunsPanel {
     }
 }
 
+impl ElRunsPanel {
+    fn render_remote(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let chips = h_flex().gap_1().flex_wrap().children(
+            self.remotes
+                .iter()
+                .enumerate()
+                .map(|(ix, name)| {
+                    Button::new(("el-remote", ix), name.clone())
+                        .label_size(LabelSize::Small)
+                        .toggle_state(self.selected_remote == Some(ix))
+                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_remote = Some(ix);
+                            this.remote_pipelines.clear();
+                            this.remote_runs.clear();
+                            this.start_remote_poll(cx);
+                            cx.notify();
+                        }))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let toolbar = h_flex()
+            .w_full()
+            .p_1()
+            .gap_2()
+            .items_center()
+            .child(chips)
+            .child(div().flex_1())
+            .children(self.remote_health.clone().map(|health| {
+                Label::new(health).size(LabelSize::XSmall).color(Color::Success)
+            }))
+            .children(self.remote_error.clone().map(|error| {
+                Label::new(error).size(LabelSize::XSmall).color(Color::Error)
+            }))
+            .child(
+                Button::new("el-remote-logs", "Logs")
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(self.remote_show_logs)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_show_logs = !this.remote_show_logs;
+                        cx.notify();
+                    })),
+            );
+
+        let mut pipelines = v_flex().w_full().px_1().gap_0p5();
+        for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
+            let name = pipeline.name.clone();
+            let meta: SharedString = match &pipeline.schedule {
+                Some(schedule) => format!(
+                    "{} stream{} — runs on {schedule}",
+                    pipeline.streams,
+                    if pipeline.streams == 1 { "" } else { "s" }
+                )
+                .into(),
+                None => format!(
+                    "{} stream{}",
+                    pipeline.streams,
+                    if pipeline.streams == 1 { "" } else { "s" }
+                )
+                .into(),
+            };
+            pipelines = pipelines.child(
+                h_flex()
+                    .w_full()
+                    .h(px(26.))
+                    .px_1()
+                    .gap_2()
+                    .items_center()
+                    .child(Label::new(pipeline.name.clone()).size(LabelSize::Small))
+                    .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(div().flex_1())
+                    .children(pipeline.running.then(|| {
+                        Label::new("running").size(LabelSize::XSmall).color(Color::Accent)
+                    }))
+                    .child(
+                        Button::new(("el-remote-run", ix), "Run")
+                            .label_size(LabelSize::XSmall)
+                            .disabled(pipeline.running)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let name = name.clone();
+                                this.remote_action(
+                                    move |client| client.start_run(&name).map(|_| ()),
+                                    cx,
+                                );
+                            })),
+                    ),
+            );
+        }
+
+        let mut runs = v_flex()
+            .id("el-remote-runs")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_1()
+            .gap_0p5();
+        for run in &self.remote_runs {
+            let status_color = match run.status.as_str() {
+                "ok" => Color::Success,
+                "failed" => Color::Error,
+                _ => Color::Accent,
+            };
+            let run_id = run.id;
+            let is_running = run.status == "running";
+            let detail: SharedString = match &run.error {
+                Some(error) => error.clone().into(),
+                None if is_running => "running…".into(),
+                None => format!("{} rows written", run.rows_written).into(),
+            };
+            runs = runs.child(
+                h_flex()
+                    .w_full()
+                    .h(px(24.))
+                    .px_1()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(format!("#{}", run.id))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(run.pipeline.clone()).size(LabelSize::Small))
+                    .child(
+                        Label::new(run.status.clone())
+                            .size(LabelSize::XSmall)
+                            .color(status_color),
+                    )
+                    .child(
+                        Label::new(detail)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(div().flex_1())
+                    .children(is_running.then(|| {
+                        Button::new(("el-remote-cancel", run.id as usize), "Cancel")
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remote_action(
+                                    move |client| client.cancel(run_id),
+                                    cx,
+                                );
+                            }))
+                    })),
+            );
+        }
+
+        let body: gpui::AnyElement = if self.remote_pipelines.is_empty()
+            && self.remote_runs.is_empty()
+            && self.remote_error.is_none()
+        {
+            v_flex()
+                .flex_1()
+                .p_2()
+                .child(
+                    Label::new("Connecting to the remote…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(pipelines)
+                .child(
+                    div().px_2().pt_1().child(
+                        Label::new("Recent runs")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(runs)
+                .into_any_element()
+        };
+        if self.remote_show_logs {
+            let mut log_pane = v_flex()
+                .id("el-remote-logs-pane")
+                .h(px(140.))
+                .flex_shrink_0()
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .px_2()
+                .py_1();
+            if self.remote_logs.is_empty() {
+                log_pane = log_pane.child(
+                    Label::new("No daemon activity yet.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            }
+            for line in self.remote_logs.iter().rev().take(200) {
+                log_pane = log_pane.child(
+                    Label::new(line.clone()).size(LabelSize::XSmall).color(Color::Muted),
+                );
+            }
+            return v_flex()
+                .size_full()
+                .child(toolbar)
+                .child(body)
+                .child(log_pane)
+                .into_any_element();
+        }
+        v_flex().size_full().child(toolbar).child(body).into_any_element()
+    }
+}
+
 /// The shared results grid: fixed-width columns, accent header, uniform
 /// rows. Used by mapping previews and query results alike.
 fn render_grid(
@@ -526,8 +896,13 @@ impl Render for ElRunsPanel {
                         .toggle_state(this.surface == surface)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.surface = surface;
-                            if surface == Surface::Query {
-                                this.refresh_connections(cx);
+                            match surface {
+                                Surface::Query => this.refresh_connections(cx),
+                                Surface::Remote => {
+                                    this.refresh_connections(cx);
+                                    this.start_remote_poll(cx);
+                                }
+                                Surface::Runs => {}
                             }
                             cx.notify();
                         }))
@@ -540,10 +915,14 @@ impl Render for ElRunsPanel {
                     .border_b_1()
                     .border_color(colors.border)
                     .child(tab("el-console-runs", "Runs", Surface::Runs, self, cx))
-                    .child(tab("el-console-query", "Query", Surface::Query, self, cx));
+                    .child(tab("el-console-query", "Query", Surface::Query, self, cx))
+                    .children((!self.remotes.is_empty()).then(|| {
+                        tab("el-console-remote", "Remote", Surface::Remote, self, cx)
+                    }));
                 let content: gpui::AnyElement = match self.surface {
                     Surface::Runs => self.run_view.clone().into_any_element(),
                     Surface::Query => self.render_query(cx),
+                    Surface::Remote => self.render_remote(cx),
                 };
                 v_flex()
                     .size_full()

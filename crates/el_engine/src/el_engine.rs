@@ -15,6 +15,8 @@ pub mod load;
 pub mod preview;
 pub mod progress;
 pub mod run;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod spec;
 pub mod state;
 pub mod types;

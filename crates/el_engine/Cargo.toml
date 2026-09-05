@@ -22,6 +22,9 @@ postgres = ["dep:postgres", "dep:chrono"]
 # The ADBC driver-manager half of the spike, kept off the default build so
 # the polars cost can be measured in isolation.
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
+# The `el serve` daemon: cron scheduling, retries, failure hooks, and the
+# token-guarded HTTP API. Blocking/threaded like the engine — no tokio.
+server = ["dep:tiny_http", "dep:cron", "dep:chrono-tz", "dep:ureq", "dep:chrono"]
 
 [dependencies]
 anyhow.workspace = true
@@ -63,6 +66,10 @@ chrono = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 adbc_driver_manager = { version = "=0.24.0", optional = true }
+tiny_http = { version = "0.12", features = ["ssl-rustls"], optional = true }
+cron = { version = "0.12", optional = true }
+chrono-tz = { version = "0.10", optional = true }
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

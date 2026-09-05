@@ -148,11 +148,16 @@ pub fn ensure_schemas(project_root: &Path) -> Result<bool> {
         ),
     ] {
         let path = dir.join(name);
-        let missing = std::fs::metadata(&path).map(|meta| meta.len() == 0).unwrap_or(true);
-        if missing {
+        let current = serde_json::to_string_pretty(&schema)?;
+        // Rewrite on drift too — spec keys evolve and stale schemas would
+        // flag valid YAML.
+        let stale = std::fs::read_to_string(&path)
+            .map(|existing| existing != current)
+            .unwrap_or(true);
+        if stale {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("creating {}", dir.display()))?;
-            std::fs::write(&path, serde_json::to_string_pretty(&schema)?)
+            std::fs::write(&path, current)
                 .with_context(|| format!("writing {}", path.display()))?;
             wrote = true;
         }

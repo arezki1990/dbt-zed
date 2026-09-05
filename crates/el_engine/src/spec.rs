@@ -199,6 +199,17 @@ pub struct Pipeline {
     /// Connection name in connections.yml.
     pub source: String,
     pub target: TargetSpec,
+    /// Cron expression executed by `el serve` (6/7-field, seconds first,
+    /// e.g. "0 0 2 * * *" = daily 02:00). Absent = manual runs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// IANA timezone the schedule fires in; defaults to UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetrySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<OnFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<StreamDefaults>,
     pub streams: Vec<StreamSpec>,
@@ -209,6 +220,73 @@ pub struct Pipeline {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+/// Automatic re-runs after a failed run: up to `attempts` retries, each
+/// `backoff` apart ("30s", "5m", "1h").
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RetrySpec {
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<String>,
+}
+
+/// What a failed run triggers, after retries are exhausted. The webhook
+/// URL may be `${VAR}`-templated — never a secret in the spec.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OnFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<String>,
+    /// Shell command run with ZDBT_EL_PIPELINE / ZDBT_EL_ERROR set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// Parses "30s" / "5m" / "1h" (bare numbers = seconds).
+pub fn parse_backoff(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
+        Some(ix) => text.split_at(ix),
+        None => (text, "s"),
+    };
+    let value: u64 = digits.parse().ok()?;
+    let seconds = match unit.trim() {
+        "s" | "" => value,
+        "m" => value * 60,
+        "h" => value * 3600,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+// ---------------------------------------------------------------------------
+// el/remotes.yml — declared `el serve` daemons the IDE can drive.
+
+/// One remote daemon. Non-loopback URLs must be https — the bearer token
+/// never travels plaintext across a network.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RemoteSpec {
+    /// e.g. `https://el.example.com:7431` (http allowed for loopback only).
+    pub url: String,
+    /// Bearer token, normally `${ZDBT_EL_TOKEN}` — never a literal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Remotes {
+    pub version: u32,
+    pub remotes: IndexMap<String, RemoteSpec>,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+pub fn load_remotes(path: &Path) -> Result<Remotes, SpecError> {
+    read_yaml(path)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

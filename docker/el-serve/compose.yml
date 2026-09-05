@@ -1,0 +1,15 @@
+# Example: run the EL daemon against a project checkout.
+#   ZDBT_EL_TOKEN=$(openssl rand -hex 24) EL_PROJECT=~/projects/zdbt-el-test \
+#     docker compose -f docker/el-serve/compose.yml up
+services:
+  el-serve:
+    build:
+      context: ../..
+      dockerfile: docker/el-serve/Dockerfile
+    ports:
+      - "127.0.0.1:7431:7431"   # localhost only — TLS at ingress otherwise
+    environment:
+      ZDBT_EL_TOKEN: ${ZDBT_EL_TOKEN:?set a token}
+    volumes:
+      - ${EL_PROJECT:?path to the EL project}:/project
+    restart: unless-stopped

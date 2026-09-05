@@ -1,0 +1,19 @@
+[package]
+name = "el_serve"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+# The standalone EL daemon: `el serve` without the IDE — what runs in a
+# container or on a VM. Pairs with the on-demand zdbt-el-worker binary.
+[[bin]]
+name = "zdbt-el-serve"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+el_engine = { workspace = true, features = ["server"] }

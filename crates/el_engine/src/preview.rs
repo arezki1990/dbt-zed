@@ -159,6 +159,10 @@ mod tests {
         writeln!(file, "2,oops").unwrap();
 
         let pipeline = crate::spec::Pipeline {
+            schedule: None,
+            timezone: None,
+            retry: None,
+            on_failure: None,
             version: 1,
             pipeline: "t".into(),
             source: "local".into(),

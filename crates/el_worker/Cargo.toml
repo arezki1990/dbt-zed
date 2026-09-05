@@ -27,5 +27,6 @@ postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+el_engine = { workspace = true, features = ["duckdb", "postgres", "server"] }
 futures.workspace = true
 tempfile.workspace = true
