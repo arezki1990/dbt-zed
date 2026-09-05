@@ -99,6 +99,7 @@ impl ElRunView {
         });
 
         self._run = cx.spawn(async move |this, cx| {
+            use futures::future::FusedFuture as _;
             let mut engine = std::pin::pin!(engine.fuse());
             let mut engine_result = None;
             loop {
@@ -107,7 +108,11 @@ impl ElRunView {
                         match event {
                             Some(event) => {
                                 // Drain whatever else is immediately ready
-                                // before one notify.
+                                // before one notify. NOTE: try_recv hitting
+                                // Closed terminates the receiver, so the
+                                // next rx.next() is born terminated — the
+                                // `complete` arm below is what keeps a
+                                // fully-terminated select from panicking.
                                 let mut events = vec![event];
                                 while let Ok(next) = rx.try_recv() {
                                     events.push(next);
@@ -126,7 +131,15 @@ impl ElRunView {
                     result = engine => {
                         engine_result = Some(result);
                     }
+                    complete => break,
                 }
+            }
+            // The channel can close before the engine branch is taken —
+            // the run's verdict must not be lost with it. The only way
+            // engine's Fuse is terminated is the select arm that fills
+            // engine_result, so this await cannot hang.
+            if engine_result.is_none() && !engine.is_terminated() {
+                engine_result = Some(engine.as_mut().await);
             }
             this.update(cx, |this, cx| {
                 if let Some(Err(error)) = engine_result {
