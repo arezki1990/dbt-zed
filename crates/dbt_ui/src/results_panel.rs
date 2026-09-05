@@ -708,6 +708,46 @@ impl DbtResultsPanel {
         Some(client)
     }
 
+    /// Displays a precomputed table in the Results view — the seam the EL
+    /// preview uses so it gets the full grid (sorting, search, CSV export,
+    /// cell inspection) without spawning dbt.
+    pub(crate) fn show_table(
+        &mut self,
+        title: SharedString,
+        columns: Vec<SharedString>,
+        rows: Vec<Vec<SharedString>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.view = ResultsView::Table;
+        self.sort = None;
+        self.hidden_columns.clear();
+        self.col_widths = columns
+            .iter()
+            .enumerate()
+            .map(|(column_ix, column)| {
+                let mut chars = column.len();
+                for row in rows.iter().take(30) {
+                    if let Some(cell) = row.get(column_ix) {
+                        chars = chars.max(cell.len());
+                    }
+                }
+                (column_ix, (chars as f32 * 8.2 + 24.).clamp(90., 340.))
+            })
+            .collect();
+        self.col_resize = None;
+        self.search_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        self.state = ResultsState::Loaded {
+            model: title,
+            columns: Arc::new(columns),
+            rows: Arc::new(rows),
+            compiled: None,
+        };
+        cx.notify();
+    }
+
     pub(crate) fn run_show(
         &mut self,
         target: ShowTarget,

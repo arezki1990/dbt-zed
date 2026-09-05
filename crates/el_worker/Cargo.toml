@@ -1,0 +1,24 @@
+[package]
+name = "el_worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+# The on-demand connector worker: database drivers compile HERE, never
+# into the main zdbt binary. Distributed per platform and downloaded when
+# a pipeline first references a database source.
+[[bin]]
+name = "zdbt-el-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+el_engine = { workspace = true, features = ["duckdb"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

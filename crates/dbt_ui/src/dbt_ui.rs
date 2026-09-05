@@ -38,6 +38,8 @@ actions!(
         OpenPipelines,
         /// Scaffolds the el/ directory: connections, an example pipeline, and YAML completion schemas.
         InitializeWorkspace,
+        /// Closes the pipeline canvas's mapping editor sidebar.
+        CloseMappingEditor,
     ]
 );
 

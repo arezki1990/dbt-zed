@@ -19,7 +19,8 @@ use workspace::{
     item::{Item, TabContentParams},
 };
 
-use super::layout::{ElEdge, ElLayout, ElNode, ElNodeKind, build_layout};
+use super::layout::{ElLayout, ElNode, ElNodeKind, build_layout};
+use super::mapping_editor::{MappingEditorState, SNOWFLAKE_TYPES};
 use el_engine::spec::{Connections, Pipeline, SpecIssue};
 
 const MIN_ZOOM: f32 = 0.4;
@@ -48,7 +49,14 @@ pub struct ElPipelineCanvas {
     pan: (f32, f32),
     zoom: f32,
     drag: Option<CanvasDrag>,
+    drag_moved: bool,
+    project: Entity<Project>,
+    mapping: Option<MappingEditorState>,
+    type_menu: Option<(Entity<ui::ContextMenu>, Point<Pixels>, gpui::Subscription)>,
     _load: Task<()>,
+    _probe: Task<()>,
+    _write: Task<()>,
+    _preview: Task<()>,
     _subscription: gpui::Subscription,
 }
 
@@ -105,7 +113,14 @@ impl ElPipelineCanvas {
             pan: (0., 0.),
             zoom: 1.,
             drag: None,
+            drag_moved: false,
+            project,
+            mapping: None,
+            type_menu: None,
             _load: Task::ready(()),
+            _probe: Task::ready(()),
+            _write: Task::ready(()),
+            _preview: Task::ready(()),
             _subscription: subscription,
         };
         this.reload(cx);
@@ -232,9 +247,25 @@ impl ElPipelineCanvas {
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     this.drag = Some(CanvasDrag::Node(ix, event.position));
+                    this.drag_moved = false;
                     cx.notify();
                 }),
             )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.drag_moved {
+                    return;
+                }
+                let stream_ix = match this.layout.nodes.get(ix).map(|node| &node.kind) {
+                    Some(ElNodeKind::Stream { stream_ix }) => Some(*stream_ix),
+                    Some(ElNodeKind::Cast) => Some(
+                        this.mapping.as_ref().map(|state| state.stream_ix).unwrap_or(0),
+                    ),
+                    _ => None,
+                };
+                if let Some(stream_ix) = stream_ix {
+                    this.open_mapping(stream_ix, window, cx);
+                }
+            }))
             .child(
                 h_flex()
                     .gap_1()
@@ -325,6 +356,9 @@ impl ElPipelineCanvas {
                     this.drag = None;
                     return;
                 }
+                if this.drag.is_some() {
+                    this.drag_moved = true;
+                }
                 match &mut this.drag {
                     Some(CanvasDrag::Canvas(last)) => {
                         this.pan.0 += f32::from(event.position.x - last.x);
@@ -387,6 +421,47 @@ impl ElPipelineCanvas {
         for (ix, node) in nodes.iter().enumerate() {
             surface = surface.child(self.render_node(ix, node, cx));
         }
+        // Edge midpoint hotspots: click a stream wire to edit its mapping.
+        let edges = self.layout.edges.clone();
+        for edge in &edges {
+            let Some(stream_ix) = edge.stream_ix else { continue };
+            let (Some(from), Some(to)) = (nodes.get(edge.from), nodes.get(edge.to)) else {
+                continue;
+            };
+            let mid_x = ((from.x + from.width) + to.x) / 2. * self.zoom + self.pan.0 - 11.;
+            let mid_y = ((from.y + from.height / 2.) + (to.y + to.height / 2.)) / 2. * self.zoom
+                + self.pan.1
+                - 11.;
+            surface = surface.child(
+                div()
+                    .id(("el-hotspot", stream_ix))
+                    .absolute()
+                    .left(px(mid_x))
+                    .top(px(mid_y))
+                    .size(px(22.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().elevated_surface_background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(cx.theme().colors().border_focused))
+                    .child(
+                        Icon::new(IconName::Filter)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_mapping(stream_ix, window, cx);
+                    })),
+            );
+        }
         surface.into_any_element()
     }
 }
@@ -425,6 +500,454 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
 
 fn loaded_connections(project_root: &std::path::Path) -> Option<Connections> {
     el_engine::spec::load_connections(&super::el_dir(project_root).join("connections.yml")).ok()
+}
+
+impl ElPipelineCanvas {
+    fn toast(&self, message: String, cx: &mut Context<Self>) {
+        struct ElCanvasToast;
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<ElCanvasToast>(),
+                        message,
+                    ),
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    fn open_mapping(&mut self, stream_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else { return };
+        if stream_ix >= loaded.pipeline.streams.len() {
+            return;
+        }
+        let pipeline = loaded.pipeline.clone();
+        self.mapping = Some(MappingEditorState::open(&pipeline, stream_ix, window, cx));
+        self.kick_probe(pipeline, stream_ix, window, cx);
+        cx.notify();
+    }
+
+    fn close_mapping(&mut self, cx: &mut Context<Self>) {
+        self.mapping = None;
+        self.type_menu = None;
+        cx.notify();
+    }
+
+    /// Background schema probe: fills inferred dtypes and unspecced
+    /// columns via the same preview path a run uses.
+    fn kick_probe(
+        &mut self,
+        pipeline: Arc<Pipeline>,
+        stream_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project_root = self.project_root.clone();
+        let stream_name = pipeline.streams[stream_ix].name.clone();
+        let excluded: Vec<String> = pipeline.streams[stream_ix]
+            .select
+            .as_ref()
+            .map(|select| select.exclude.clone())
+            .unwrap_or_default();
+        let worker = super::find_worker();
+        let task = cx.background_spawn(async move {
+            el_engine::preview_stream(
+                &project_root,
+                &pipeline,
+                &stream_name,
+                30,
+                worker.as_deref(),
+                &el_engine::CancelFlag::default(),
+            )
+        });
+        self._probe = cx.spawn_in(_window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                let Some(state) = &mut this.mapping else { return };
+                if state.stream_ix != stream_ix {
+                    return;
+                }
+                match result {
+                    Ok(preview) => state.absorb_probe(&preview.columns, &excluded, window, cx),
+                    Err(error) => {
+                        state.probing = false;
+                        state.probe_error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn apply_mapping(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.mapping else { return };
+        let Some(loaded) = &self.loaded else { return };
+        let mut pipeline = (*loaded.pipeline).clone();
+        match state.apply(&mut pipeline, cx) {
+            Ok(_) => {}
+            Err(error) => {
+                self.toast(format!("Apply failed: {error:#}"), cx);
+                return;
+            }
+        }
+        if let Some(state) = &mut self.mapping {
+            state.dirty = false;
+        }
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        let spec_path = self.spec_path.clone();
+        self._write = cx.spawn_in(_window, async move |this, cx| {
+            let result =
+                super::spec_io::write_spec(workspace, project, spec_path, pipeline, cx).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.reload(cx),
+                    Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+                }
+            })
+            .ok();
+        });
+    }
+
+    /// Runs the bounded preview and shows rows (or failed casts) in the
+    /// results panel's grid.
+    fn preview_to_grid(&mut self, failures_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.mapping else { return };
+        let Some(loaded) = &self.loaded else { return };
+        let pipeline = loaded.pipeline.clone();
+        let stream_ix = state.stream_ix;
+        let stream_name = pipeline.streams[stream_ix].name.clone();
+        let project_root = self.project_root.clone();
+        let worker = super::find_worker();
+        let title: SharedString = if failures_only {
+            format!("{stream_name} · failed casts").into()
+        } else {
+            format!("{stream_name} · preview").into()
+        };
+        let task = cx.background_spawn(async move {
+            el_engine::preview_stream(
+                &project_root,
+                &pipeline,
+                &stream_name,
+                200,
+                worker.as_deref(),
+                &el_engine::CancelFlag::default(),
+            )
+        });
+        let workspace = self.workspace.clone();
+        self._preview = cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            match result {
+                Ok(preview) => {
+                    let (columns, rows): (Vec<SharedString>, Vec<Vec<SharedString>>) =
+                        if failures_only {
+                            (
+                                vec!["column".into(), "failed".into(), "sample values".into()],
+                                preview
+                                    .failures
+                                    .iter()
+                                    .map(|failure| {
+                                        vec![
+                                            failure.column.clone().into(),
+                                            failure.count.to_string().into(),
+                                            failure.samples.join(" · ").into(),
+                                        ]
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            (
+                                preview
+                                    .columns
+                                    .iter()
+                                    .map(|column| {
+                                        format!("{} ({})", column.name, column.target_type).into()
+                                    })
+                                    .collect(),
+                                preview
+                                    .rows
+                                    .iter()
+                                    .map(|row| {
+                                        row.iter().map(|cell| cell.clone().into()).collect()
+                                    })
+                                    .collect(),
+                            )
+                        };
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            let Some(panel) =
+                                workspace.panel::<crate::results_panel::DbtResultsPanel>(cx)
+                            else {
+                                return;
+                            };
+                            workspace
+                                .focus_panel::<crate::results_panel::DbtResultsPanel>(window, cx);
+                            panel.update(cx, |panel, cx| {
+                                panel.show_table(title, columns, rows, window, cx)
+                            });
+                        })
+                        .ok();
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.toast(format!("Preview failed: {error:#}"), cx)
+                    })
+                    .ok();
+                }
+            }
+        });
+    }
+
+    fn deploy_type_menu(
+        &mut self,
+        draft_ix: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity().downgrade();
+        let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+            menu = menu.entry("inherit source type", None, {
+                let entity = entity.clone();
+                move |_, cx| {
+                    entity
+                        .update(cx, |this, cx| this.set_draft_cast(draft_ix, None, cx))
+                        .ok();
+                }
+            });
+            for spelling in SNOWFLAKE_TYPES {
+                let entity = entity.clone();
+                menu = menu.entry(*spelling, None, move |_, cx| {
+                    entity
+                        .update(cx, |this, cx| {
+                            this.set_draft_cast(draft_ix, Some((*spelling).into()), cx)
+                        })
+                        .ok();
+                });
+            }
+            menu
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.type_menu.take();
+            cx.notify();
+        });
+        self.type_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn set_draft_cast(&mut self, draft_ix: usize, cast: Option<SharedString>, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.mapping {
+            if let Some(draft) = state.drafts.get_mut(draft_ix) {
+                draft.cast = cast;
+                state.dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_mapping_sidebar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let Some(state) = &self.mapping else {
+            return div().into_any_element();
+        };
+        let stream_count = self
+            .loaded
+            .as_ref()
+            .map(|loaded| loaded.pipeline.streams.len())
+            .unwrap_or(0);
+        let stream_ix = state.stream_ix;
+
+        let mut rows = v_flex().id("el-map-rows").flex_1().min_h_0().overflow_y_scroll().gap_0p5().p_1();
+        for (draft_ix, draft) in state.drafts.iter().enumerate() {
+            let include = draft.include;
+            let strict = draft.strict;
+            let row = h_flex()
+                .w_full()
+                .gap_1()
+                .items_center()
+                .px_1()
+                .py_0p5()
+                .rounded_sm()
+                .when(!include, |row| row.opacity(0.5))
+                .child(
+                    IconButton::new(
+                        ("el-inc", draft_ix),
+                        if include {
+                            IconName::Check
+                        } else {
+                            IconName::Circle
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text(if include {
+                        "Included — click to exclude"
+                    } else {
+                        "Excluded — click to include"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = &mut this.mapping {
+                            if let Some(draft) = state.drafts.get_mut(draft_ix) {
+                                draft.include = !draft.include;
+                                state.dirty = true;
+                            }
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    v_flex()
+                        .w(px(120.))
+                        .flex_shrink_0()
+                        .child(Label::new(draft.name.clone()).size(LabelSize::Small).truncate())
+                        .child(
+                            Label::new(draft.inferred.clone().unwrap_or_else(|| "…".into()))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .child(
+                    Icon::new(IconName::ArrowRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().w(px(100.)).flex_shrink_0().child(draft.rename.clone()))
+                .child(
+                    Button::new(
+                        ("el-type", draft_ix),
+                        draft.cast.clone().unwrap_or_else(|| "inherit".into()),
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                        let position = match event {
+                            gpui::ClickEvent::Mouse(event) => event.up.position,
+                            _ => Point::default(),
+                        };
+                        this.deploy_type_menu(draft_ix, position, window, cx);
+                    })),
+                )
+                .child(
+                    IconButton::new(("el-strict", draft_ix), IconName::Warning)
+                        .icon_size(IconSize::XSmall)
+                        .toggle_state(strict)
+                        .tooltip(ui::Tooltip::text(if strict {
+                            "Strict: failures stop the stream"
+                        } else {
+                            "Lax: failures become NULL and are counted"
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(state) = &mut this.mapping {
+                                if let Some(draft) = state.drafts.get_mut(draft_ix) {
+                                    draft.strict = !draft.strict;
+                                    state.dirty = true;
+                                }
+                            }
+                            cx.notify();
+                        })),
+                );
+            rows = rows.child(row);
+        }
+
+        v_flex()
+            .w(px(420.))
+            .flex_shrink_0()
+            .h_full()
+            .border_l_1()
+            .border_color(colors.border)
+            .bg(colors.panel_background)
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_1()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .child(
+                        IconButton::new("el-map-prev", IconName::ChevronLeft)
+                            .icon_size(IconSize::Small)
+                            .disabled(stream_ix == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
+                                if ix > 0 {
+                                    this.open_mapping(ix - 1, window, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Label::new(state.stream_name.clone())
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        IconButton::new("el-map-next", IconName::ChevronRight)
+                            .icon_size(IconSize::Small)
+                            .disabled(stream_ix + 1 >= stream_count)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
+                                this.open_mapping(ix + 1, window, cx);
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("el-map-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_mapping(cx))),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Label::new("target table")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().child(state.target_table.clone())),
+            )
+            .children(state.probe_error.clone().map(|error| {
+                div().px_2().py_1().child(
+                    Label::new(error).size(LabelSize::XSmall).color(Color::Warning),
+                )
+            }))
+            .child(rows)
+            .child(
+                h_flex()
+                    .w_full()
+                    .p_1()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(colors.border)
+                    .child(
+                        Button::new("el-map-preview", "Preview")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.preview_to_grid(false, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("el-map-failed", "Failed casts")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.preview_to_grid(true, window, cx)
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("el-map-apply", "Apply")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.apply_mapping(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl EventEmitter<()> for ElPipelineCanvas {}
@@ -570,7 +1093,30 @@ impl Render for ElPipelineCanvas {
                 ),
             )
         } else {
-            body.child(self.render_canvas(cx))
+            let canvas = self.render_canvas(cx);
+            let content = if self.mapping.is_some() {
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().flex_1().min_w_0().h_full().child(canvas))
+                    .child(self.render_mapping_sidebar(cx))
+                    .into_any_element()
+            } else {
+                canvas
+            };
+            body.child(content)
         }
+        .on_action(cx.listener(|this, _: &crate::CloseMappingEditor, _, cx| {
+            this.close_mapping(cx);
+        }))
+        .children(self.type_menu.as_ref().map(|(menu, position, _)| {
+            gpui::deferred(
+                gpui::anchored()
+                    .position(*position)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(menu.clone()),
+            )
+            .with_priority(3)
+        }))
     }
 }

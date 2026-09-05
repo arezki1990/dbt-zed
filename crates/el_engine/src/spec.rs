@@ -64,6 +64,7 @@ pub enum Connection {
     Mysql(DbConn),
     Mssql(MssqlConn),
     Snowflake(SnowflakeConn),
+    Duckdb(DuckdbConn),
     S3(ObjectStoreConn),
     Gcs(ObjectStoreConn),
     Azure(ObjectStoreConn),
@@ -77,6 +78,7 @@ impl Connection {
             Connection::Mysql(_) => "mysql",
             Connection::Mssql(_) => "mssql",
             Connection::Snowflake(_) => "snowflake",
+            Connection::Duckdb(_) => "duckdb",
             Connection::S3(_) => "s3",
             Connection::Gcs(_) => "gcs",
             Connection::Azure(_) => "azure",
@@ -101,6 +103,14 @@ pub struct DbConn {
     /// Full connection URL, e.g. `postgres://user:pass@host:5432/db` —
     /// normally `${SOME_URL}`.
     pub url: String,
+}
+
+/// A DuckDB database file — the zero-credential source for local testing.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DuckdbConn {
+    /// Project-relative or absolute path to the .duckdb file; may be
+    /// `${VAR}`-templated.
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -494,6 +504,28 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
                         format!("column {:?} has parse: but no temporal cast", column.name),
                     );
                 }
+            }
+        }
+        // Stream shape must match the source connection's kind.
+        if let Some(conn) = source_conn {
+            let db_kind = matches!(conn.kind(), "duckdb" | "postgres" | "mysql" | "mssql");
+            match &stream.source {
+                SourceObject::Table { .. } if !db_kind => issue(
+                    Some(&stream.name),
+                    format!(
+                        "table sources need a database connection, but {:?} is {}",
+                        pipeline.source,
+                        conn.kind()
+                    ),
+                ),
+                SourceObject::Path { .. } if db_kind => issue(
+                    Some(&stream.name),
+                    format!(
+                        "file sources can't use database connection {:?} — use a local/object-store connection",
+                        pipeline.source
+                    ),
+                ),
+                _ => {}
             }
         }
         // File streams can't be incremental in v1 (no cursor pushdown).

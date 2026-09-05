@@ -8,6 +8,8 @@ use anyhow::{Context as _, Result};
 use polars::prelude::*;
 
 use crate::cast::{CastPlan, ColumnFailures};
+use crate::connectors::SourceContext;
+use crate::env::EnvMap;
 use crate::progress::CancelFlag;
 use crate::spec::{Pipeline, StreamSpec};
 
@@ -37,6 +39,7 @@ pub fn preview_stream(
     pipeline: &Pipeline,
     stream_name: &str,
     limit: usize,
+    worker: Option<&std::path::Path>,
     cancel: &CancelFlag,
 ) -> Result<PreviewResult> {
     let stream = pipeline
@@ -44,17 +47,31 @@ pub fn preview_stream(
         .iter()
         .find(|stream| stream.name == stream_name)
         .with_context(|| format!("no stream named {stream_name:?} in the pipeline"))?;
-    preview(project_root, stream, limit, cancel)
+    // Connections + env resolve the same way a real run will.
+    let connections = crate::spec::load_connections(
+        &project_root.join("el").join("connections.yml"),
+    )
+    .ok();
+    let env = EnvMap::load(project_root, None);
+    let ctx = SourceContext {
+        project_root,
+        connection: connections
+            .as_ref()
+            .and_then(|connections| connections.connections.get(&pipeline.source)),
+        env: &env,
+        worker,
+    };
+    preview(&ctx, stream, limit, cancel)
 }
 
 fn preview(
-    project_root: &std::path::Path,
+    ctx: &SourceContext,
     stream: &StreamSpec,
     limit: usize,
     cancel: &CancelFlag,
 ) -> Result<PreviewResult> {
     let limit = limit.clamp(1, 10_000);
-    let mut extractor = crate::connectors::make_extractor(project_root, stream, limit)?;
+    let mut extractor = crate::connectors::make_extractor(ctx, stream, limit)?;
     let schema = extractor.schema()?;
     let plan = CastPlan::build(&schema, stream)?;
 
@@ -182,6 +199,7 @@ mod tests {
             &pipeline,
             "d",
             100,
+            None,
             &crate::progress::CancelFlag::default(),
         )
         .unwrap();

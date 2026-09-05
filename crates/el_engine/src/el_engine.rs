@@ -15,6 +15,10 @@ pub mod progress;
 pub mod spec;
 pub mod types;
 
+/// Re-exported so downstream binaries (the connector worker) never pin a
+/// second polars.
+pub use polars;
+
 pub use cast::{CastOutcome, CastPlan, ColumnFailures};
 pub use preview::{PreviewColumn, PreviewResult, preview_stream};
 pub use progress::{CancelFlag, Phase, ProgressEvent};

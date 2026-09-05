@@ -13,6 +13,10 @@ path = "src/el_engine.rs"
 
 [features]
 default = []
+# DuckDB source connector — bundles the DuckDB engine (heavy C++ build).
+# Deliberately NOT default: database connectors compile into the
+# on-demand `el_worker` binary, never into the main app.
+duckdb = ["dep:duckdb", "dep:chrono"]
 # The ADBC driver-manager half of the spike, kept off the default build so
 # the polars cost can be measured in isolation.
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
@@ -25,6 +29,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 # Exact-pinned: the 0.5x Rust API churns between minor versions.
 polars = { version = "=0.55.2", default-features = false, features = [
@@ -49,6 +54,8 @@ polars = { version = "=0.55.2", default-features = false, features = [
     "azure",
 ] }
 adbc_core = { version = "=0.24.0", optional = true }
+chrono = { workspace = true, optional = true }
+duckdb = { workspace = true, optional = true }
 adbc_driver_manager = { version = "=0.24.0", optional = true }
 
 [dev-dependencies]

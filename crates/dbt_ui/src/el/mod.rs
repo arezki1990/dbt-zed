@@ -3,7 +3,9 @@
 
 pub mod canvas_item;
 pub mod layout;
+pub mod mapping_editor;
 pub mod scaffold;
+pub mod spec_io;
 
 pub use canvas_item::ElPipelineCanvas;
 
@@ -15,6 +17,28 @@ use workspace::Workspace;
 /// The EL directory for a dbt project root — `el/` beside dbt_project.yml.
 pub fn el_dir(project_root: &Path) -> PathBuf {
     project_root.join("el")
+}
+
+/// Locates the on-demand connector worker binary: an explicit env
+/// override, then a sibling of the running executable (dev builds and
+/// bundles), then the managed install dir (the future download target).
+pub fn find_worker() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ZDBT_EL_WORKER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("zdbt-el-worker");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+    let managed = paths::data_dir().join("el-worker").join("zdbt-el-worker");
+    managed.is_file().then_some(managed)
 }
 
 /// `el::OpenPipelines`: opens the canvas for the project's pipeline(s) —
