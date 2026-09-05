@@ -63,6 +63,8 @@ pub struct ElRunsPanel {
     remote_logs: Vec<SharedString>,
     remote_log_next: u64,
     remote_show_logs: bool,
+    /// A pipeline opened in the detail view; None = overview.
+    remote_detail: Option<SharedString>,
     remote_epoch: u64,
     _remote_poll: Task<()>,
 }
@@ -123,6 +125,7 @@ impl ElRunsPanel {
                 remote_logs: Vec::new(),
                 remote_log_next: 0,
                 remote_show_logs: false,
+                remote_detail: None,
                 remote_epoch: 0,
                 _remote_poll: Task::ready(()),
             }
@@ -156,6 +159,7 @@ impl ElRunsPanel {
     /// A profile switch changed what every connection name means: drop
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
+        self.remote_detail = None;
         self.result = None;
         self.query_error = None;
         self.elapsed = None;
@@ -579,6 +583,7 @@ impl ElRunsPanel {
                             this.remote_pipelines.clear();
                             this.remote_runs.clear();
                             this.remote_action_error = None;
+                            this.remote_detail = None;
                             this.start_remote_poll(cx);
                             cx.notify();
                         }))
@@ -611,44 +616,131 @@ impl ElRunsPanel {
                     })),
             );
 
-        let mut pipelines = v_flex().w_full().px_1().gap_0p5();
-        for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
-            let name = pipeline.name.clone();
-            let streams_text = format!(
-                "{} stream{}",
-                pipeline.streams,
-                if pipeline.streams == 1 { "" } else { "s" }
-            );
-            let meta: SharedString = match (&pipeline.schedule, pipeline.next_run_unix) {
-                (Some(schedule), Some(next)) => format!(
-                    "{streams_text} — runs on {schedule}, next {}",
-                    relative_time(next, true)
+        let body: gpui::AnyElement = if self.remote_pipelines.is_empty()
+            && self.remote_runs.is_empty()
+            && self.remote_error.is_none()
+        {
+            v_flex()
+                .flex_1()
+                .p_2()
+                .child(
+                    Label::new("Connecting to the remote…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 )
-                .into(),
-                (Some(schedule), None) => {
-                    format!("{streams_text} — runs on {schedule}").into()
-                }
-                (None, _) => streams_text.into(),
+                .into_any_element()
+        } else if let Some(detail) = self.remote_detail.clone() {
+            self.render_remote_detail(&detail, cx)
+        } else {
+            self.render_remote_overview(cx)
+        };
+
+        if self.remote_show_logs {
+            let mut log_pane = v_flex()
+                .id("el-remote-logs-pane")
+                .h(px(140.))
+                .flex_shrink_0()
+                .overflow_y_scroll()
+                .border_t_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .px_2()
+                .py_1();
+            if self.remote_logs.is_empty() {
+                log_pane = log_pane.child(
+                    Label::new("No daemon activity yet.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+            }
+            for line in self.remote_logs.iter().rev().take(200) {
+                log_pane = log_pane.child(
+                    Label::new(line.clone()).size(LabelSize::XSmall).color(Color::Muted),
+                );
+            }
+            return v_flex()
+                .size_full()
+                .child(toolbar)
+                .child(body)
+                .child(log_pane)
+                .into_any_element();
+        }
+        v_flex().size_full().child(toolbar).child(body).into_any_element()
+    }
+
+    /// The overview: pipelines as a striped table (click a row for its
+    /// detail view), recent runs below.
+    fn render_remote_overview(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let colors = &colors;
+        let head = |width: f32, text: &'static str| {
+            div().w(px(width)).flex_shrink_0().child(
+                Label::new(text).size(LabelSize::XSmall).color(Color::Accent),
+            )
+        };
+        let pipeline_header = h_flex()
+            .w_full()
+            .px_2()
+            .gap_2()
+            .child(head(150., "pipeline"))
+            .child(head(70., "streams"))
+            .child(head(150., "schedule"))
+            .child(head(90., "next run"))
+            .child(head(70., "state"));
+        let mut pipelines = v_flex().w_full().px_1();
+        for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
+            let name: SharedString = pipeline.name.clone().into();
+            let run_name = pipeline.name.clone();
+            let cell = |width: f32, text: String, color: Color| {
+                div().w(px(width)).flex_shrink_0().overflow_hidden().child(
+                    Label::new(text).size(LabelSize::XSmall).color(color).truncate(),
+                )
             };
+            let open_name = name.clone();
             pipelines = pipelines.child(
                 h_flex()
+                    .id(("el-remote-pipeline", ix))
                     .w_full()
                     .h(px(26.))
                     .px_1()
                     .gap_2()
                     .items_center()
-                    .child(Label::new(pipeline.name.clone()).size(LabelSize::Small))
-                    .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted))
-                    .child(div().flex_1())
-                    .children(pipeline.running.then(|| {
-                        Label::new("running").size(LabelSize::XSmall).color(Color::Accent)
+                    .rounded_sm()
+                    .when(ix % 2 == 1, |row| row.bg(colors.element_background))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remote_detail = Some(open_name.clone());
+                        cx.notify();
                     }))
+                    .child(cell(150., pipeline.name.clone(), Color::Default))
+                    .child(cell(70., pipeline.streams.to_string(), Color::Muted))
+                    .child(cell(
+                        150.,
+                        pipeline.schedule.clone().unwrap_or_else(|| "manual".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        90.,
+                        pipeline
+                            .next_run_unix
+                            .map(|next| relative_time(next, true))
+                            .unwrap_or_else(|| "—".into()),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        70.,
+                        if pipeline.running { "running".into() } else { "idle".into() },
+                        if pipeline.running { Color::Accent } else { Color::Muted },
+                    ))
+                    .child(div().flex_1())
                     .child(
                         Button::new(("el-remote-run", ix), "Run")
                             .label_size(LabelSize::XSmall)
                             .disabled(pipeline.running)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let name = name.clone();
+                                cx.stop_propagation();
+                                let name = run_name.clone();
                                 this.remote_action(
                                     move |client| client.start_run(&name).map(|_| ()),
                                     cx,
@@ -658,7 +750,115 @@ impl ElRunsPanel {
             );
         }
 
-        // Past runs as a table: fixed columns, error takes the remainder.
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(pipeline_header)
+            .child(pipelines)
+            .child(
+                div().px_2().pt_1().child(
+                    Label::new("Recent runs")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(self.render_runs_table(None, cx))
+            .into_any_element()
+    }
+
+    /// One pipeline's page: back button, its facts, its runs.
+    fn render_remote_detail(
+        &mut self,
+        name: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let colors = &colors;
+        let pipeline = self
+            .remote_pipelines
+            .iter()
+            .find(|pipeline| pipeline.name == name.as_ref());
+        let run_name = name.to_string();
+        let running = pipeline.map(|pipeline| pipeline.running).unwrap_or(false);
+        let meta: SharedString = match pipeline {
+            None => "no longer on the server".into(),
+            Some(pipeline) => {
+                let streams = format!(
+                    "{} stream{}",
+                    pipeline.streams,
+                    if pipeline.streams == 1 { "" } else { "s" }
+                );
+                match (&pipeline.schedule, pipeline.next_run_unix) {
+                    (Some(schedule), Some(next)) => format!(
+                        "{streams} — runs on {schedule}, next {}",
+                        relative_time(next, true)
+                    )
+                    .into(),
+                    (Some(schedule), None) => format!("{streams} — runs on {schedule}").into(),
+                    (None, _) => format!("{streams} — manual runs only").into(),
+                }
+            }
+        };
+        let header = h_flex()
+            .w_full()
+            .px_1()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                IconButton::new("el-remote-back", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Back to pipelines"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_detail = None;
+                        cx.notify();
+                    })),
+            )
+            .child(Label::new(name.clone()).size(LabelSize::Small))
+            .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted))
+            .child(div().flex_1())
+            .children(running.then(|| {
+                Label::new("running").size(LabelSize::XSmall).color(Color::Accent)
+            }))
+            .child(
+                Button::new("el-remote-detail-run", "Run")
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Filled)
+                    .disabled(running || pipeline.is_none())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let name = run_name.clone();
+                        this.remote_action(
+                            move |client| client.start_run(&name).map(|_| ()),
+                            cx,
+                        );
+                    })),
+            );
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(
+                div().px_2().pt_1().child(
+                    Label::new("Runs of this pipeline")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(self.render_runs_table(Some(name.as_ref()), cx))
+            .into_any_element()
+    }
+
+    /// The run-history table, striped; `filter` narrows to one pipeline.
+    fn render_runs_table(
+        &mut self,
+        filter: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let colors = &colors;
         let col = |width: f32, element: gpui::AnyElement| {
             div().w(px(width)).flex_shrink_0().overflow_hidden().child(element)
         };
@@ -671,12 +871,12 @@ impl ElRunsPanel {
                     .into_any_element(),
             )
         };
-        let header = h_flex()
-            .w_full()
-            .px_2()
-            .gap_2()
-            .child(head(44., "run"))
-            .child(head(130., "pipeline"))
+        let show_pipeline = filter.is_none();
+        let mut header = h_flex().w_full().px_2().gap_2().child(head(44., "run"));
+        if show_pipeline {
+            header = header.child(head(130., "pipeline"));
+        }
+        let header = header
             .child(head(70., "status"))
             .child(head(80., "started"))
             .child(head(64., "duration"))
@@ -687,14 +887,20 @@ impl ElRunsPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Accent),
             );
+
         let mut runs = v_flex()
             .id("el-remote-runs")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_1()
-            .gap_0p5();
+            .px_1();
+        let mut shown = 0usize;
         for run in &self.remote_runs {
+            if filter.is_some_and(|name| run.pipeline != name) {
+                continue;
+            }
+            let stripe = shown % 2 == 1;
+            shown += 1;
             let status_color = match run.status.as_str() {
                 "ok" => Color::Success,
                 "failed" => Color::Error,
@@ -713,16 +919,20 @@ impl ElRunsPanel {
                         .into_any_element(),
                 )
             };
+            let mut row = h_flex()
+                .w_full()
+                .h(px(24.))
+                .px_1()
+                .gap_2()
+                .items_center()
+                .rounded_sm()
+                .when(stripe, |row| row.bg(colors.element_background))
+                .child(cell(44., format!("#{}", run.id), Color::Muted));
+            if show_pipeline {
+                row = row.child(cell(130., run.pipeline.clone(), Color::Default));
+            }
             runs = runs.child(
-                h_flex()
-                    .w_full()
-                    .h(px(24.))
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .child(cell(44., format!("#{}", run.id), Color::Muted))
-                    .child(cell(130., run.pipeline.clone(), Color::Default))
-                    .child(cell(70., run.status.clone(), status_color))
+                row.child(cell(70., run.status.clone(), status_color))
                     .child(cell(
                         80.,
                         relative_time(run.started_unix, false),
@@ -770,67 +980,19 @@ impl ElRunsPanel {
                     })),
             );
         }
-
-        let body: gpui::AnyElement = if self.remote_pipelines.is_empty()
-            && self.remote_runs.is_empty()
-            && self.remote_error.is_none()
-        {
-            v_flex()
-                .flex_1()
-                .p_2()
-                .child(
-                    Label::new("Connecting to the remote…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .into_any_element()
-        } else {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(pipelines)
-                .child(
-                    div().px_2().pt_1().child(
-                        Label::new("Recent runs")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
-                .child(header)
-                .child(runs)
-                .into_any_element()
-        };
-        if self.remote_show_logs {
-            let mut log_pane = v_flex()
-                .id("el-remote-logs-pane")
-                .h(px(140.))
-                .flex_shrink_0()
-                .overflow_y_scroll()
-                .border_t_1()
-                .border_color(colors.border)
-                .bg(colors.editor_background)
-                .px_2()
-                .py_1();
-            if self.remote_logs.is_empty() {
-                log_pane = log_pane.child(
-                    Label::new("No daemon activity yet.")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-            }
-            for line in self.remote_logs.iter().rev().take(200) {
-                log_pane = log_pane.child(
-                    Label::new(line.clone()).size(LabelSize::XSmall).color(Color::Muted),
-                );
-            }
-            return v_flex()
-                .size_full()
-                .child(toolbar)
-                .child(body)
-                .child(log_pane)
-                .into_any_element();
+        if shown == 0 {
+            runs = runs.child(div().px_1().py_1().child(
+                Label::new("No runs yet — press Run above.")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ));
         }
-        v_flex().size_full().child(toolbar).child(body).into_any_element()
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(runs)
+            .into_any_element()
     }
 }
 
