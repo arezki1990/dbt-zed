@@ -218,12 +218,12 @@ impl ElPipelineCanvas {
         let zoom = self.zoom;
         let accent = match node.kind {
             ElNodeKind::Stream { .. } => cx.theme().status().info,
-            ElNodeKind::Cast => cx.theme().status().warning,
+            ElNodeKind::Map { .. } => cx.theme().status().warning,
             ElNodeKind::Target => cx.theme().status().success,
         };
         let icon = match node.kind {
             ElNodeKind::Stream { .. } => IconName::FileCode,
-            ElNodeKind::Cast => IconName::ArrowRightLeft,
+            ElNodeKind::Map { .. } => IconName::ArrowRightLeft,
             ElNodeKind::Target => IconName::DatabaseZap,
         };
         let x = node.x * zoom + self.pan.0;
@@ -259,10 +259,8 @@ impl ElPipelineCanvas {
                     return;
                 }
                 let stream_ix = match this.layout.nodes.get(ix).map(|node| &node.kind) {
-                    Some(ElNodeKind::Stream { stream_ix }) => Some(*stream_ix),
-                    Some(ElNodeKind::Cast) => Some(
-                        this.mapping.as_ref().map(|state| state.stream_ix).unwrap_or(0),
-                    ),
+                    Some(ElNodeKind::Stream { stream_ix })
+                    | Some(ElNodeKind::Map { stream_ix }) => Some(*stream_ix),
                     _ => None,
                 };
                 if let Some(stream_ix) = stream_ix {
@@ -329,7 +327,6 @@ impl ElPipelineCanvas {
                     if let Ok(path) = path.build() {
                         window.paint_path(path, stroke);
                     }
-                    let _ = &edge.stream_ix;
                 }
             },
         )
@@ -425,47 +422,6 @@ impl ElPipelineCanvas {
         let nodes = self.layout.nodes.clone();
         for (ix, node) in nodes.iter().enumerate() {
             surface = surface.child(self.render_node(ix, node, cx));
-        }
-        // Edge midpoint hotspots: click a stream wire to edit its mapping.
-        let edges = self.layout.edges.clone();
-        for edge in &edges {
-            let Some(stream_ix) = edge.stream_ix else { continue };
-            let (Some(from), Some(to)) = (nodes.get(edge.from), nodes.get(edge.to)) else {
-                continue;
-            };
-            let mid_x = ((from.x + from.width) + to.x) / 2. * self.zoom + self.pan.0 - 11.;
-            let mid_y = ((from.y + from.height / 2.) + (to.y + to.height / 2.)) / 2. * self.zoom
-                + self.pan.1
-                - 11.;
-            surface = surface.child(
-                div()
-                    .id(("el-hotspot", stream_ix))
-                    .absolute()
-                    .left(px(mid_x))
-                    .top(px(mid_y))
-                    .size(px(22.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .bg(cx.theme().colors().elevated_surface_background)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(cx.theme().colors().border_focused))
-                    .child(
-                        Icon::new(IconName::Filter)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_mapping(stream_ix, window, cx);
-                    })),
-            );
         }
         surface.into_any_element()
     }

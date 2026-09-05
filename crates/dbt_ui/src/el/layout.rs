@@ -1,9 +1,9 @@
 //! The pipeline canvas layout: spec → positioned nodes and edges.
-//! Auto-layout stacks streams on the left, Cast & Map in the middle, the
-//! Snowflake target on the right; positions in the spec's `canvas:` block
-//! override per node.
+//! Auto-layout draws one row per stream — source table → that stream's
+//! own Cast & Map step — converging on the warehouse target at the
+//! right; positions in the spec's `canvas:` block override per node.
 
-use el_engine::spec::{Connection, Connections, Pipeline, SourceObject};
+use el_engine::spec::{Connection, Connections, Mode, Pipeline, SourceObject};
 use gpui::SharedString;
 
 pub const NODE_WIDTH: f32 = 190.;
@@ -15,7 +15,9 @@ pub const PADDING: f32 = 40.;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NodeId {
     Stream(String),
-    Cast,
+    /// One Cast & Map step per stream — casting is per table, and the
+    /// graph says so.
+    Map(String),
     Target,
 }
 
@@ -24,7 +26,7 @@ impl NodeId {
     pub fn spec_key(&self) -> String {
         match self {
             NodeId::Stream(name) => format!("stream:{name}"),
-            NodeId::Cast => "cast".to_owned(),
+            NodeId::Map(name) => format!("map:{name}"),
             NodeId::Target => "target".to_owned(),
         }
     }
@@ -33,7 +35,7 @@ impl NodeId {
 #[derive(Clone)]
 pub enum ElNodeKind {
     Stream { stream_ix: usize },
-    Cast,
+    Map { stream_ix: usize },
     Target,
 }
 
@@ -53,9 +55,6 @@ pub struct ElNode {
 pub struct ElEdge {
     pub from: usize,
     pub to: usize,
-    /// The stream this edge belongs to (stream→cast edges); None for
-    /// cast→target.
-    pub stream_ix: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -78,12 +77,12 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
         .and_then(|connections| connections.connections.get(&pipeline.source))
         .map(Connection::kind);
 
+    let map_column_x = PADDING + NODE_WIDTH + COL_GAP;
+    let mut map_indices = Vec::with_capacity(pipeline.streams.len());
     for (stream_ix, stream) in pipeline.streams.iter().enumerate() {
+        let row_y = PADDING + stream_ix as f32 * (NODE_HEIGHT + ROW_GAP);
         let id = NodeId::Stream(stream.name.clone());
-        let (x, y) = position(pipeline, &id).unwrap_or((
-            PADDING,
-            PADDING + stream_ix as f32 * (NODE_HEIGHT + ROW_GAP),
-        ));
+        let (x, y) = position(pipeline, &id).unwrap_or((PADDING, row_y));
         let sublabel: SharedString = match &stream.source {
             SourceObject::Table { schema, table } => match schema {
                 Some(schema) => format!("{}: {schema}.{table}", source_kind.unwrap_or("db")).into(),
@@ -94,6 +93,7 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
                 format!("file: {name}").into()
             }
         };
+        let stream_node_ix = nodes.len();
         nodes.push(ElNode {
             id,
             kind: ElNodeKind::Stream { stream_ix },
@@ -104,33 +104,36 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             width: NODE_WIDTH,
             height: NODE_HEIGHT,
         });
-    }
 
-    let cast_ix = nodes.len();
-    let (cast_x, cast_y) = position(pipeline, &NodeId::Cast)
-        .unwrap_or((PADDING + NODE_WIDTH + COL_GAP, mid_y));
-    let rules: usize = pipeline
-        .streams
-        .iter()
-        .map(|stream| stream.columns.len())
-        .sum();
-    nodes.push(ElNode {
-        id: NodeId::Cast,
-        kind: ElNodeKind::Cast,
-        label: "Cast & Map".into(),
-        sublabel: format!(
-            "{} stream{} · {} column rule{}",
-            pipeline.streams.len(),
-            if pipeline.streams.len() == 1 { "" } else { "s" },
-            rules,
-            if rules == 1 { "" } else { "s" },
-        )
-        .into(),
-        x: cast_x,
-        y: cast_y,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-    });
+        // This stream's own transform step, on the same row.
+        let map_id = NodeId::Map(stream.name.clone());
+        let (map_x, map_y) = position(pipeline, &map_id).unwrap_or((map_column_x, row_y));
+        let rules = stream.columns.len();
+        let mode = match stream.mode(pipeline.defaults.as_ref()) {
+            Mode::FullRefresh => "full refresh",
+            Mode::Incremental => "incremental",
+        };
+        let map_node_ix = nodes.len();
+        nodes.push(ElNode {
+            id: map_id,
+            kind: ElNodeKind::Map { stream_ix },
+            label: "Cast & Map".into(),
+            sublabel: format!(
+                "{rules} rule{} · {mode}",
+                if rules == 1 { "" } else { "s" },
+            )
+            .into(),
+            x: map_x,
+            y: map_y,
+            width: NODE_WIDTH,
+            height: NODE_HEIGHT,
+        });
+        edges.push(ElEdge {
+            from: stream_node_ix,
+            to: map_node_ix,
+        });
+        map_indices.push(map_node_ix);
+    }
 
     let target_ix = nodes.len();
     let (target_x, target_y) = position(pipeline, &NodeId::Target)
@@ -155,18 +158,12 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
         height: NODE_HEIGHT,
     });
 
-    for stream_ix in 0..pipeline.streams.len() {
+    for map_node_ix in map_indices {
         edges.push(ElEdge {
-            from: stream_ix,
-            to: cast_ix,
-            stream_ix: Some(stream_ix),
+            from: map_node_ix,
+            to: target_ix,
         });
     }
-    edges.push(ElEdge {
-        from: cast_ix,
-        to: target_ix,
-        stream_ix: None,
-    });
 
     let width = nodes
         .iter()
@@ -205,6 +202,9 @@ target: { connection: wh, schema: RAW }
 streams:
 - name: a
   source: { schema: s, table: a }
+  mode: incremental
+  primary_key: [id]
+  update_key: at
 - name: b
   source: { path: x/b.csv, format: csv }
 canvas:
@@ -213,12 +213,16 @@ canvas:
 "#;
         let pipeline: el_engine::spec::Pipeline = serde_yaml_ng::from_str(yaml).unwrap();
         let layout = build_layout(&pipeline, None);
-        assert_eq!(layout.nodes.len(), 4); // 2 streams + cast + target
-        assert_eq!(layout.edges.len(), 3);
-        // Auto for "a", override for "b".
+        // 2 streams, each with its own map node, plus the target.
+        assert_eq!(layout.nodes.len(), 5);
+        assert_eq!(layout.edges.len(), 4);
+        // Auto for "a", override for "b" (streams sit at even indices).
         assert_eq!(layout.nodes[0].x, PADDING);
-        assert_eq!((layout.nodes[1].x, layout.nodes[1].y), (7., 9.));
+        assert_eq!((layout.nodes[2].x, layout.nodes[2].y), (7., 9.));
+        // Per-stream map nodes carry that stream's rules and sync mode.
+        assert_eq!(layout.nodes[1].sublabel.as_ref(), "0 rules · incremental");
+        assert_eq!(layout.nodes[3].sublabel.as_ref(), "0 rules · full refresh");
         assert!(layout.width > 0. && layout.height > 0.);
-        assert_eq!(layout.nodes[1].sublabel.as_ref(), "file: b.csv");
+        assert_eq!(layout.nodes[2].sublabel.as_ref(), "file: b.csv");
     }
 }
