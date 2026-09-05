@@ -690,7 +690,8 @@ impl ElRunsPanel {
             .children(self.remote_action_error.clone().map(|error| {
                 Label::new(error).size(LabelSize::XSmall).color(Color::Error)
             }))
-            .child({
+            .children(self.remote_detail.clone().map(|name| {
+                // The deploy unit is one pipeline — no deploy-all.
                 let remote = self
                     .selected_remote
                     .and_then(|ix| self.remotes.get(ix))
@@ -700,18 +701,10 @@ impl ElRunsPanel {
                     .remote_profile
                     .clone()
                     .unwrap_or_else(|| "base connections".into());
-                let only = self.remote_detail.clone();
                 let label: SharedString = if self.deploy_armed {
-                    match &only {
-                        Some(name) => {
-                            format!("Confirm: {name} → {remote} ({profile})").into()
-                        }
-                        None => format!("Confirm: all → {remote} ({profile})").into(),
-                    }
-                } else if only.is_some() {
-                    "Deploy this pipeline".into()
+                    format!("Confirm: {name} → {remote} ({profile})").into()
                 } else {
-                    "Deploy pipelines".into()
+                    "Deploy this pipeline".into()
                 };
                 Button::new("el-remote-deploy", label)
                     .label_size(LabelSize::XSmall)
@@ -732,7 +725,7 @@ impl ElRunsPanel {
                         }
                         cx.notify();
                     }))
-            })
+            }))
             .child(
                 Button::new("el-remote-logs", "Logs")
                     .label_size(LabelSize::XSmall)

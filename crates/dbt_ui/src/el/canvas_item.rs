@@ -839,6 +839,90 @@ impl ElPipelineCanvas {
         });
     }
 
+    /// "Deploy to <remote>…": one entry per declared remote. Picking one
+    /// ships THIS pipeline; the toast reports the remote's profile.
+    fn deploy_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remotes: Vec<String> = el_engine::spec::load_remotes(
+            &super::el_dir(&self.project_root).join("remotes.yml"),
+        )
+        .map(|remotes| remotes.remotes.keys().cloned().collect())
+        .unwrap_or_default();
+        if remotes.is_empty() {
+            self.toast(
+                "No remotes declared — add one to el/remotes.yml first.".into(),
+                cx,
+            );
+            return;
+        }
+        let entity = cx.entity().downgrade();
+        let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+            for remote in remotes {
+                let entity = entity.clone();
+                let label = format!("Deploy to {remote}");
+                menu = menu.entry(label, None, move |_, cx| {
+                    let remote = remote.clone();
+                    entity
+                        .update(cx, |this, cx| this.deploy_pipeline(remote, cx))
+                        .ok();
+                });
+            }
+            menu
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.type_menu.take();
+            cx.notify();
+        });
+        self.type_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// Ships this canvas's pipeline to `remote`, reporting the remote's
+    /// active profile in the outcome.
+    fn deploy_pipeline(&mut self, remote: String, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            self.toast("Fix the pipeline's errors before deploying.".into(), cx);
+            return;
+        };
+        let name = loaded.pipeline.pipeline.clone();
+        let root = self.project_root.clone();
+        let spec_path = self.spec_path.clone();
+        let task = cx.background_spawn(async move {
+            use anyhow::Context as _;
+            let yaml = std::fs::read_to_string(&spec_path).context("reading the pipeline")?;
+            let client = el_engine::server::RemoteClient::connect(&root, &remote)?;
+            let profile = client
+                .health()
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("profile")
+                        .and_then(|name| name.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "base connections".to_owned());
+            client.deploy(&[(name.clone(), yaml)])?;
+            anyhow::Ok((name, remote, profile))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok((name, remote, profile)) => this.toast(
+                    format!("Deployed {name} to {remote} (profile {profile})."),
+                    cx,
+                ),
+                Err(error) => this.toast(format!("Deploy failed: {error:#}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn set_sync_mode(&mut self, mode: el_engine::spec::Mode, cx: &mut Context<Self>) {
         if let Some(state) = &mut self.mapping {
             if state.mode != mode {
@@ -1442,6 +1526,21 @@ impl Render for ElPipelineCanvas {
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Run pipeline"))
                     .on_click(cx.listener(|this, _, window, cx| this.run_pipeline(window, cx))),
+            )
+            .child(
+                Button::new("el-deploy", "Deploy")
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(
+                        "Ship this pipeline to a remote server — nothing runs there \
+                         until deployed",
+                    ))
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                        let position = match event {
+                            gpui::ClickEvent::Mouse(event) => event.up.position,
+                            _ => Point::default(),
+                        };
+                        this.deploy_menu(position, window, cx);
+                    })),
             )
             .child(
                 Button::new("el-add-source", "+ Source")
