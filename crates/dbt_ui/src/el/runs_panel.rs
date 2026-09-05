@@ -706,6 +706,7 @@ impl ElRunsPanel {
             .child(head(70., "streams"))
             .child(head(150., "schedule"))
             .child(head(90., "next run"))
+            .child(head(80., "profile"))
             .child(head(70., "state"));
         let mut pipelines = v_flex().w_full().px_1();
         for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
@@ -747,6 +748,18 @@ impl ElRunsPanel {
                             .map(|next| relative_time(next, true))
                             .unwrap_or_else(|| "—".into()),
                         Color::Muted,
+                    ))
+                    .child(cell(
+                        80.,
+                        pipeline
+                            .profile
+                            .clone()
+                            .unwrap_or_else(|| "default".into()),
+                        if pipeline.profile.is_some() {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
                     ))
                     .child(cell(
                         70.,
@@ -803,11 +816,18 @@ impl ElRunsPanel {
         let meta: SharedString = match pipeline {
             None => "no longer on the server".into(),
             Some(pipeline) => {
-                let streams = format!(
-                    "{} stream{}",
-                    pipeline.streams,
-                    if pipeline.streams == 1 { "" } else { "s" }
-                );
+                let streams = match &pipeline.profile {
+                    Some(profile) => format!(
+                        "{} stream{} · profile {profile}",
+                        pipeline.streams,
+                        if pipeline.streams == 1 { "" } else { "s" }
+                    ),
+                    None => format!(
+                        "{} stream{}",
+                        pipeline.streams,
+                        if pipeline.streams == 1 { "" } else { "s" }
+                    ),
+                };
                 match (&pipeline.schedule, pipeline.next_run_unix) {
                     (Some(schedule), Some(next)) => format!(
                         "{streams} — runs on {schedule}, next {}",
