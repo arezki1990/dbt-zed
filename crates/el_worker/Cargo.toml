@@ -16,7 +16,11 @@ name = "zdbt-el-worker"
 path = "src/main.rs"
 
 [dependencies]
+adbc_core = "=0.24.0"
+adbc_driver_manager = "=0.24.0"
 anyhow.workspace = true
+arrow-cast = "59"
+arrow-ipc = "59"
 el_engine = { workspace = true, features = ["duckdb"] }
 serde_json.workspace = true
 

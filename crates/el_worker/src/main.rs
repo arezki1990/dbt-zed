@@ -8,6 +8,8 @@
 //!            --chunk-rows <n> --out-dir <dir>
 //!   seed-demo <path>   create a small demo DuckDB database
 
+mod snowflake_loader;
+
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
@@ -29,6 +31,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("extract") => extract(&args[1..]),
         Some("seed-demo") => seed_demo(&args[1..]),
+        Some("snowflake-loader") => snowflake_loader::serve(),
         _ => {
             eprintln!(
                 "usage: zdbt-el-worker extract --kind duckdb --db <path> [--schema <s>] \

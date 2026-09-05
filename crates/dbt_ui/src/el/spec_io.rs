@@ -23,6 +23,17 @@ pub async fn write_spec(
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
     let text = el_engine::spec::to_canonical_yaml(&pipeline);
+    write_text(workspace, project, spec_path, text, cx).await
+}
+
+/// Same buffer-routed write for any canonical spec text (connections.yml).
+pub async fn write_text(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    spec_path: PathBuf,
+    text: String,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
 
     let project_path = project
         .update(cx, |project, cx| {

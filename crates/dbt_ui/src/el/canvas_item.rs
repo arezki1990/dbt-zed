@@ -19,6 +19,7 @@ use workspace::{
     item::{Item, TabContentParams},
 };
 
+use super::builder::{BuilderForm, BuilderKind};
 use super::layout::{ElLayout, ElNode, ElNodeKind, build_layout};
 use super::mapping_editor::{MappingEditorState, SNOWFLAKE_TYPES};
 use el_engine::spec::{Connections, Pipeline, SpecIssue};
@@ -52,6 +53,7 @@ pub struct ElPipelineCanvas {
     drag_moved: bool,
     project: Entity<Project>,
     mapping: Option<MappingEditorState>,
+    builder: Option<BuilderForm>,
     type_menu: Option<(Entity<ui::ContextMenu>, Point<Pixels>, gpui::Subscription)>,
     _load: Task<()>,
     _probe: Task<()>,
@@ -116,6 +118,7 @@ impl ElPipelineCanvas {
             drag_moved: false,
             project,
             mapping: None,
+            builder: None,
             type_menu: None,
             _load: Task::ready(()),
             _probe: Task::ready(()),
@@ -950,6 +953,97 @@ impl ElPipelineCanvas {
     }
 }
 
+impl ElPipelineCanvas {
+    fn run_pipeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            self.toast("The pipeline has errors — fix them before running.".into(), cx);
+            return;
+        };
+        let pipeline = loaded.pipeline.clone();
+        let root = self.project_root.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<crate::results_panel::DbtResultsPanel>(cx)
+                else {
+                    return;
+                };
+                workspace.focus_panel::<crate::results_panel::DbtResultsPanel>(window, cx);
+                panel.update(cx, |panel, cx| {
+                    let view = panel.el_run_view();
+                    cx.notify();
+                    view.update(cx, |view, cx| view.start_run(root, pipeline, cx));
+                });
+            })
+            .ok();
+    }
+
+    fn open_builder(&mut self, kind: BuilderKind, window: &mut Window, cx: &mut Context<Self>) {
+        let connections = loaded_connections(&self.project_root);
+        let pipeline = self.loaded.as_ref().map(|loaded| loaded.pipeline.clone());
+        self.builder = Some(BuilderForm::open(
+            kind,
+            pipeline.as_deref(),
+            connections.as_ref(),
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    pub(crate) fn builder_mut(&mut self) -> Option<&mut BuilderForm> {
+        self.builder.as_mut()
+    }
+
+    pub(crate) fn close_builder(&mut self, cx: &mut Context<Self>) {
+        self.builder = None;
+        cx.notify();
+    }
+
+    pub(crate) fn apply_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.builder else { return };
+        let connections = loaded_connections(&self.project_root);
+        let pipeline = self.loaded.as_ref().map(|loaded| (*loaded.pipeline).clone());
+        match form.build(pipeline, connections, cx) {
+            Err(error) => self.toast(format!("{error:#}"), cx),
+            Ok(outcome) => {
+                let workspace = self.workspace.clone();
+                let project = self.project.clone();
+                let spec_path = self.spec_path.clone();
+                let connections_path =
+                    super::el_dir(&self.project_root).join("connections.yml");
+                self.builder = None;
+                self._write = cx.spawn_in(window, async move |this, cx| {
+                    let mut result = Ok(());
+                    if let Some(connections) = outcome.connections {
+                        result = super::spec_io::write_text(
+                            workspace.clone(),
+                            project.clone(),
+                            connections_path,
+                            el_engine::spec::to_canonical_connections_yaml(&connections),
+                            cx,
+                        )
+                        .await;
+                    }
+                    if result.is_ok() {
+                        if let Some(pipeline) = outcome.pipeline {
+                            result = super::spec_io::write_spec(
+                                workspace, project, spec_path, pipeline, cx,
+                            )
+                            .await;
+                        }
+                    }
+                    this.update(cx, |this, cx| match result {
+                        Ok(()) => this.reload(cx),
+                        Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+                    })
+                    .ok();
+                });
+                cx.notify();
+            }
+        }
+    }
+}
+
 impl EventEmitter<()> for ElPipelineCanvas {}
 
 impl Focusable for ElPipelineCanvas {
@@ -996,6 +1090,33 @@ impl Render for ElPipelineCanvas {
                     .color(Color::Default),
             )
             .child(div().flex_1())
+            .child(
+                IconButton::new("el-run", IconName::PlayFilled)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Run pipeline"))
+                    .on_click(cx.listener(|this, _, window, cx| this.run_pipeline(window, cx))),
+            )
+            .child(
+                Button::new("el-add-source", "+ Source")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_builder(BuilderKind::Source, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("el-add-conn", "+ Connection")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_builder(BuilderKind::Connection, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("el-edit-target", "Target")
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_builder(BuilderKind::Target, window, cx)
+                    })),
+            )
             .child(
                 IconButton::new("el-zoom-out", IconName::Dash)
                     .icon_size(IconSize::Small)
@@ -1108,6 +1229,22 @@ impl Render for ElPipelineCanvas {
         }
         .on_action(cx.listener(|this, _: &crate::CloseMappingEditor, _, cx| {
             this.close_mapping(cx);
+        }))
+        .children(self.builder.as_ref().map(|form| {
+            gpui::deferred(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::black().opacity(0.35))
+                    .child(form.render(cx.entity().downgrade(), cx)),
+            )
+            .with_priority(2)
+        }))
+        .on_action(cx.listener(|this, _: &crate::RunPipeline, window, cx| {
+            this.run_pipeline(window, cx);
         }))
         .children(self.type_menu.as_ref().map(|(menu, position, _)| {
             gpui::deferred(

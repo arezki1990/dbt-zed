@@ -373,6 +373,15 @@ pub fn list_pipelines(el_dir: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
+/// Serializes connections in canonical form. Same comment-loss caveat as
+/// pipelines; the builder warns once.
+pub fn to_canonical_connections_yaml(connections: &Connections) -> String {
+    let body = serde_yaml_ng::to_string(connections).unwrap_or_default();
+    format!(
+        "# yaml-language-server: $schema=./.zdbt/el-connections.schema.json\n{MANAGED_HEADER}\n{body}"
+    )
+}
+
 /// Serializes the pipeline in canonical form with the managed header and a
 /// schema pointer for yaml-language-server.
 pub fn to_canonical_yaml(pipeline: &Pipeline) -> String {

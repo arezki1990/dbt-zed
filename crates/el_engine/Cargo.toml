@@ -23,6 +23,7 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 indexmap.workspace = true
 log.workspace = true
 schemars.workspace = true

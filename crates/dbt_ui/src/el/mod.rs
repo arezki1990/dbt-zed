@@ -1,9 +1,12 @@
 //! The EL (extract→load) UI: pipeline canvas, scaffolding, and spec IO.
 //! The engine lives in `el_engine`; nothing here touches a warehouse.
 
+pub mod builder;
 pub mod canvas_item;
+pub mod cli;
 pub mod layout;
 pub mod mapping_editor;
+pub mod run_view;
 pub mod scaffold;
 pub mod spec_io;
 

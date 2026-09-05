@@ -40,6 +40,10 @@ actions!(
         InitializeWorkspace,
         /// Closes the pipeline canvas's mapping editor sidebar.
         CloseMappingEditor,
+        /// Runs the pipeline open on the canvas.
+        RunPipeline,
+        /// Cancels the active EL run.
+        CancelRun,
     ]
 );
 

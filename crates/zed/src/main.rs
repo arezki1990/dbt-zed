@@ -200,6 +200,14 @@ static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 fn main() {
     // Fork: `--dbt-mcp` serves zdbt's dbt tools over MCP stdio for agents
     // (Zed agent panel context_servers, Claude Code, any MCP client).
+    // Headless EL CLI: `zdbt el run <pipeline>` — no GPUI, cron-able.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("el") {
+            std::process::exit(dbt_ui::el::cli::main(&args[1..]));
+        }
+    }
+
     if std::env::args().any(|arg| arg == "--dbt-mcp") {
         dbt_ui::mcp::serve();
         return;
