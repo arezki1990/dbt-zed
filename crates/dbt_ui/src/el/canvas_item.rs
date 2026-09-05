@@ -300,15 +300,17 @@ impl ElPipelineCanvas {
 
         canvas(
             |_, _, _| {},
-            move |_bounds, _, window, _| {
+            move |bounds, _, window, _| {
+                // paint_path works in window space; nodes are element-local.
+                let origin = bounds.origin;
                 let place = |node: &ElNode| -> (Point<Pixels>, Point<Pixels>) {
                     let left = point(
-                        px(node.x * zoom + pan.0),
-                        px((node.y + node.height / 2.) * zoom + pan.1),
+                        origin.x + px(node.x * zoom + pan.0),
+                        origin.y + px((node.y + node.height / 2.) * zoom + pan.1),
                     );
                     let right = point(
-                        px((node.x + node.width) * zoom + pan.0),
-                        px((node.y + node.height / 2.) * zoom + pan.1),
+                        origin.x + px((node.x + node.width) * zoom + pan.0),
+                        origin.y + px((node.y + node.height / 2.) * zoom + pan.1),
                     );
                     (left, right)
                 };

@@ -136,14 +136,18 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
     let (target_x, target_y) = position(pipeline, &NodeId::Target)
         .unwrap_or((PADDING + 2. * (NODE_WIDTH + COL_GAP), mid_y));
     let target_db = pipeline.target.database.as_deref().unwrap_or("");
+    let target_kind = connections
+        .and_then(|connections| connections.connections.get(&pipeline.target.connection))
+        .map(Connection::kind)
+        .unwrap_or("warehouse");
     nodes.push(ElNode {
         id: NodeId::Target,
         kind: ElNodeKind::Target,
         label: pipeline.target.connection.clone().into(),
         sublabel: if target_db.is_empty() {
-            format!("snowflake: {}", pipeline.target.schema).into()
+            format!("{target_kind}: {}", pipeline.target.schema).into()
         } else {
-            format!("snowflake: {target_db}.{}", pipeline.target.schema).into()
+            format!("{target_kind}: {target_db}.{}", pipeline.target.schema).into()
         },
         x: target_x,
         y: target_y,

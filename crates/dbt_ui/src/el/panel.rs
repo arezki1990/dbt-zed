@@ -135,10 +135,25 @@ impl ElPanel {
             }
             index += 1;
         };
+        // Seed source/target from the project's real connections so the
+        // starter validates immediately.
+        let source = self
+            .connections
+            .iter()
+            .find(|(_, kind)| !matches!(kind.as_ref(), "snowflake"))
+            .or(self.connections.first())
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| "files".to_owned());
+        let target = self
+            .connections
+            .iter()
+            .find(|(_, kind)| matches!(kind.as_ref(), "duckdb" | "snowflake"))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| "warehouse".to_owned());
         let starter = format!(
             "# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json\n\
-             version: 1\npipeline: pipeline_{index}\nsource: files\n\
-             target:\n  connection: duck_wh\n  schema: LANDING\n  table: '{{stream}}'\nstreams: []\n"
+             version: 1\npipeline: pipeline_{index}\nsource: {source}\n\
+             target:\n  connection: {target}\n  schema: LANDING\n  table: '{{stream}}'\nstreams: []\n"
         );
         if std::fs::write(&path, starter).is_ok() {
             self.refresh(cx);
