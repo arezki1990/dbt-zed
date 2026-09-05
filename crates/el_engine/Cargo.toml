@@ -1,0 +1,49 @@
+[package]
+name = "el_engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/el_engine.rs"
+
+[features]
+default = []
+# The ADBC driver-manager half of the spike, kept off the default build so
+# the polars cost can be measured in isolation.
+adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
+
+[dependencies]
+anyhow.workspace = true
+# Exact-pinned: the 0.5x Rust API churns between minor versions.
+polars = { version = "=0.55.2", default-features = false, features = [
+    "lazy",
+    "csv",
+    "parquet",
+    "json",
+    "ipc",
+    "dtype-struct",
+    "dtype-decimal",
+    "dtype-date",
+    "dtype-datetime",
+    "dtype-time",
+    "timezones",
+    "strings",
+    "temporal",
+    "regex",
+    "streaming",
+    "cloud",
+    "aws",
+    "gcp",
+    "azure",
+] }
+adbc_core = { version = "=0.24.0", optional = true }
+adbc_driver_manager = { version = "=0.24.0", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+polars = { version = "=0.55.2", default-features = false }

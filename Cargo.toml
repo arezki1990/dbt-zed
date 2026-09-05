@@ -62,6 +62,7 @@ members = [
     "crates/edit_prediction_types",
     "crates/edit_prediction_ui",
     "crates/editor",
+    "crates/el_engine",
     "crates/editor_benchmarks",
     "crates/encoding_selector",
     "crates/env_var",
@@ -335,6 +336,7 @@ edit_prediction_metrics = { path = "crates/edit_prediction_metrics" }
 edit_prediction_types = { path = "crates/edit_prediction_types" }
 edit_prediction_ui = { path = "crates/edit_prediction_ui" }
 editor = { path = "crates/editor" }
+el_engine = { path = "crates/el_engine" }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
 etw_tracing = { path = "crates/etw_tracing" }
