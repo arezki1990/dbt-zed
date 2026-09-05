@@ -277,7 +277,38 @@ impl ElPipelineCanvas {
                                 .size(LabelSize::Small)
                                 .truncate(),
                         ),
-                    ),
+                    )
+                    .children(match node.kind {
+                        // Data straight off the node: the stream's source
+                        // rows, or what the warehouse actually holds.
+                        ElNodeKind::Stream { stream_ix } => Some(
+                            IconButton::new(("el-node-preview", ix), IconName::Eye)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Preview data"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.preview_to_grid(stream_ix, false, window, cx);
+                                })),
+                        ),
+                        ElNodeKind::Target => Some(
+                            IconButton::new(("el-node-preview", ix), IconName::Eye)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Preview loaded table"))
+                                .on_click(cx.listener(
+                                    move |this, event: &gpui::ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        let position = match event {
+                                            gpui::ClickEvent::Mouse(event) => event.up.position,
+                                            _ => Point::default(),
+                                        };
+                                        this.preview_target(position, window, cx);
+                                    },
+                                )),
+                        ),
+                        ElNodeKind::Map { .. } => None,
+                    }),
             )
             .child(
                 div()
@@ -575,12 +606,17 @@ impl ElPipelineCanvas {
 
     /// Runs the bounded preview and shows rows (or failed casts) in the
     /// results panel's grid.
-    fn preview_to_grid(&mut self, failures_only: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state) = &self.mapping else { return };
+    fn preview_to_grid(
+        &mut self,
+        stream_ix: usize,
+        failures_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(loaded) = &self.loaded else { return };
         let pipeline = loaded.pipeline.clone();
-        let stream_ix = state.stream_ix;
-        let stream_name = pipeline.streams[stream_ix].name.clone();
+        let Some(stream) = pipeline.streams.get(stream_ix) else { return };
+        let stream_name = stream.name.clone();
         let project_root = self.project_root.clone();
         let worker = super::find_worker();
         let title: SharedString = if failures_only {
@@ -705,6 +741,71 @@ impl ElPipelineCanvas {
             }
         }
         cx.notify();
+    }
+
+    /// Shows what the warehouse holds for one stream: opens the Query view
+    /// on the target connection with `SELECT * … LIMIT 200`.
+    fn preview_target_table(&mut self, stream_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else { return };
+        let pipeline = loaded.pipeline.clone();
+        let Some(stream) = pipeline.streams.get(stream_ix) else { return };
+        let connection: SharedString = pipeline.target.connection.clone().into();
+        let schema = pipeline.target.schema.clone();
+        let table = stream.target_table(&pipeline.target);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
+                    return;
+                };
+                workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                panel.update(cx, |panel, cx| {
+                    panel.show_query_for_table(connection, &schema, &table, window, cx);
+                });
+            })
+            .ok();
+    }
+
+    /// The target node's preview: one stream goes straight to its table,
+    /// several offer the choice.
+    fn preview_target(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else { return };
+        let pipeline = loaded.pipeline.clone();
+        match pipeline.streams.len() {
+            0 => {}
+            1 => self.preview_target_table(0, window, cx),
+            _ => {
+                let entries: Vec<(usize, SharedString)> = pipeline
+                    .streams
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, stream)| {
+                        (ix, stream.target_table(&pipeline.target).into())
+                    })
+                    .collect();
+                let entity = cx.entity().downgrade();
+                let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+                    for (stream_ix, table) in entries {
+                        let entity = entity.clone();
+                        menu = menu.entry(table, None, move |window, cx| {
+                            entity
+                                .update(cx, |this, cx| {
+                                    this.preview_target_table(stream_ix, window, cx)
+                                })
+                                .ok();
+                        });
+                    }
+                    menu
+                });
+                window.focus(&menu.focus_handle(cx), cx);
+                let subscription =
+                    cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+                        this.type_menu.take();
+                        cx.notify();
+                    });
+                self.type_menu = Some((menu, position, subscription));
+                cx.notify();
+            }
+        }
     }
 
     fn set_sync_mode(&mut self, mode: el_engine::spec::Mode, cx: &mut Context<Self>) {
@@ -1044,14 +1145,18 @@ impl ElPipelineCanvas {
                         Button::new("el-map-preview", "Preview")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.preview_to_grid(false, window, cx)
+                                if let Some(ix) = this.mapping.as_ref().map(|s| s.stream_ix) {
+                                    this.preview_to_grid(ix, false, window, cx)
+                                }
                             })),
                     )
                     .child(
                         Button::new("el-map-failed", "Failed casts")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.preview_to_grid(true, window, cx)
+                                if let Some(ix) = this.mapping.as_ref().map(|s| s.stream_ix) {
+                                    this.preview_to_grid(ix, true, window, cx)
+                                }
                             })),
                     )
                     .child(div().flex_1())
