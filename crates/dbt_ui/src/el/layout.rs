@@ -1,7 +1,7 @@
 //! The pipeline canvas layout: spec → positioned nodes and edges.
-//! Auto-layout draws one row per stream — source table → that stream's
-//! own Cast & Map step — converging on the warehouse target at the
-//! right; positions in the spec's `canvas:` block override per node.
+//! Auto-layout draws one complete row per stream: source table → that
+//! stream's own Cast & Map step → the warehouse table it loads;
+//! positions in the spec's `canvas:` block override per node.
 
 use el_engine::spec::{Connection, Connections, Mode, Pipeline, SourceObject};
 use gpui::SharedString;
@@ -18,7 +18,8 @@ pub enum NodeId {
     /// One Cast & Map step per stream — casting is per table, and the
     /// graph says so.
     Map(String),
-    Target,
+    /// One warehouse table per stream — each row is complete end to end.
+    TargetTable(String),
 }
 
 impl NodeId {
@@ -27,7 +28,7 @@ impl NodeId {
         match self {
             NodeId::Stream(name) => format!("stream:{name}"),
             NodeId::Map(name) => format!("map:{name}"),
-            NodeId::Target => "target".to_owned(),
+            NodeId::TargetTable(name) => format!("target:{name}"),
         }
     }
 }
@@ -36,7 +37,7 @@ impl NodeId {
 pub enum ElNodeKind {
     Stream { stream_ix: usize },
     Map { stream_ix: usize },
-    Target,
+    TargetTable { stream_ix: usize },
 }
 
 #[derive(Clone)]
@@ -69,16 +70,11 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    let streams = pipeline.streams.len().max(1);
-    let column_height = streams as f32 * (NODE_HEIGHT + ROW_GAP) - ROW_GAP;
-    let mid_y = PADDING + column_height / 2. - NODE_HEIGHT / 2.;
-
     let source_kind = connections
         .and_then(|connections| connections.connections.get(&pipeline.source))
         .map(Connection::kind);
 
     let map_column_x = PADDING + NODE_WIDTH + COL_GAP;
-    let mut map_indices = Vec::with_capacity(pipeline.streams.len());
     for (stream_ix, stream) in pipeline.streams.iter().enumerate() {
         let row_y = PADDING + stream_ix as f32 * (NODE_HEIGHT + ROW_GAP);
         let id = NodeId::Stream(stream.name.clone());
@@ -132,36 +128,35 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             from: stream_node_ix,
             to: map_node_ix,
         });
-        map_indices.push(map_node_ix);
-    }
 
-    let target_ix = nodes.len();
-    let (target_x, target_y) = position(pipeline, &NodeId::Target)
-        .unwrap_or((PADDING + 2. * (NODE_WIDTH + COL_GAP), mid_y));
-    let target_db = pipeline.target.database.as_deref().unwrap_or("");
-    let target_kind = connections
-        .and_then(|connections| connections.connections.get(&pipeline.target.connection))
-        .map(Connection::kind)
-        .unwrap_or("warehouse");
-    nodes.push(ElNode {
-        id: NodeId::Target,
-        kind: ElNodeKind::Target,
-        label: pipeline.target.connection.clone().into(),
-        sublabel: if target_db.is_empty() {
-            format!("{target_kind}: {}", pipeline.target.schema).into()
-        } else {
-            format!("{target_kind}: {target_db}.{}", pipeline.target.schema).into()
-        },
-        x: target_x,
-        y: target_y,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-    });
-
-    for map_node_ix in map_indices {
+        // This stream's warehouse table, completing the row.
+        let target_table = stream.target_table(&pipeline.target);
+        let target_id = NodeId::TargetTable(stream.name.clone());
+        let (target_x, target_y) = position(pipeline, &target_id)
+            .unwrap_or((PADDING + 2. * (NODE_WIDTH + COL_GAP), row_y));
+        let target_db = pipeline.target.database.as_deref().unwrap_or("");
+        let target_kind = connections
+            .and_then(|connections| connections.connections.get(&pipeline.target.connection))
+            .map(Connection::kind)
+            .unwrap_or("warehouse");
+        let target_node_ix = nodes.len();
+        nodes.push(ElNode {
+            id: target_id,
+            kind: ElNodeKind::TargetTable { stream_ix },
+            label: target_table.into(),
+            sublabel: if target_db.is_empty() {
+                format!("{target_kind}: {}", pipeline.target.schema).into()
+            } else {
+                format!("{target_kind}: {target_db}.{}", pipeline.target.schema).into()
+            },
+            x: target_x,
+            y: target_y,
+            width: NODE_WIDTH,
+            height: NODE_HEIGHT,
+        });
         edges.push(ElEdge {
             from: map_node_ix,
-            to: target_ix,
+            to: target_node_ix,
         });
     }
 
@@ -213,16 +208,19 @@ canvas:
 "#;
         let pipeline: el_engine::spec::Pipeline = serde_yaml_ng::from_str(yaml).unwrap();
         let layout = build_layout(&pipeline, None);
-        // 2 streams, each with its own map node, plus the target.
-        assert_eq!(layout.nodes.len(), 5);
+        // 2 streams, each with its own map and target-table nodes.
+        assert_eq!(layout.nodes.len(), 6);
         assert_eq!(layout.edges.len(), 4);
-        // Auto for "a", override for "b" (streams sit at even indices).
+        // Auto for "a", override for "b" (rows are stream, map, target).
         assert_eq!(layout.nodes[0].x, PADDING);
-        assert_eq!((layout.nodes[2].x, layout.nodes[2].y), (7., 9.));
+        assert_eq!((layout.nodes[3].x, layout.nodes[3].y), (7., 9.));
         // Per-stream map nodes carry that stream's rules and sync mode.
         assert_eq!(layout.nodes[1].sublabel.as_ref(), "0 rules · incremental");
-        assert_eq!(layout.nodes[3].sublabel.as_ref(), "0 rules · full refresh");
+        assert_eq!(layout.nodes[4].sublabel.as_ref(), "0 rules · full refresh");
+        // Target-table nodes are labeled by the table each stream loads.
+        assert_eq!(layout.nodes[2].label.as_ref(), "A");
+        assert_eq!(layout.nodes[5].label.as_ref(), "B");
         assert!(layout.width > 0. && layout.height > 0.);
-        assert_eq!(layout.nodes[2].sublabel.as_ref(), "file: b.csv");
+        assert_eq!(layout.nodes[3].sublabel.as_ref(), "file: b.csv");
     }
 }

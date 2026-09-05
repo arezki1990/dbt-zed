@@ -219,12 +219,12 @@ impl ElPipelineCanvas {
         let accent = match node.kind {
             ElNodeKind::Stream { .. } => cx.theme().status().info,
             ElNodeKind::Map { .. } => cx.theme().status().warning,
-            ElNodeKind::Target => cx.theme().status().success,
+            ElNodeKind::TargetTable { .. } => cx.theme().status().success,
         };
         let icon = match node.kind {
             ElNodeKind::Stream { .. } => IconName::FileCode,
             ElNodeKind::Map { .. } => IconName::ArrowRightLeft,
-            ElNodeKind::Target => IconName::DatabaseZap,
+            ElNodeKind::TargetTable { .. } => IconName::DatabaseZap,
         };
         let x = node.x * zoom + self.pan.0;
         let y = node.y * zoom + self.pan.1;
@@ -254,7 +254,7 @@ impl ElPipelineCanvas {
                     cx.notify();
                 }),
             )
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if this.drag_moved {
                     return;
                 }
@@ -265,12 +265,8 @@ impl ElPipelineCanvas {
                     Some(ElNodeKind::Map { stream_ix }) => {
                         this.open_mapping(stream_ix, window, cx);
                     }
-                    Some(ElNodeKind::Target) => {
-                        let position = match event {
-                            gpui::ClickEvent::Mouse(event) => event.up.position,
-                            _ => Point::default(),
-                        };
-                        this.preview_target(position, window, cx);
+                    Some(ElNodeKind::TargetTable { stream_ix }) => {
+                        this.preview_target_table(stream_ix, window, cx);
                     }
                     None => {}
                 }
@@ -741,49 +737,6 @@ impl ElPipelineCanvas {
                 });
             })
             .ok();
-    }
-
-    /// The target node's preview: one stream goes straight to its table,
-    /// several offer the choice.
-    fn preview_target(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(loaded) = &self.loaded else { return };
-        let pipeline = loaded.pipeline.clone();
-        match pipeline.streams.len() {
-            0 => {}
-            1 => self.preview_target_table(0, window, cx),
-            _ => {
-                let entries: Vec<(usize, SharedString)> = pipeline
-                    .streams
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, stream)| {
-                        (ix, stream.target_table(&pipeline.target).into())
-                    })
-                    .collect();
-                let entity = cx.entity().downgrade();
-                let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
-                    for (stream_ix, table) in entries {
-                        let entity = entity.clone();
-                        menu = menu.entry(table, None, move |window, cx| {
-                            entity
-                                .update(cx, |this, cx| {
-                                    this.preview_target_table(stream_ix, window, cx)
-                                })
-                                .ok();
-                        });
-                    }
-                    menu
-                });
-                window.focus(&menu.focus_handle(cx), cx);
-                let subscription =
-                    cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
-                        this.type_menu.take();
-                        cx.notify();
-                    });
-                self.type_menu = Some((menu, position, subscription));
-                cx.notify();
-            }
-        }
     }
 
     fn set_sync_mode(&mut self, mode: el_engine::spec::Mode, cx: &mut Context<Self>) {
