@@ -13,6 +13,17 @@ fn emit(event: &ExploreEvent) {
     }
 }
 
+/// Connect with a hard 10s timeout — an unreachable database must
+/// become an error, never an indefinite hang.
+fn pg_connect(url: &str) -> Result<postgres::Client> {
+    use std::str::FromStr as _;
+    let mut config = postgres::Config::from_str(url).context("parsing postgres url")?;
+    config.connect_timeout(std::time::Duration::from_secs(10));
+    config
+        .connect(postgres::NoTls)
+        .context("connecting to postgres (10s timeout)")
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|arg| arg == name)
@@ -45,8 +56,7 @@ pub fn list(args: &[String]) -> Result<()> {
         "postgres" => {
             let url = std::env::var("ZDBT_EL_SRC_URL")
                 .context("ZDBT_EL_SRC_URL is not set")?;
-            let mut client = postgres::Client::connect(&url, postgres::NoTls)
-                .context("connecting to postgres")?;
+            let mut client = pg_connect(&url)?;
             for row in client.query(LIST_SQL, &[])? {
                 items.push((row.get(0), row.get(1)));
             }
@@ -123,8 +133,7 @@ pub fn query(args: &[String]) -> Result<()> {
         "postgres" => {
             let url = std::env::var("ZDBT_EL_SRC_URL")
                 .context("ZDBT_EL_SRC_URL is not set")?;
-            let mut client = postgres::Client::connect(&url, postgres::NoTls)
-                .context("connecting to postgres")?;
+            let mut client = pg_connect(&url)?;
             // Probe for names + text-cast every column for display.
             let probe = client
                 .prepare(&format!("SELECT * FROM ({sql}) AS zdbt_q LIMIT 0"))

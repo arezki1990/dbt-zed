@@ -70,6 +70,26 @@ fn read_events(
         .stderr(Stdio::piped());
     let mut child = command.spawn().context("spawning connector worker")?;
     let stdout = child.stdout.take().context("worker stdout")?;
+    // Watchdog: whatever the driver does, the UI gets an answer. The
+    // worker's own connect timeouts fire far earlier; this is the
+    // backstop for anything else that wedges.
+    let watchdog_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = std::sync::Arc::clone(&watchdog_flag);
+        let timed_out = std::sync::Arc::clone(&timed_out);
+        let pid = child.id();
+        std::thread::spawn(move || {
+            for _ in 0..900 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+            }
+            timed_out.store(true, std::sync::atomic::Ordering::Relaxed);
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        });
+    }
     let mut events = Vec::new();
     for line in std::io::BufReader::new(stdout).lines() {
         let line = line.context("reading worker")?;
@@ -86,6 +106,10 @@ fn read_events(
         events.push(event);
     }
     let status = child.wait().context("waiting for worker")?;
+    watchdog_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    if timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+        bail!("timed out after 90s — is the database reachable?");
+    }
     if !status.success() && events.is_empty() {
         bail!("connector worker failed ({status})");
     }

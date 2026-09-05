@@ -133,18 +133,29 @@ impl ElPipelineCanvas {
     }
 
     fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
-        let mtime = std::fs::metadata(&self.spec_path)
-            .and_then(|meta| meta.modified())
-            .ok();
+        // The canvas depends on three files: its pipeline, the
+        // connections (labels + validation), and the profile selection.
+        let mtime = self.watched_mtime();
         if mtime != self.spec_mtime {
             self.reload(cx);
         }
     }
 
+    /// The newest mtime across everything the canvas renders from.
+    fn watched_mtime(&self) -> Option<SystemTime> {
+        let el = super::el_dir(&self.project_root);
+        [
+            self.spec_path.clone(),
+            el.join("connections.yml"),
+            el_engine::spec::profile_selection_path(&self.project_root),
+        ]
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        .max()
+    }
+
     pub(crate) fn reload(&mut self, cx: &mut Context<Self>) {
-        self.spec_mtime = std::fs::metadata(&self.spec_path)
-            .and_then(|meta| meta.modified())
-            .ok();
+        self.spec_mtime = self.watched_mtime();
         let spec_path = self.spec_path.clone();
         let project_root = self.project_root.clone();
         let task = cx.background_spawn(async move { load_spec(&project_root, &spec_path) });
@@ -1313,7 +1324,31 @@ impl ElPipelineCanvas {
 
     pub(crate) fn apply_builder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.builder else { return };
-        let connections = loaded_connections(&self.project_root);
+        // Adding a connection EDITS the raw file: it must start from the
+        // raw contents (profiles block intact), and a parse failure must
+        // abort — never fall back to an empty map that a full-file write
+        // would then make real. Reads (Source/Target pickers) keep the
+        // profile-resolved view.
+        let connections = if form.kind == BuilderKind::Connection {
+            let path = super::el_dir(&self.project_root).join("connections.yml");
+            match el_engine::spec::load_connections(&path) {
+                Ok(raw) => Some(raw),
+                Err(el_engine::spec::SpecError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(error) => {
+                    self.toast(
+                        format!("connections.yml could not be read: {error} — fix it first"),
+                        cx,
+                    );
+                    return;
+                }
+            }
+        } else {
+            loaded_connections(&self.project_root)
+        };
         let pipeline = self.loaded.as_ref().map(|loaded| (*loaded.pipeline).clone());
         match form.build(pipeline, connections, cx) {
             Err(error) => self.toast(format!("{error:#}"), cx),

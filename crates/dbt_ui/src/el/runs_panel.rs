@@ -153,6 +153,19 @@ impl ElRunsPanel {
         cx.notify();
     }
 
+    /// A profile switch changed what every connection name means: drop
+    /// the old environment's query state and re-read the resolved set.
+    pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
+        self.result = None;
+        self.query_error = None;
+        self.elapsed = None;
+        self.refresh_connections(cx);
+        if self.surface == Surface::Remote {
+            self.start_remote_poll(cx);
+        }
+        cx.notify();
+    }
+
     /// The explorer's click-a-table entry point: switches to Query,
     /// selects the connection, seeds the SQL, and runs it.
     pub fn show_query_for_table(

@@ -65,8 +65,15 @@ impl PostgresExtractor {
         chunk_rows: usize,
         cursor: Option<(String, crate::state::WatermarkValue)>,
     ) -> Result<Self> {
-        let mut client = Client::connect(url, NoTls)
-            .context("connecting to postgres (TLS connections come in a later phase)")?;
+        let mut client = {
+            use std::str::FromStr as _;
+            let mut config = postgres::Config::from_str(url).context("parsing postgres url")?;
+            // An unreachable host must fail, not hang the run forever.
+            config.connect_timeout(std::time::Duration::from_secs(10));
+            config
+                .connect(NoTls)
+                .context("connecting to postgres (10s timeout; TLS comes later)")?
+        };
 
         let relation = match schema {
             Some(schema) => format!("{}.{}", quote_ident(schema), quote_ident(table)),

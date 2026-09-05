@@ -61,6 +61,7 @@ pub fn run_pipeline(
     if let Some(profile) = &profile {
         log::info!("el run: profile {profile}");
     }
+    let profile_key = profile.clone();
     let env = EnvMap::load(&request.project_root, None);
 
     // Fail fast on anything validation can catch.
@@ -89,7 +90,7 @@ pub fn run_pipeline(
         worker: request.worker.as_deref(),
     };
 
-    let state = crate::state::StateStore::open(&request.project_root)
+    let state = crate::state::StateStore::open(&request.project_root, profile_key.as_deref())
         .context("opening incremental state store")?;
 
     let mut report = RunReport::default();
@@ -445,7 +446,7 @@ streams:
         };
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };
-        let state = crate::state::StateStore::open(dir.path()).unwrap();
+        let state = crate::state::StateStore::open(dir.path(), None).unwrap();
         let (rows_read, rows_written, cast_failures) = run_stream(
             &ctx,
             &pipeline,
@@ -502,7 +503,7 @@ streams:
         };
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };
-        let state = crate::state::StateStore::open(dir.path()).unwrap();
+        let state = crate::state::StateStore::open(dir.path(), None).unwrap();
         let result = run_stream(
             &ctx,
             &pipeline,

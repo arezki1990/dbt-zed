@@ -6617,6 +6617,7 @@ dependencies = [
  "duckdb",
  "futures 0.3.32",
  "indexmap 2.14.0",
+ "libc",
  "log",
  "polars",
  "postgres",

@@ -32,6 +32,9 @@ pub struct ElPanel {
     /// Connections whose table list is unfolded in the explorer.
     expanded: std::collections::HashSet<SharedString>,
     tables: std::collections::HashMap<SharedString, TablesState>,
+    /// Bumped on profile/connection changes: in-flight table listings
+    /// from the previous environment are dropped, not displayed.
+    tables_epoch: u64,
     _list_tasks: std::collections::HashMap<SharedString, Task<()>>,
     scroll: UniformListScrollHandle,
     _refresh: Task<()>,
@@ -111,6 +114,7 @@ impl ElPanel {
             profiles: Vec::new(),
             expanded: Default::default(),
             tables: Default::default(),
+            tables_epoch: 0,
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
             _refresh: Task::ready(()),
@@ -183,7 +187,24 @@ impl ElPanel {
         }
         self.tables.clear();
         self.expanded.clear();
+        self.tables_epoch += 1;
         self.refresh(cx);
+        // The selection file is one voice among three — say what actually
+        // happened instead of assuming the write took effect.
+        let effective = self.profile.clone();
+        let message = if effective.as_ref() == Some(&name) {
+            format!("Profile: {name}")
+        } else if std::env::var("ZDBT_EL_PROFILE").is_ok() {
+            format!(
+                "Saved, but ZDBT_EL_PROFILE overrides the selection — this window                  still runs as {}.",
+                effective.as_deref().unwrap_or("the base connections")
+            )
+        } else {
+            format!(
+                "Saved, but the active profile is {} — check connections.yml.",
+                effective.as_deref().unwrap_or("none")
+            )
+        };
         self.workspace
             .update(cx, |workspace, cx| {
                 let canvases: Vec<_> =
@@ -191,7 +212,12 @@ impl ElPanel {
                 for canvas in canvases {
                     canvas.update(cx, |canvas, cx| canvas.reload(cx));
                 }
-                super::toast(workspace, &format!("Profile: {name}"), cx);
+                // The EL console's Query chips and results are from the
+                // old environment — reset them.
+                if let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.profile_changed(cx));
+                }
+                super::toast(workspace, &message, cx);
             })
             .ok();
     }
@@ -263,6 +289,7 @@ impl ElPanel {
     fn load_tables(&mut self, name: SharedString, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         self.tables.insert(name.clone(), TablesState::Loading);
+        let epoch = self.tables_epoch;
         let connection_name = name.to_string();
         let task = cx.background_spawn(async move {
             let worker = super::find_worker().ok_or_else(|| {
@@ -284,6 +311,9 @@ impl ElPanel {
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
+                    if this.tables_epoch != epoch {
+                        return; // a different environment answered
+                    }
                     let state = match result {
                         Ok(tables) => TablesState::Loaded(tables),
                         Err(error) => TablesState::Failed(format!("{error:#}").into()),
@@ -301,6 +331,7 @@ impl ElPanel {
     pub fn connections_changed(&mut self, cx: &mut Context<Self>) {
         self.tables.clear();
         self.expanded.clear();
+        self.tables_epoch += 1;
         self.refresh(cx);
     }
 

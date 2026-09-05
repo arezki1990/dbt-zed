@@ -30,6 +30,7 @@ server = ["dep:tiny_http", "dep:cron", "dep:chrono-tz", "dep:ureq", "dep:chrono"
 anyhow.workspace = true
 futures.workspace = true
 indexmap.workspace = true
+libc.workspace = true
 log.workspace = true
 schemars.workspace = true
 serde.workspace = true

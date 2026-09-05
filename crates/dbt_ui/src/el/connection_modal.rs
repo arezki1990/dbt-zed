@@ -420,10 +420,19 @@ impl ElConnectionModal {
             }
         };
 
+        // A name exists if the base OR any profile defines it — profiles
+        // override by name, so a collision anywhere is a collision.
+        let name_taken = |connections: &Connections, name: &str| {
+            connections.connections.contains_key(name)
+                || connections
+                    .profiles
+                    .values()
+                    .any(|profile| profile.connections.contains_key(name))
+        };
         let mut renamed_from = None;
         match &self.editing {
             None => {
-                if connections.connections.contains_key(&new_name) {
+                if name_taken(&connections, &new_name) {
                     return self.fail(
                         format!("a connection named {new_name:?} already exists"),
                         cx,
@@ -432,7 +441,7 @@ impl ElConnectionModal {
                 connections.connections.insert(new_name.clone(), value);
             }
             Some(original) => {
-                if new_name != *original && connections.connections.contains_key(&new_name) {
+                if new_name != *original && name_taken(&connections, &new_name) {
                     return self.fail(
                         format!("a connection named {new_name:?} already exists"),
                         cx,
@@ -454,6 +463,22 @@ impl ElConnectionModal {
                     })
                     .collect();
                 if new_name != *original {
+                    // Profile overrides ride along with the rename — a
+                    // detached override would silently resolve the new
+                    // name to the wrong environment's base connection.
+                    for profile in connections.profiles.values_mut() {
+                        profile.connections = profile
+                            .connections
+                            .iter()
+                            .map(|(name, existing)| {
+                                if name == original {
+                                    (new_name.clone(), existing.clone())
+                                } else {
+                                    (name.clone(), existing.clone())
+                                }
+                            })
+                            .collect();
+                    }
                     renamed_from = Some(original.clone());
                 }
             }
@@ -620,7 +645,12 @@ impl ElConnectionModal {
             Ok(connections) => connections,
             Err(error) => return self.fail(format!("{error:#}"), cx),
         };
-        if connections.connections.shift_remove(&original).is_none() {
+        let in_base = connections.connections.shift_remove(&original).is_some();
+        let mut in_profiles = false;
+        for profile in connections.profiles.values_mut() {
+            in_profiles |= profile.connections.shift_remove(&original).is_some();
+        }
+        if !in_base && !in_profiles {
             return self.fail("the connection is gone from connections.yml".into(), cx);
         }
 

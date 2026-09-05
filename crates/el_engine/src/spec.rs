@@ -110,19 +110,37 @@ pub fn profile_selection_path(project_root: &Path) -> std::path::PathBuf {
 /// The active profile name: ZDBT_EL_PROFILE env wins, then the local
 /// selection file, then the file's default_profile. None = base only.
 pub fn active_profile(project_root: &Path, connections: &Connections) -> Option<String> {
+    try_active_profile(project_root, connections).unwrap_or(None)
+}
+
+/// Like [`active_profile`], but an UNREADABLE selection file (present yet
+/// failing to read) is an error — never a silent flip to the default
+/// environment.
+pub fn try_active_profile(
+    project_root: &Path,
+    connections: &Connections,
+) -> Result<Option<String>, String> {
     if let Ok(name) = std::env::var("ZDBT_EL_PROFILE") {
         let name = name.trim().to_owned();
         if !name.is_empty() {
-            return Some(name);
+            return Ok(Some(name));
         }
     }
-    if let Ok(name) = std::fs::read_to_string(profile_selection_path(project_root)) {
-        let name = name.trim().to_owned();
-        if !name.is_empty() {
-            return Some(name);
+    match std::fs::read_to_string(profile_selection_path(project_root)) {
+        Ok(name) => {
+            let name = name.trim().to_owned();
+            if !name.is_empty() {
+                return Ok(Some(name));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "the profile selection file could not be read ({error}) — fix or                  delete el/.zdbt/profile"
+            ));
         }
     }
-    connections.default_profile.clone()
+    Ok(connections.default_profile.clone())
 }
 
 /// One-stop loader for run surfaces: connections.yml resolved through
@@ -134,7 +152,11 @@ pub fn load_active_connections(
 ) -> Result<(Connections, Option<String>), SpecError> {
     let path = project_root.join("el").join("connections.yml");
     let raw = load_connections(&path)?;
-    let profile = active_profile(project_root, &raw);
+    let profile =
+        try_active_profile(project_root, &raw).map_err(|message| SpecError::Parse {
+            path: path.display().to_string(),
+            message,
+        })?;
     let resolved = raw
         .resolved(profile.as_deref())
         .map_err(|message| SpecError::Parse {

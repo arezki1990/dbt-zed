@@ -171,10 +171,17 @@ pub struct StateStore {
 
 /// Where a project's state db lives. Overridable for tests via
 /// ZDBT_EL_STATE_DIR.
-pub fn state_db_path(project_root: &Path) -> PathBuf {
+pub fn state_db_path(project_root: &Path, profile: Option<&str>) -> PathBuf {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(project_root.to_string_lossy().as_bytes());
+    // Watermarks are PER ENVIRONMENT: a dev cursor must never make a
+    // recette/prod run skip rows (or vice versa). Each profile gets its
+    // own state database.
+    if let Some(profile) = profile {
+        hasher.update([0u8]);
+        hasher.update(profile.as_bytes());
+    }
     let digest = hasher.finalize();
     let short = digest
         .iter()
@@ -212,8 +219,8 @@ fn paths_data_dir() -> PathBuf {
 }
 
 impl StateStore {
-    pub fn open(project_root: &Path) -> Result<Self> {
-        let path = state_db_path(project_root);
+    pub fn open(project_root: &Path, profile: Option<&str>) -> Result<Self> {
+        let path = state_db_path(project_root, profile);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("creating el-state dir")?;
         }
@@ -344,11 +351,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: test-local env var, no threads racing it here.
         unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", dir.path()) };
-        let store = StateStore::open(Path::new("/some/project")).unwrap();
+        let store = StateStore::open(Path::new("/some/project"), None).unwrap();
         assert!(store.watermark("p", "s").is_none());
         let wm = WatermarkValue::Timestamp(1_234_567_890);
         store.set_watermark("p", "s", &wm).unwrap();
         assert_eq!(store.watermark("p", "s"), Some(wm.clone()));
+        // Profiles get distinct databases.
+        assert_ne!(
+            state_db_path(Path::new("/p"), None),
+            state_db_path(Path::new("/p"), Some("prod"))
+        );
         // Update wins.
         let wm2 = WatermarkValue::Timestamp(9_999_999_999);
         store.set_watermark("p", "s", &wm2).unwrap();

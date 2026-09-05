@@ -100,7 +100,7 @@ streams:
         scalar(&warehouse_db, "SELECT COUNT(*)::VARCHAR FROM LANDING.ORDERS"),
         "4"
     );
-    let store = el_engine::state::StateStore::open(project.path()).unwrap();
+    let store = el_engine::state::StateStore::open(project.path(), None).unwrap();
     let cursor = store.watermark("inc", "orders").expect("cursor stored");
     assert_eq!(
         cursor,
@@ -152,7 +152,7 @@ streams:
         "111.00"
     );
     // Cursor advanced to the new max.
-    let store = el_engine::state::StateStore::open(project.path()).unwrap();
+    let store = el_engine::state::StateStore::open(project.path(), None).unwrap();
     assert_eq!(
         store.watermark("inc", "orders").unwrap().to_string(),
         "2026-01-06 10:00:00"
