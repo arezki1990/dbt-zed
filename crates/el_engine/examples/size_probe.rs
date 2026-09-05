@@ -1,19 +1,20 @@
-//! Binary-size probe for the spike: a minimal executable that pulls the
-//! full el_engine polars surface, so `ls -lh` on the release artifact
-//! approximates what linking the engine adds to zdbt.
+//! Binary-size probe: minimal executable pulling the engine's polars surface.
 
 fn main() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).expect("usage: size_probe <csv>");
-    let df = el_engine::read_csv(std::path::Path::new(&path))?;
-    let outcome = el_engine::apply_casts(
-        df,
-        &[el_engine::CastRule {
-            column: "id".into(),
-            to: polars::prelude::DataType::Int64,
-            strict: false,
-            parse: None,
-        }],
+    let root = std::path::Path::new(".");
+    let mut extractor = el_engine::connectors::files::FileExtractor::new(
+        root,
+        &path,
+        el_engine::spec::FileFormat::Csv,
+        None,
+        10_000,
     )?;
-    println!("{} rows, {} lax failures", outcome.df.height(), outcome.lax_failures.len());
+    use el_engine::connectors::Extractor as _;
+    let mut rows = 0usize;
+    while let Some(chunk) = extractor.next_chunk()? {
+        rows += chunk.height();
+    }
+    println!("{rows} rows");
     Ok(())
 }

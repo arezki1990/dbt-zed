@@ -19,6 +19,13 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
 
 [dependencies]
 anyhow.workspace = true
+indexmap.workspace = true
+log.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
 # Exact-pinned: the 0.5x Rust API churns between minor versions.
 polars = { version = "=0.55.2", default-features = false, features = [
     "lazy",
