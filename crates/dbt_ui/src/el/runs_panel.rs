@@ -614,19 +614,21 @@ impl ElRunsPanel {
         let mut pipelines = v_flex().w_full().px_1().gap_0p5();
         for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
             let name = pipeline.name.clone();
-            let meta: SharedString = match &pipeline.schedule {
-                Some(schedule) => format!(
-                    "{} stream{} — runs on {schedule}",
-                    pipeline.streams,
-                    if pipeline.streams == 1 { "" } else { "s" }
+            let streams_text = format!(
+                "{} stream{}",
+                pipeline.streams,
+                if pipeline.streams == 1 { "" } else { "s" }
+            );
+            let meta: SharedString = match (&pipeline.schedule, pipeline.next_run_unix) {
+                (Some(schedule), Some(next)) => format!(
+                    "{streams_text} — runs on {schedule}, next {}",
+                    relative_time(next, true)
                 )
                 .into(),
-                None => format!(
-                    "{} stream{}",
-                    pipeline.streams,
-                    if pipeline.streams == 1 { "" } else { "s" }
-                )
-                .into(),
+                (Some(schedule), None) => {
+                    format!("{streams_text} — runs on {schedule}").into()
+                }
+                (None, _) => streams_text.into(),
             };
             pipelines = pipelines.child(
                 h_flex()
@@ -656,6 +658,35 @@ impl ElRunsPanel {
             );
         }
 
+        // Past runs as a table: fixed columns, error takes the remainder.
+        let col = |width: f32, element: gpui::AnyElement| {
+            div().w(px(width)).flex_shrink_0().overflow_hidden().child(element)
+        };
+        let head = |width: f32, text: &'static str| {
+            col(
+                width,
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent)
+                    .into_any_element(),
+            )
+        };
+        let header = h_flex()
+            .w_full()
+            .px_2()
+            .gap_2()
+            .child(head(44., "run"))
+            .child(head(130., "pipeline"))
+            .child(head(70., "status"))
+            .child(head(80., "started"))
+            .child(head(64., "duration"))
+            .child(head(70., "rows"))
+            .child(head(50., "attempt"))
+            .child(
+                Label::new("error")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
+            );
         let mut runs = v_flex()
             .id("el-remote-runs")
             .flex_1()
@@ -672,33 +703,58 @@ impl ElRunsPanel {
             };
             let run_id = run.id;
             let is_running = run.status == "running";
-            let detail: SharedString = match &run.error {
-                Some(error) => error.clone().into(),
-                None if is_running => "running…".into(),
-                None => format!("{} rows written", run.rows_written).into(),
+            let cell = |width: f32, text: String, color: Color| {
+                col(
+                    width,
+                    Label::new(text)
+                        .size(LabelSize::XSmall)
+                        .color(color)
+                        .truncate()
+                        .into_any_element(),
+                )
             };
             runs = runs.child(
                 h_flex()
                     .w_full()
                     .h(px(24.))
-                    .px_1()
+                    .px_2()
                     .gap_2()
                     .items_center()
+                    .child(cell(44., format!("#{}", run.id), Color::Muted))
+                    .child(cell(130., run.pipeline.clone(), Color::Default))
+                    .child(cell(70., run.status.clone(), status_color))
+                    .child(cell(
+                        80.,
+                        relative_time(run.started_unix, false),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        64.,
+                        duration_text(run.started_unix, run.finished_unix),
+                        Color::Muted,
+                    ))
+                    .child(cell(
+                        70.,
+                        if is_running {
+                            "…".to_owned()
+                        } else {
+                            run.rows_written.to_string()
+                        },
+                        Color::Default,
+                    ))
+                    .child(cell(
+                        50.,
+                        if run.attempt == 0 {
+                            "—".to_owned()
+                        } else {
+                            format!("retry {}", run.attempt)
+                        },
+                        if run.attempt == 0 { Color::Muted } else { Color::Warning },
+                    ))
                     .child(
-                        Label::new(format!("#{}", run.id))
+                        Label::new(run.error.clone().unwrap_or_default())
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(run.pipeline.clone()).size(LabelSize::Small))
-                    .child(
-                        Label::new(run.status.clone())
-                            .size(LabelSize::XSmall)
-                            .color(status_color),
-                    )
-                    .child(
-                        Label::new(detail)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
+                            .color(Color::Error)
                             .truncate(),
                     )
                     .child(div().flex_1())
@@ -740,6 +796,7 @@ impl ElRunsPanel {
                             .color(Color::Muted),
                     ),
                 )
+                .child(header)
                 .child(runs)
                 .into_any_element()
         };
@@ -774,6 +831,39 @@ impl ElRunsPanel {
                 .into_any_element();
         }
         v_flex().size_full().child(toolbar).child(body).into_any_element()
+    }
+}
+
+/// "in 1m 20s" / "3m ago" for a unix instant, relative to now.
+fn relative_time(unix: u64, future: bool) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let delta = if future {
+        unix.saturating_sub(now)
+    } else {
+        now.saturating_sub(unix)
+    };
+    let text = if delta >= 3600 {
+        format!("{}h {}m", delta / 3600, (delta % 3600) / 60)
+    } else if delta >= 60 {
+        format!("{}m {}s", delta / 60, delta % 60)
+    } else {
+        format!("{delta}s")
+    };
+    if future { format!("in {text}") } else { format!("{text} ago") }
+}
+
+fn duration_text(started: u64, finished: Option<u64>) -> String {
+    let Some(finished) = finished else {
+        return "…".to_owned();
+    };
+    let delta = finished.saturating_sub(started);
+    if delta >= 60 {
+        format!("{}m {}s", delta / 60, delta % 60)
+    } else {
+        format!("{delta}s")
     }
 }
 

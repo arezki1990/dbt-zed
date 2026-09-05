@@ -56,6 +56,7 @@ struct RunRecord {
     id: u64,
     pipeline: String,
     started: SystemTime,
+    finished: Option<SystemTime>,
     attempt: u32,
     status: RunStatus,
     error: Option<String>,
@@ -143,6 +144,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
             id,
             pipeline: pipeline_name.to_owned(),
             started: SystemTime::now(),
+            finished: None,
             attempt,
             status: RunStatus::Running,
             error: None,
@@ -212,6 +214,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
             {
                 let mut registry = engine_state.registry.lock().unwrap();
                 if let Some(run) = registry.runs.iter_mut().find(|run| run.id == run_id) {
+                    run.finished = Some(SystemTime::now());
                     run.status = if was_cancelled {
                         RunStatus::Cancelled
                     } else if failed_error.is_none() {
@@ -398,8 +401,26 @@ struct PipelineInfo {
     name: String,
     schedule: Option<String>,
     timezone: Option<String>,
+    /// When the schedule next fires (unix seconds, UTC).
+    next_run_unix: Option<u64>,
     streams: usize,
     running: bool,
+}
+
+/// The schedule's next fire time, panic-guarded like the scheduler.
+fn next_fire_unix(schedule: Option<&str>, timezone: Option<&str>) -> Option<u64> {
+    let schedule: cron::Schedule = schedule?.parse().ok()?;
+    let timezone: chrono_tz::Tz = timezone
+        .and_then(|name| name.parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        schedule
+            .upcoming(timezone)
+            .next()
+            .map(|fire| fire.with_timezone(&Utc).timestamp().max(0) as u64)
+    }))
+    .ok()
+    .flatten()
 }
 
 #[derive(Serialize)]
@@ -409,8 +430,15 @@ struct RunInfo {
     status: RunStatus,
     attempt: u32,
     started_unix: u64,
+    finished_unix: Option<u64>,
     rows_written: u64,
     error: Option<String>,
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn run_info(run: &RunRecord) -> RunInfo {
@@ -419,11 +447,8 @@ fn run_info(run: &RunRecord) -> RunInfo {
         pipeline: run.pipeline.clone(),
         status: run.status,
         attempt: run.attempt,
-        started_unix: run
-            .started
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0),
+        started_unix: unix_secs(run.started),
+        finished_unix: run.finished.map(unix_secs),
         rows_written: run.rows_written,
         error: run.error.clone(),
     }
@@ -587,6 +612,10 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 if let Ok(pipeline) = spec::load_pipeline(&path) {
                     pipelines.push(PipelineInfo {
                         running: state.is_running(&pipeline.pipeline),
+                        next_run_unix: next_fire_unix(
+                            pipeline.schedule.as_deref(),
+                            pipeline.timezone.as_deref(),
+                        ),
                         name: pipeline.pipeline,
                         schedule: pipeline.schedule,
                         timezone: pipeline.timezone,
@@ -797,6 +826,8 @@ pub struct EventsPage {
 pub struct RemotePipeline {
     pub name: String,
     pub schedule: Option<String>,
+    #[serde(default)]
+    pub next_run_unix: Option<u64>,
     pub streams: usize,
     pub running: bool,
 }
@@ -808,6 +839,8 @@ pub struct RemoteRun {
     pub status: String,
     pub attempt: u32,
     pub started_unix: u64,
+    #[serde(default)]
+    pub finished_unix: Option<u64>,
     pub rows_written: u64,
     pub error: Option<String>,
 }
