@@ -29,6 +29,7 @@ use crate::{
 
 pub struct DbtDatabasePanel {
     focus_handle: FocusHandle,
+    dbt_detected: std::cell::Cell<Option<(std::time::Instant, bool)>>,
     workspace: WeakEntity<Workspace>,
     root: Option<PathBuf>,
     catalog: Option<Arc<DbCatalog>>,
@@ -123,6 +124,22 @@ fn artifact_mtimes(root: &std::path::Path) -> (Option<SystemTime>, Option<System
 }
 
 impl DbtDatabasePanel {
+    fn workspace_has_dbt(&self, cx: &App) -> bool {
+        if let Some((checked, value)) = self.dbt_detected.get() {
+            if checked.elapsed() < std::time::Duration::from_secs(5) {
+                return value;
+            }
+        }
+        let value = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| discover_workspace_root(workspace.read(cx), cx))
+            .is_some();
+        self.dbt_detected
+            .set(Some((std::time::Instant::now(), value)));
+        value
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
@@ -156,6 +173,7 @@ impl DbtDatabasePanel {
 
             Self {
                 focus_handle: cx.focus_handle(),
+                dbt_detected: std::cell::Cell::new(None),
                 workspace: workspace_handle,
                 root: None,
                 catalog: None,
@@ -648,8 +666,12 @@ impl Panel for DbtDatabasePanel {
         px(300.)
     }
 
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::DatabaseZap)
+    fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
+        // The EL/dbt split: without a dbt project the dbt features hide
+        // (a None icon removes the dock button — dock.rs consumes it
+        // with `?`). Cached with a short TTL; opening a dbt project
+        // later reveals the button on the next check.
+        self.workspace_has_dbt(cx).then_some(IconName::DatabaseZap)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

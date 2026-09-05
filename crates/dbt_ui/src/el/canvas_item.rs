@@ -683,15 +683,12 @@ impl ElPipelineCanvas {
                         };
                     workspace
                         .update_in(cx, |workspace, window, cx| {
-                            let Some(panel) =
-                                workspace.panel::<crate::results_panel::DbtResultsPanel>(cx)
-                            else {
+                            let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
                                 return;
                             };
-                            workspace
-                                .focus_panel::<crate::results_panel::DbtResultsPanel>(window, cx);
+                            workspace.focus_panel::<super::ElRunsPanel>(window, cx);
                             panel.update(cx, |panel, cx| {
-                                panel.show_table(title, columns, rows, window, cx)
+                                panel.show_preview(title, columns, rows, cx)
                             });
                         })
                         .ok();
