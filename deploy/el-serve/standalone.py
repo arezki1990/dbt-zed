@@ -12,8 +12,12 @@ never touches the IDE's dependency graph.
 """
 import shutil
 import sys
-import tomllib
 from pathlib import Path
+
+try:  # 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Ubuntu 22.04's 3.10: apt python3-tomli / pip tomli
+    import tomli as tomllib
 
 EL_CRATES = ["el_engine", "el_worker", "el_serve"]
 

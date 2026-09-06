@@ -60,6 +60,9 @@ fi
 if [[ "$DOWNLOADED" != 1 ]]; then
   echo "==> build dependencies"
   apt-get install -y -qq build-essential cmake pkg-config libssl-dev python3 >/dev/null
+  # standalone.py reads TOML: 3.11+ has tomllib; older Pythons need tomli.
+  python3 -c 'import tomllib' 2>/dev/null || apt-get install -y -qq python3-tomli >/dev/null \
+    || { apt-get install -y -qq python3-pip >/dev/null && python3 -m pip install -q tomli; }
   if ! command -v cargo >/dev/null; then
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
     # shellcheck disable=SC1091
