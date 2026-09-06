@@ -117,8 +117,14 @@ impl ElRunsPanel {
         {
             let sql = sql.clone();
             cx.spawn(async move |_, cx| {
-                let Ok(language) = languages.language_for_name("dbt SQL").await else {
-                    return;
+                // Plain SQL grammar first (what the dbt results grid uses);
+                // the Jinja-host dbt language as a fallback.
+                let language = match languages.language_for_name("SQL (dbt)").await {
+                    Ok(language) => language,
+                    Err(_) => match languages.language_for_name("dbt SQL").await {
+                        Ok(language) => language,
+                        Err(_) => return,
+                    },
                 };
                 sql.update(cx, |editor, cx| {
                     if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
