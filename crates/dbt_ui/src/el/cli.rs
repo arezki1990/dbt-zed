@@ -257,7 +257,10 @@ fn install_remote(args: &[String]) -> i32 {
         eprintln!("could not place the token on {host_spec}");
         return 1;
     }
-    println!("==> {host_spec}: installing (builds from source — this takes a while)");
+    println!(
+        "==> {host_spec}: installing (downloads the released daemon; builds from source \
+         only when no release fits this platform — that takes a while)"
+    );
     let install = format!(
         "sudo bash -s -- --project '{remote_project}' --listen '{listen}' --branch '{branch}' \
          --profile '{profile}'"
@@ -277,15 +280,39 @@ fn install_remote(args: &[String]) -> i32 {
     );
     let env_path = root.join(".env");
     {
-        use std::io::Write as _;
-        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&env_path) {
-            Ok(file) => file,
+        // Re-installing the same server replaces its line instead of
+        // appending a second one (whichever the loader picked would be
+        // stale for one side).
+        let existing = match std::fs::read_to_string(&env_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => {
-                eprintln!("could not write {}: {error}", env_path.display());
+                eprintln!("could not read {}: {error}", env_path.display());
                 return 1;
             }
         };
-        let _ = writeln!(file, "{var}={token}");
+        let prefix = format!("{var}=");
+        let mut replaced = false;
+        let mut lines: Vec<String> = existing
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    replaced = true;
+                    format!("{var}={token}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        if !replaced {
+            lines.push(format!("{var}={token}"));
+        }
+        let mut contents = lines.join("\n");
+        contents.push('\n');
+        if let Err(error) = std::fs::write(&env_path, contents) {
+            eprintln!("could not write {}: {error}", env_path.display());
+            return 1;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

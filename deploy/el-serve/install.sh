@@ -18,6 +18,7 @@ PROJECT=""
 LISTEN="0.0.0.0:7431"
 PREFIX="/usr/local/bin"
 PROFILE="prod"
+PROFILE_SET=0
 FROM_SOURCE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,7 +26,7 @@ while [[ $# -gt 0 ]]; do
     --branch) BRANCH="$2"; shift 2 ;;
     --project) PROJECT="$2"; shift 2 ;;
     --listen) LISTEN="$2"; shift 2 ;;
-    --profile) PROFILE="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; PROFILE_SET=1; shift 2 ;;
     --from-source) FROM_SOURCE=1; shift ;;
     *) echo "unknown flag $1"; exit 2 ;;
   esac
@@ -120,7 +121,19 @@ ZDBT_EL_PROFILE=$PROFILE
 # EL_PG_URL_PROD=postgres://user:pass@host:5432/db
 ENV
   chmod 0600 /etc/zdbt-el-serve/env
+else
+  # Re-install: keep the operator's env (database URLs) but apply what this
+  # run brought — the fresh token `zdbt el install-remote` just placed, and
+  # an explicit --profile.
+  set_env() {
+    { grep -v "^$1=" /etc/zdbt-el-serve/env || true; echo "$1=$2"; } > /etc/zdbt-el-serve/env.new
+    mv /etc/zdbt-el-serve/env.new /etc/zdbt-el-serve/env && chmod 0600 /etc/zdbt-el-serve/env
+  }
+  [[ -f /etc/zdbt-el-serve/token ]] && set_env ZDBT_EL_TOKEN "$(head -1 /etc/zdbt-el-serve/token)"
+  [[ "$PROFILE_SET" == 1 ]] && set_env ZDBT_EL_PROFILE "$PROFILE"
 fi
+# The pre-placed token is consumed — a later manual re-run keeps the env as is.
+rm -f /etc/zdbt-el-serve/token
 
 # A launcher that works with or without systemd (containers have none).
 cat > "$PREFIX/zdbt-el-serve-start" <<START
@@ -136,11 +149,14 @@ if [[ -d /run/systemd/system ]] && systemctl --version >/dev/null 2>&1; then
   sed -e "s|@PROJECT@|$PROJECT|g" -e "s|@LISTEN@|$LISTEN|g" -e "s|@PREFIX@|$PREFIX|g" \
     "$SRC/deploy/el-serve/zdbt-el-serve.service" > /etc/systemd/system/zdbt-el-serve.service
   systemctl daemon-reload
-  systemctl enable --now zdbt-el-serve || true
+  systemctl enable zdbt-el-serve >/dev/null 2>&1 || true
+  # restart, not start: a re-install must pick up the new binary and env
+  systemctl restart zdbt-el-serve || true
   START_HINT="systemctl status zdbt-el-serve   &&   journalctl -fu zdbt-el-serve"
 else
   echo "==> no systemd here (container?) — starting the daemon in the background"
   chown -R zdbt:zdbt "$PROJECT"
+  pkill -f "$PREFIX/zdbt-el-serve" >/dev/null 2>&1 || true; sleep 1
   nohup runuser -u zdbt -- "$PREFIX/zdbt-el-serve-start" > /var/log/zdbt-el-serve.log 2>&1 &
   sleep 2
   START_HINT="tail -f /var/log/zdbt-el-serve.log   (restart: zdbt-el-serve-start)"
