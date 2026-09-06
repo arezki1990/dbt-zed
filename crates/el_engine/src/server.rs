@@ -1107,7 +1107,7 @@ pub struct RemoteClient {
 /// no `http://localhost:6@evil.com` userinfo bypass), credentials in the
 /// URL rejected outright, and plaintext http allowed only when the HOST
 /// is genuinely loopback.
-fn check_remote_url(raw: &str) -> Result<()> {
+pub fn check_remote_url(raw: &str) -> Result<()> {
     let parsed = url::Url::parse(raw)
         .map_err(|error| anyhow::anyhow!("invalid remote url: {error}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {

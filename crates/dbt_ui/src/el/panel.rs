@@ -347,7 +347,7 @@ impl ElPanel {
         }
         if self.remotes.is_empty() {
             rows.push(Row::ConnNote(
-                "No servers yet — press + to declare one.".into(),
+                "No servers yet — press + to add one.".into(),
                 Color::Muted,
             ));
         }
@@ -377,8 +377,34 @@ impl ElPanel {
             .ok();
     }
 
-    /// "+" on Remotes: remotes are declared in YAML (a token is a
-    /// ${VAR} reference) — open the file, creating a starter if absent.
+    pub fn remotes_changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+    }
+
+    fn edit_remote(
+        &mut self,
+        editing: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.root.clone() else { return };
+        let panel = cx.entity().downgrade();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                super::remote_modal::ElRemoteModal::deploy(
+                    workspace,
+                    panel,
+                    root,
+                    editing.map(|name| name.to_string()),
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+    }
+
+    /// Kept for the YAML route: open (or scaffold) remotes.yml.
+    #[allow(dead_code)]
     fn add_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
         let path = super::el_dir(&root).join("remotes.yml");
@@ -931,10 +957,10 @@ impl ElPanel {
                     IconButton::new("el-add-remote", IconName::Plus)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Declare a server (el/remotes.yml)"))
+                        .tooltip(Tooltip::text("Add server"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             cx.stop_propagation();
-                            this.add_remote(window, cx)
+                            this.edit_remote(None, window, cx)
                         })),
                 )
                 .into_any_element(),
@@ -954,6 +980,17 @@ impl ElPanel {
                             .color(Color::Muted)
                             .truncate(),
                     )
+                    .child({
+                        let name = name.clone();
+                        IconButton::new(("el-remote-edit", ix), IconName::Pencil)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Edit server"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.edit_remote(Some(name.clone()), window, cx);
+                            }))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.show_remote(open_name.clone(), window, cx);
                     }))

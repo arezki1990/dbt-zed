@@ -626,6 +626,15 @@ pub fn list_pipelines(el_dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Serializes connections in canonical form. Same comment-loss caveat as
 /// pipelines; the builder warns once.
+pub fn to_canonical_remotes_yaml(remotes: &Remotes) -> String {
+    let body = serde_yaml_ng::to_string(remotes).unwrap_or_default();
+    format!(
+        "# el/remotes.yml — el serve daemons the IDE can drive from the Remote tab.\n\
+         # Tokens are ${{VAR}} references, never literals. Non-loopback URLs must be https.\n\
+         {MANAGED_HEADER}\n{body}"
+    )
+}
+
 pub fn to_canonical_connections_yaml(connections: &Connections) -> String {
     let body = serde_yaml_ng::to_string(connections).unwrap_or_default();
     format!(

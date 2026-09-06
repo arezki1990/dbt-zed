@@ -6,6 +6,7 @@ pub mod canvas_item;
 pub mod cli;
 pub mod connection_modal;
 pub mod deploy_modal;
+pub mod remote_modal;
 pub mod layout;
 pub mod mapping_editor;
 pub mod panel;
