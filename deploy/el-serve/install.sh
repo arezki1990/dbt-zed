@@ -18,6 +18,7 @@ PROJECT=""
 LISTEN="0.0.0.0:7431"
 PREFIX="/usr/local/bin"
 PROFILE="prod"
+FROM_SOURCE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
@@ -25,36 +26,72 @@ while [[ $# -gt 0 ]]; do
     --project) PROJECT="$2"; shift 2 ;;
     --listen) LISTEN="$2"; shift 2 ;;
     --profile) PROFILE="$2"; shift 2 ;;
+    --from-source) FROM_SOURCE=1; shift ;;
     *) echo "unknown flag $1"; exit 2 ;;
   esac
 done
 [[ -n "$PROJECT" ]] || { echo "--project <dir holding el/> is required"; exit 2; }
 
-echo "==> build dependencies"
 apt-get update -qq
-apt-get install -y -qq build-essential cmake pkg-config libssl-dev git curl ca-certificates python3 >/dev/null
-if ! command -v cargo >/dev/null; then
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
-  # shellcheck disable=SC1091
-  source "$HOME/.cargo/env"
+apt-get install -y -qq curl ca-certificates git >/dev/null
+
+# Prebuilt binaries from the latest el-v* release (seconds), unless
+# --from-source was asked for or no asset exists for this platform.
+ARCH=$(uname -m)
+case "$ARCH" in x86_64|amd64) ARCH=x86_64 ;; aarch64|arm64) ARCH=aarch64 ;; esac
+ASSET="zdbt-el-linux-${ARCH}.tar.gz"
+DOWNLOADED=0
+if [[ "$FROM_SOURCE" != 1 ]]; then
+  echo "==> looking for a released binary ($ASSET)"
+  API="https://api.github.com/repos/${REPO#https://github.com/}/releases"
+  URL=$(curl -fsSL "$API" | grep -o "https://[^\"]*/el-v[^\"]*/${ASSET}" | head -1 || true)
+  if [[ -n "$URL" ]] && curl -fsSL "$URL" -o /tmp/zdbt-el.tar.gz; then
+    tar -xzf /tmp/zdbt-el.tar.gz -C /tmp
+    install -m 0755 /tmp/zdbt-el-serve "$PREFIX/zdbt-el-serve"
+    install -m 0755 /tmp/zdbt-el-worker "$PREFIX/zdbt-el-worker"
+    rm -f /tmp/zdbt-el.tar.gz /tmp/zdbt-el-serve /tmp/zdbt-el-worker
+    DOWNLOADED=1
+    echo "==> installed $(basename "$URL")"
+  else
+    echo "==> no released binary for linux-$ARCH — building from source"
+  fi
 fi
 
-echo "==> source"
-SRC=/opt/zdbt-src
-if [[ -d "$SRC/.git" ]]; then
-  git -C "$SRC" fetch -q origin "$BRANCH" && git -C "$SRC" checkout -q "origin/$BRANCH"
-else
-  git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$SRC"
+if [[ "$DOWNLOADED" != 1 ]]; then
+  echo "==> build dependencies"
+  apt-get install -y -qq build-essential cmake pkg-config libssl-dev python3 >/dev/null
+  if ! command -v cargo >/dev/null; then
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+
+  echo "==> source"
+  SRC=/opt/zdbt-src
+  if [[ -d "$SRC/.git" ]]; then
+    git -C "$SRC" fetch -q origin "$BRANCH" && git -C "$SRC" checkout -q "origin/$BRANCH"
+  else
+    git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$SRC"
+  fi
+
+  echo "==> standalone workspace (only the EL crates — none of the IDE's dependencies)"
+  EL=/opt/zdbt-el
+  python3 "$SRC/deploy/el-serve/standalone.py" "$SRC" "$EL"
+
+  echo "==> build (this takes a while: polars + duckdb)"
+  ( cd "$EL" && cargo build --release -p el_serve -p el_worker )
+  install -m 0755 "$EL/target/release/zdbt-el-serve" "$PREFIX/zdbt-el-serve"
+  install -m 0755 "$EL/target/release/zdbt-el-worker" "$PREFIX/zdbt-el-worker"
 fi
 
-echo "==> standalone workspace (only the EL crates — none of the IDE's dependencies)"
-EL=/opt/zdbt-el
-python3 "$SRC/deploy/el-serve/standalone.py" "$SRC" "$EL"
-
-echo "==> build (this takes a while: polars + duckdb)"
-( cd "$EL" && cargo build --release -p el_serve -p el_worker )
-install -m 0755 "$EL/target/release/zdbt-el-serve" "$PREFIX/zdbt-el-serve"
-install -m 0755 "$EL/target/release/zdbt-el-worker" "$PREFIX/zdbt-el-worker"
+# The systemd unit template ships with the release too; fetch it if we
+# did not clone.
+SRC=${SRC:-/opt/zdbt-src}
+if [[ ! -f "$SRC/deploy/el-serve/zdbt-el-serve.service" ]]; then
+  mkdir -p "$SRC/deploy/el-serve"
+  curl -fsSL "https://raw.githubusercontent.com/${REPO#https://github.com/}/${BRANCH}/deploy/el-serve/zdbt-el-serve.service" \
+    -o "$SRC/deploy/el-serve/zdbt-el-serve.service"
+fi
 
 echo "==> service user, dirs, env"
 id -u zdbt >/dev/null 2>&1 || useradd --system --home "$PROJECT" --shell /usr/sbin/nologin zdbt
