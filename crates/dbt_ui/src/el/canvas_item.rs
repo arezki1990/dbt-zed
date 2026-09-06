@@ -1699,12 +1699,12 @@ impl Render for ElPipelineCanvas {
             .bg(colors.panel_background)
             .child(
                 Label::new(self.pipeline_name())
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Default)
                     .color(Color::Default),
             )
             .children(route.map(|route| {
                 // Source → target · profile: what Run will actually touch.
-                Label::new(route).size(LabelSize::XSmall).color(Color::Muted)
+                Label::new(route).size(LabelSize::Small).color(Color::Muted)
             }))
             .child(div().flex_1())
             .child(

@@ -72,6 +72,9 @@ pub struct ElRunsPanel {
     remote_run_detail: Option<u64>,
     remote_run_events: Vec<el_engine::ProgressEvent>,
     remote_run_cursor: usize,
+    /// Height of the SQL editor in the Query tab; its splitter drags it.
+    query_split: f32,
+    query_split_drag: Option<(f32, f32)>,
     /// Height of the pipelines section; the splitter drags it.
     remote_split: f32,
     /// (pointer y at drag start, split at drag start).
@@ -104,8 +107,9 @@ impl ElRunsPanel {
         let workspace_handle = cx.entity().downgrade();
         let languages = workspace.project().read(cx).languages().clone();
         let sql = cx.new(|cx| {
-            let mut editor = Editor::auto_height(3, 8, window, cx);
+            let mut editor = Editor::multi_line(window, cx);
             editor.set_placeholder_text("SELECT …", window, cx);
+            editor.set_show_gutter(false, cx);
             editor
         });
         let remote_log_editor = cx.new(|cx| {
@@ -171,6 +175,8 @@ impl ElRunsPanel {
                 remote_run_detail: None,
                 remote_run_events: Vec::new(),
                 remote_run_cursor: 0,
+                query_split: 110.,
+                query_split_drag: None,
                 remote_split: 170.,
                 remote_split_drag: None,
                 remote_epoch: 0,
@@ -556,7 +562,7 @@ impl ElRunsPanel {
                 .gap_1()
                 .items_center()
                 .child(Label::new("on").size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(name.clone()).size(LabelSize::Small).color(Color::Accent))
+                .child(Label::new(name.clone()).size(LabelSize::Default).color(Color::Accent))
                 .child(
                     Label::new(kind.clone())
                         .size(LabelSize::XSmall)
@@ -601,19 +607,38 @@ impl ElRunsPanel {
                     .on_click(cx.listener(|this, _, _, cx| this.run_query(cx))),
             );
 
+        let dragging = self.query_split_drag.is_some();
         let editor = div()
             .w_full()
             .px_1()
-            .pb_1()
             .child(
                 div()
                     .w_full()
+                    .h(px(self.query_split))
                     .p_1()
                     .rounded_sm()
                     .border_1()
                     .border_color(colors.border)
                     .bg(colors.editor_background)
                     .child(self.sql.clone()),
+            );
+        let splitter = div()
+            .id("el-query-split")
+            .w_full()
+            .h(px(5.))
+            .mt_1()
+            .flex_shrink_0()
+            .cursor(gpui::CursorStyle::ResizeRow)
+            .bg(colors.border)
+            .hover(|style| style.bg(colors.border_focused))
+            .when(dragging, |bar| bar.bg(colors.border_focused))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.query_split_drag = Some((f32::from(event.position.y), this.query_split));
+                    cx.notify();
+                }),
             );
 
         let body: gpui::AnyElement = if let Some(error) = &self.query_error {
@@ -1041,7 +1066,7 @@ impl ElRunsPanel {
                         cx.notify();
                     })),
             )
-            .child(Label::new(name.clone()).size(LabelSize::Small))
+            .child(Label::new(name.clone()).size(LabelSize::Default))
             .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted))
             .child(div().flex_1())
             .children(running.then(|| {
@@ -1068,7 +1093,7 @@ impl ElRunsPanel {
             .child(
                 div().px_2().pt_1().child(
                     Label::new("Runs of this pipeline")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Muted),
                 ),
             )
@@ -1134,7 +1159,7 @@ impl ElRunsPanel {
                     "run #{run_id} · {}",
                     run.map(|run| run.pipeline.clone()).unwrap_or_default()
                 ))
-                .size(LabelSize::Small),
+                .size(LabelSize::Default),
             )
             .child(Label::new(status).size(LabelSize::XSmall).color(status_color))
             .child(Label::new(facts).size(LabelSize::XSmall).color(Color::Muted))
@@ -1621,7 +1646,7 @@ impl Render for ElRunsPanel {
                                     .tooltip(ui::Tooltip::text("Back"))
                                     .on_click(cx.listener(|this, _, _, cx| this.show_runs(cx))),
                             )
-                            .child(Label::new(preview.title.clone()).size(LabelSize::Small))
+                            .child(Label::new(preview.title.clone()).size(LabelSize::Default))
                             .child(
                                 Label::new(format!("{count} rows"))
                                     .size(LabelSize::XSmall)
@@ -1638,7 +1663,7 @@ impl Render for ElRunsPanel {
                            this: &Self,
                            cx: &mut Context<Self>| {
                     Button::new(id, label)
-                        .label_size(LabelSize::Small)
+                        .label_size(LabelSize::Default)
                         .toggle_state(this.surface == surface)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.surface = surface;

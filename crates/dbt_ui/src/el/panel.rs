@@ -41,6 +41,10 @@ pub struct ElPanel {
     tables_epoch: u64,
     _list_tasks: std::collections::HashMap<SharedString, Task<()>>,
     scroll: UniformListScrollHandle,
+    scroll_lower: UniformListScrollHandle,
+    /// Height of the Pipelines section; the splitter drags it.
+    split: f32,
+    split_drag: Option<(f32, f32)>,
     _refresh: Task<()>,
 }
 
@@ -126,6 +130,9 @@ impl ElPanel {
             tables_epoch: 0,
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
+            scroll_lower: UniformListScrollHandle::new(),
+            split: 200.,
+            split_drag: None,
             _refresh: Task::ready(()),
         })
     }
@@ -256,9 +263,16 @@ impl ElPanel {
             .ok();
     }
 
-    fn rows(&self) -> Vec<Row> {
+    /// True when the project has nothing EL yet — one list with the
+    /// invitation to initialize.
+    fn is_empty_project(&self) -> bool {
+        self.pipelines.is_empty() && self.connections.is_empty() && self.remotes.is_empty()
+    }
+
+    /// The upper list: pipelines.
+    fn upper_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        if self.pipelines.is_empty() && self.connections.is_empty() {
+        if self.is_empty_project() {
             rows.push(Row::Note(
                 "Extract-load pipelines, defined as YAML in el/.".into(),
             ));
@@ -271,6 +285,12 @@ impl ElPanel {
                 rows.push(Row::Pipeline(path.clone()));
             }
         }
+        rows
+    }
+
+    /// The lower list: connections (with their explorer trees) and remotes.
+    fn lower_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
         if let Some(error) = &self.connections_error {
             rows.push(Row::ConnectionsHeader);
             if !self.collapsed.contains("connections") {
@@ -609,28 +629,97 @@ impl Panel for ElPanel {
 
 impl Render for ElPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let rows = std::sync::Arc::new(self.rows());
-        let count = rows.len();
-        let entity = cx.entity();
-
-        let list = gpui::uniform_list("el-panel-rows", count, {
-            move |range, _window, cx| {
-                entity.update(cx, |this, cx| {
-                    range
-                        .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, ix, cx)))
-                        .collect::<Vec<_>>()
-                })
-            }
-        })
-        .flex_1()
-        .track_scroll(&self.scroll);
+        let colors = cx.theme().colors().clone();
+        let make_list = |id: &'static str,
+                         rows: Vec<Row>,
+                         scroll: &UniformListScrollHandle,
+                         cx: &mut Context<Self>| {
+            let rows = std::sync::Arc::new(rows);
+            let count = rows.len();
+            let entity = cx.entity();
+            gpui::uniform_list(id, count, {
+                move |range, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        range
+                            .filter_map(|ix| {
+                                rows.get(ix).map(|row| this.render_row(row, ix, cx))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                }
+            })
+            .track_scroll(scroll)
+        };
+        let empty = self.is_empty_project();
+        let upper = make_list("el-panel-upper", self.upper_rows(), &self.scroll, cx);
+        let lower = make_list("el-panel-lower", self.lower_rows(), &self.scroll_lower, cx);
+        let dragging = self.split_drag.is_some();
+        let list: gpui::AnyElement = if empty {
+            upper.flex_1().into_any_element()
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .h(px(self.split))
+                        .flex_shrink_0()
+                        .child(upper.size_full()),
+                )
+                .child(
+                    // The splitter: drag to trade space between pipelines
+                    // and the connections/remotes below.
+                    div()
+                        .id("el-panel-split")
+                        .w_full()
+                        .h(px(5.))
+                        .flex_shrink_0()
+                        .cursor(gpui::CursorStyle::ResizeRow)
+                        .bg(colors.border)
+                        .hover(|style| style.bg(colors.border_focused))
+                        .when(dragging, |bar| bar.bg(colors.border_focused))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.split_drag =
+                                    Some((f32::from(event.position.y), this.split));
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(div().flex_1().min_h_0().child(lower.size_full()))
+                .into_any_element()
+        };
 
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("ElPanel")
             .bg(colors.panel_background)
+            .when(dragging, |flex| {
+                flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start_y, start_split)) = this.split_drag {
+                        this.split =
+                            (start_split + f32::from(event.position.y) - start_y).clamp(60., 900.);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.split_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.split_drag = None;
+                        cx.notify();
+                    }),
+                )
+            })
             .child(
                 h_flex()
                     .w_full()
@@ -639,7 +728,7 @@ impl Render for ElPanel {
                     .items_center()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(Label::new("EL").size(LabelSize::Small))
+                    .child(Label::new("EL").size(LabelSize::Default))
                     .child(div().flex_1())
                     .children(self.profile.clone().map(|profile| {
                         Label::new(profile)
@@ -745,7 +834,7 @@ impl ElPanel {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
             )
-            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .child(Label::new(label).size(LabelSize::Default).color(Color::Default))
             .child(div().flex_1())
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(key, cx)))
     }
