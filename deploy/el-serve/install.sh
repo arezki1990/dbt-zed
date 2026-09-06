@@ -17,12 +17,14 @@ BRANCH="el-spike"
 PROJECT=""
 LISTEN="0.0.0.0:7431"
 PREFIX="/usr/local/bin"
+PROFILE="prod"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --project) PROJECT="$2"; shift 2 ;;
     --listen) LISTEN="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
     *) echo "unknown flag $1"; exit 2 ;;
   esac
 done
@@ -55,11 +57,18 @@ id -u zdbt >/dev/null 2>&1 || useradd --system --home "$PROJECT" --shell /usr/sb
 mkdir -p "$PROJECT/el/.zdbt" /etc/zdbt-el-serve
 chown -R zdbt:zdbt "$PROJECT"
 if [[ ! -f /etc/zdbt-el-serve/env ]]; then
+  # `zdbt el install-remote` places the token beforehand (over stdin);
+  # a manual install gets a fresh one.
+  if [[ -f /etc/zdbt-el-serve/token ]]; then
+    TOKEN=$(head -1 /etc/zdbt-el-serve/token)
+  else
+    TOKEN=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  fi
   cat > /etc/zdbt-el-serve/env <<ENV
-# Bearer token the IDE presents (put the same value in your local .env)
-ZDBT_EL_TOKEN=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# Bearer token the IDE presents (the IDE's .env holds the same value)
+ZDBT_EL_TOKEN=$TOKEN
 # Environment this server runs by default (deploys can pin another)
-ZDBT_EL_PROFILE=prod
+ZDBT_EL_PROFILE=$PROFILE
 # Database credentials referenced as \${VAR} in el/connections.yml
 # EL_PG_URL_PROD=postgres://user:pass@host:5432/db
 ENV

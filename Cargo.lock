@@ -5593,6 +5593,7 @@ dependencies = [
  "smol",
  "sqlitegraph",
  "sqlparser",
+ "task",
  "tempfile",
  "ui",
  "util",
