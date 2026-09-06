@@ -629,9 +629,9 @@ impl ElRunsPanel {
             .mt_1()
             .flex_shrink_0()
             .cursor(gpui::CursorStyle::ResizeRow)
-            .bg(colors.border)
-            .hover(|style| style.bg(colors.border_focused))
-            .when(dragging, |bar| bar.bg(colors.border_focused))
+            .border_t_1()
+            .border_color(if dragging { colors.border_focused } else { colors.border })
+            .hover(|style| style.border_color(colors.border_focused))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -976,9 +976,9 @@ impl ElRunsPanel {
                     .h(px(5.))
                     .flex_shrink_0()
                     .cursor(gpui::CursorStyle::ResizeRow)
-                    .bg(colors.border)
-                    .hover(|style| style.bg(colors.border_focused))
-                    .when(dragging, |bar| bar.bg(colors.border_focused))
+                    .border_t_1()
+                    .border_color(if dragging { colors.border_focused } else { colors.border })
+                    .hover(|style| style.border_color(colors.border_focused))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {

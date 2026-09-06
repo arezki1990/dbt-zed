@@ -9,7 +9,7 @@ use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Task,
     UniformListScrollHandle, WeakEntity, Window,
 };
-use ui::{Tooltip, prelude::*};
+use ui::{Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -628,7 +628,7 @@ impl Panel for ElPanel {
 }
 
 impl Render for ElPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let make_list = |id: &'static str,
                          rows: Vec<Row>,
@@ -664,20 +664,25 @@ impl Render for ElPanel {
                     div()
                         .h(px(self.split))
                         .flex_shrink_0()
-                        .child(upper.size_full()),
+                        .child(upper.size_full())
+                        .vertical_scrollbar_for(&self.scroll, window, cx),
                 )
                 .child(
-                    // The splitter: drag to trade space between pipelines
-                    // and the connections/remotes below.
+                    // The splitter: a 1px line with a 5px grab area — drag
+                    // to trade space between pipelines and the rest.
                     div()
                         .id("el-panel-split")
                         .w_full()
                         .h(px(5.))
                         .flex_shrink_0()
                         .cursor(gpui::CursorStyle::ResizeRow)
-                        .bg(colors.border)
-                        .hover(|style| style.bg(colors.border_focused))
-                        .when(dragging, |bar| bar.bg(colors.border_focused))
+                        .border_t_1()
+                        .border_color(if dragging {
+                            colors.border_focused
+                        } else {
+                            colors.border
+                        })
+                        .hover(|style| style.border_color(colors.border_focused))
                         .on_mouse_down(
                             gpui::MouseButton::Left,
                             cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -688,7 +693,13 @@ impl Render for ElPanel {
                             }),
                         ),
                 )
-                .child(div().flex_1().min_h_0().child(lower.size_full()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(lower.size_full())
+                        .vertical_scrollbar_for(&self.scroll_lower, window, cx),
+                )
                 .into_any_element()
         };
 
