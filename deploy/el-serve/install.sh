@@ -167,7 +167,7 @@ if [[ -d /run/systemd/system ]] && systemctl --version >/dev/null 2>&1; then
 else
   echo "==> no systemd here (container?) — starting the daemon in the background"
   chown -R zdbt:zdbt "$PROJECT"
-  pkill -f "$PREFIX/zdbt-el-serve" >/dev/null 2>&1 || true; sleep 1
+  pkill -x zdbt-el-serve >/dev/null 2>&1 || true; sleep 1
   nohup runuser -u zdbt -- "$PREFIX/zdbt-el-serve-start" > /var/log/zdbt-el-serve.log 2>&1 &
   sleep 2
   START_HINT="tail -f /var/log/zdbt-el-serve.log   (restart: zdbt-el-serve-start)"
