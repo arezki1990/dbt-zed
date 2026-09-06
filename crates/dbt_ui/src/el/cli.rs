@@ -217,9 +217,10 @@ fn install_remote(args: &[String]) -> i32 {
     let listen = flag(args, "--listen").unwrap_or_else(|| "0.0.0.0:7431".into());
     let branch = flag(args, "--branch").unwrap_or_else(|| "el-spike".into());
     let profile = flag(args, "--profile").unwrap_or_else(|| "prod".into());
-    let installer = format!(
-        "https://raw.githubusercontent.com/arezki1990/dbt-zed/{branch}/deploy/el-serve/install.sh"
-    );
+    // The installer travels with the binary and is sent over stdin: no
+    // CDN-cached copy, no network fetch of the script, always the version
+    // that matches this build.
+    const INSTALLER: &str = include_str!("../../../../deploy/el-serve/install.sh");
 
     // A fresh token, from the OS CSPRNG.
     let token = {
@@ -258,10 +259,10 @@ fn install_remote(args: &[String]) -> i32 {
     }
     println!("==> {host_spec}: installing (builds from source — this takes a while)");
     let install = format!(
-        "curl -fsSL {installer} | sudo bash -s -- --project '{remote_project}' --listen '{listen}' \
-         --branch '{branch}' --profile '{profile}'"
+        "sudo bash -s -- --project '{remote_project}' --listen '{listen}' --branch '{branch}' \
+         --profile '{profile}'"
     );
-    if !run_ssh(&host_spec, &with_port(&["-t"]), &install, None) {
+    if !run_ssh(&host_spec, &with_port(&[]), &install, Some(INSTALLER)) {
         eprintln!("the installer failed on {host_spec} — see its output above");
         return 1;
     }
