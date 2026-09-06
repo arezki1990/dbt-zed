@@ -98,14 +98,15 @@ def main(repo_root: str, out_dir: str) -> None:
         for key, value in entries.items():
             lines.append(f"{key} = {toml_value(value)}")
         lines.append("")
-    release = root_manifest.get("profile", {}).get("release")
-    if release:
-        lines.append("[profile.release]")
-        for key, value in release.items():
-            if isinstance(value, dict):
-                continue  # per-package overrides belong to the IDE build
-            lines.append(f"{key} = {toml_value(value)}")
-        lines.append("")
+    # A shippable daemon: the IDE's release profile keeps debug info for
+    # its own crash reports, which balloons these binaries to the GB.
+    release = dict(root_manifest.get("profile", {}).get("release", {}))
+    release = {key: value for key, value in release.items() if not isinstance(value, dict)}
+    release.update({"debug": False, "strip": True, "lto": "thin", "codegen-units": 1})
+    lines.append("[profile.release]")
+    for key, value in release.items():
+        lines.append(f"{key} = {toml_value(value)}")
+    lines.append("")
     (out / "Cargo.toml").write_text("\n".join(lines))
     shutil.copy2(repo / "Cargo.lock", out / "Cargo.lock")
     for license in ("LICENSE-GPL", "LICENSE-APACHE"):
