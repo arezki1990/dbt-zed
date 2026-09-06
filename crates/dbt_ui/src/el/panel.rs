@@ -248,17 +248,13 @@ impl ElPanel {
                 effective.as_deref().unwrap_or("none")
             )
         };
+        let console = self.console(cx);
         self.workspace
             .update(cx, |workspace, cx| {
                 let canvases: Vec<_> =
                     workspace.items_of_type::<super::ElPipelineCanvas>(cx).collect();
                 for canvas in canvases {
                     canvas.update(cx, |canvas, cx| canvas.reload(cx));
-                }
-                // The EL console's Query chips and results are from the
-                // old environment — reset them.
-                if let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) {
-                    panel.update(cx, |panel, cx| panel.profile_changed(cx));
                 }
                 if effective.as_ref() == Some(&name) {
                     super::toast(workspace, &message, cx);
@@ -267,6 +263,11 @@ impl ElPanel {
                 }
             })
             .ok();
+        // The EL console's Query state is from the old environment — reset
+        // it, outside the workspace lease (it reads the workspace).
+        if let Some(console) = console {
+            console.update(cx, |panel, cx| panel.profile_changed(cx));
+        }
     }
 
     /// True when the project has nothing EL yet — one list with the
@@ -366,15 +367,22 @@ impl ElPanel {
 
     /// Opens the console's Remote tab on the named server.
     fn show_remote(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        // Two separate leases: the console may read the workspace while it
+        // refreshes, so it must not be updated inside workspace.update.
+        let Some(console) = self.console(cx) else { return };
         self.workspace
             .update(cx, |workspace, cx| {
-                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
-                    return;
-                };
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
-                panel.update(cx, |panel, cx| panel.show_remote(name, cx));
             })
             .ok();
+        console.update(cx, |panel, cx| panel.show_remote(name, cx));
+    }
+
+    /// The EL console panel, read without holding a workspace lease.
+    fn console(&self, cx: &App) -> Option<Entity<super::ElRunsPanel>> {
+        self.workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElRunsPanel>(cx))
     }
 
     pub fn remotes_changed(&mut self, cx: &mut Context<Self>) {
@@ -446,13 +454,9 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
             }
         }
         // Touching a connection here is how the Query tab picks its target.
-        self.workspace
-            .update(cx, |workspace, cx| {
-                if let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) {
-                    panel.update(cx, |panel, cx| panel.select_connection(name.clone(), cx));
-                }
-            })
-            .ok();
+        if let Some(console) = self.console(cx) {
+            console.update(cx, |panel, cx| panel.select_connection(name.clone(), cx));
+        }
         cx.notify();
     }
 
@@ -535,17 +539,15 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(console) = self.console(cx) else { return };
         self.workspace
             .update(cx, |workspace, cx| {
-                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
-                    return;
-                };
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
-                panel.update(cx, |panel, cx| {
-                    panel.show_query_for_table(connection, &schema, &table, window, cx);
-                });
             })
             .ok();
+        console.update(cx, |panel, cx| {
+            panel.show_query_for_table(connection, &schema, &table, window, cx);
+        });
     }
 
     fn open_pipeline(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {

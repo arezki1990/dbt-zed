@@ -868,17 +868,20 @@ impl ElPipelineCanvas {
         let connection: SharedString = pipeline.target.connection.clone().into();
         let schema = pipeline.target.schema.clone();
         let table = stream.target_table(&pipeline.target);
+        // Separate leases: the console reads the workspace while refreshing.
+        let console = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElRunsPanel>(cx));
+        let Some(console) = console else { return };
         self.workspace
             .update(cx, |workspace, cx| {
-                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
-                    return;
-                };
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
-                panel.update(cx, |panel, cx| {
-                    panel.show_query_for_table(connection, &schema, &table, window, cx);
-                });
             })
             .ok();
+        console.update(cx, |panel, cx| {
+            panel.show_query_for_table(connection, &schema, &table, window, cx);
+        });
     }
 
     /// A table dropped from the EL panel becomes a stream. The dropped

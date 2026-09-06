@@ -198,15 +198,18 @@ impl ElDeployModal {
                                     ),
                                     cx,
                                 );
-                                if let Some(panel) =
-                                    workspace.panel::<super::ElRunsPanel>(cx)
-                                {
-                                    panel.update(cx, |panel, cx| {
-                                        panel.profile_changed(cx)
-                                    });
-                                }
                             })
                             .ok();
+                        // The console refreshes by reading the workspace —
+                        // update it only after the lease above is released.
+                        let console = workspace
+                            .upgrade()
+                            .and_then(|workspace| {
+                                workspace.read(cx).panel::<super::ElRunsPanel>(cx)
+                            });
+                        if let Some(console) = console {
+                            console.update(cx, |panel, cx| panel.profile_changed(cx));
+                        }
                         cx.emit(DismissEvent);
                     }
                     Err(error) => {
