@@ -75,20 +75,40 @@ ENV
   chmod 0600 /etc/zdbt-el-serve/env
 fi
 
-echo "==> systemd unit"
-sed -e "s|@PROJECT@|$PROJECT|g" -e "s|@LISTEN@|$LISTEN|g" -e "s|@PREFIX@|$PREFIX|g" \
-  "$SRC/deploy/el-serve/zdbt-el-serve.service" > /etc/systemd/system/zdbt-el-serve.service
-systemctl daemon-reload
+# A launcher that works with or without systemd (containers have none).
+cat > "$PREFIX/zdbt-el-serve-start" <<START
+#!/usr/bin/env bash
+set -a; source /etc/zdbt-el-serve/env; set +a
+exec "$PREFIX/zdbt-el-serve" --project "$PROJECT" --listen "$LISTEN" --insecure-http \
+  --worker "$PREFIX/zdbt-el-worker" \$ZDBT_EL_SERVE_FLAGS
+START
+chmod 0755 "$PREFIX/zdbt-el-serve-start"
+
+if [[ -d /run/systemd/system ]] && systemctl --version >/dev/null 2>&1; then
+  echo "==> systemd unit"
+  sed -e "s|@PROJECT@|$PROJECT|g" -e "s|@LISTEN@|$LISTEN|g" -e "s|@PREFIX@|$PREFIX|g" \
+    "$SRC/deploy/el-serve/zdbt-el-serve.service" > /etc/systemd/system/zdbt-el-serve.service
+  systemctl daemon-reload
+  systemctl enable --now zdbt-el-serve || true
+  START_HINT="systemctl status zdbt-el-serve   &&   journalctl -fu zdbt-el-serve"
+else
+  echo "==> no systemd here (container?) — starting the daemon in the background"
+  chown -R zdbt:zdbt "$PROJECT"
+  nohup runuser -u zdbt -- "$PREFIX/zdbt-el-serve-start" > /var/log/zdbt-el-serve.log 2>&1 &
+  sleep 2
+  START_HINT="tail -f /var/log/zdbt-el-serve.log   (restart: zdbt-el-serve-start)"
+fi
 
 cat <<DONE
 
-Installed. Next:
-  1. Edit /etc/zdbt-el-serve/env  (token, profile, database URLs)
-  2. Put el/connections.yml (with its profiles) under $PROJECT/el/
-  3. TLS: add  --tls-cert /path/cert.pem --tls-key /path/key.pem  to the ExecStart
-     in /etc/systemd/system/zdbt-el-serve.service, or keep --insecure-http and
-     terminate TLS at your reverse proxy.
-  4. systemctl enable --now zdbt-el-serve   &&   journalctl -fu zdbt-el-serve
-  5. In the IDE: Remotes +  ->  https://<host>:7431, token variable ZDBT_EL_TOKEN
-     (same value in your local .env), then Deploy pipelines from their canvas.
+Installed and started. Next:
+  1. /etc/zdbt-el-serve/env holds the token, the profile and the database URL
+     slots — fill the URLs your el/connections.yml references.
+  2. Put el/connections.yml (with its profiles) under $PROJECT/el/, then restart.
+  3. TLS: set ZDBT_EL_SERVE_FLAGS="--tls-cert /path/cert.pem --tls-key /path/key.pem"
+     in /etc/zdbt-el-serve/env and drop --insecure-http from the launcher, or keep
+     it and terminate TLS at your reverse proxy.
+  4. Logs: $START_HINT
+  5. In the IDE the server is declared already (install-remote) — otherwise
+     Remotes + -> https://<host>:7431 with token variable ZDBT_EL_TOKEN.
 DONE

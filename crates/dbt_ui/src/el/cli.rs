@@ -196,6 +196,17 @@ fn install_remote(args: &[String]) -> i32 {
         return 2;
     };
     let remote_project = flag(args, "--remote-project").unwrap_or_else(|| "/srv/el-project".into());
+    // user@host[:port] — the port goes to ssh -p, the host to the URL.
+    let (host_spec, ssh_port) = match host_spec.rsplit_once(':') {
+        Some((spec, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
+            (spec.to_owned(), Some(port.to_owned()))
+        }
+        _ => (host_spec.clone(), None),
+    };
+    let port_flags: Vec<String> = ssh_port
+        .as_ref()
+        .map(|port| vec!["-p".to_owned(), port.clone()])
+        .unwrap_or_default();
     let host = host_spec.rsplit('@').next().unwrap_or(&host_spec).to_owned();
     let name = flag(args, "--name").unwrap_or_else(|| {
         host.chars()
@@ -225,14 +236,19 @@ fn install_remote(args: &[String]) -> i32 {
     };
 
     println!("==> {host_spec}: checking sudo (you may be asked for your password)");
-    if !run_ssh(&host_spec, &["-t"], "sudo -v", None) {
+    let with_port = |extra: &[&str]| -> Vec<String> {
+        let mut flags = port_flags.clone();
+        flags.extend(extra.iter().map(|flag| flag.to_string()));
+        flags
+    };
+    if !run_ssh(&host_spec, &with_port(&["-t"]), "sudo -v", None) {
         eprintln!("sudo check failed on {host_spec}");
         return 1;
     }
     println!("==> {host_spec}: placing the token (over stdin)");
     if !run_ssh(
         &host_spec,
-        &[],
+        &with_port(&[]),
         "sudo mkdir -p /etc/zdbt-el-serve && sudo tee /etc/zdbt-el-serve/token >/dev/null \
          && sudo chmod 600 /etc/zdbt-el-serve/token",
         Some(&token),
@@ -245,7 +261,7 @@ fn install_remote(args: &[String]) -> i32 {
         "curl -fsSL {installer} | sudo bash -s -- --project '{remote_project}' --listen '{listen}' \
          --branch '{branch}' --profile '{profile}'"
     );
-    if !run_ssh(&host_spec, &["-t"], &install, None) {
+    if !run_ssh(&host_spec, &with_port(&["-t"]), &install, None) {
         eprintln!("the installer failed on {host_spec} — see its output above");
         return 1;
     }
@@ -312,7 +328,7 @@ fn install_remote(args: &[String]) -> i32 {
 
 /// Runs a remote shell command via the user's ssh; `stdin` is piped
 /// verbatim when given (how the token travels — never on a command line).
-fn run_ssh(host: &str, ssh_flags: &[&str], command: &str, stdin: Option<&str>) -> bool {
+fn run_ssh(host: &str, ssh_flags: &[String], command: &str, stdin: Option<&str>) -> bool {
     use std::io::Write as _;
     let mut cmd = std::process::Command::new("ssh");
     cmd.args(ssh_flags).arg(host).arg(command);
