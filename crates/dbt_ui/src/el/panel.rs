@@ -29,6 +29,10 @@ pub struct ElPanel {
     /// The active profile (dev/recette/prod…) and all declared ones.
     profile: Option<SharedString>,
     profiles: Vec<SharedString>,
+    /// Declared remotes: (name, host shown muted — never the token).
+    remotes: Vec<(SharedString, SharedString)>,
+    /// Section keys the user folded ("pipelines", "connections", "remotes").
+    collapsed: std::collections::HashSet<&'static str>,
     /// Connections whose table list is unfolded in the explorer.
     expanded: std::collections::HashSet<SharedString>,
     tables: std::collections::HashMap<SharedString, TablesState>,
@@ -48,9 +52,11 @@ enum TablesState {
 
 enum Row {
     Header(SharedString),
-    /// Section headers with their "+" action beside the label.
+    /// Section headers: collapse chevron, label, and the "+" action.
     PipelinesHeader,
     ConnectionsHeader,
+    RemotesHeader,
+    Remote(SharedString, SharedString),
     Pipeline(PathBuf),
     Connection(SharedString, SharedString),
     Table {
@@ -113,6 +119,8 @@ impl ElPanel {
             connections_error: None,
             profile: None,
             profiles: Vec::new(),
+            remotes: Vec::new(),
+            collapsed: Default::default(),
             expanded: Default::default(),
             tables: Default::default(),
             tables_epoch: 0,
@@ -139,6 +147,27 @@ impl ElPanel {
             log::warn!("el: could not write schemas: {error:#}");
         }
         self.pipelines = el_engine::spec::list_pipelines(&el);
+        self.remotes = el_engine::spec::load_remotes(&el.join("remotes.yml"))
+            .map(|remotes| {
+                remotes
+                    .remotes
+                    .iter()
+                    .map(|(name, remote)| {
+                        // Host only: scheme stripped, path/query dropped.
+                        let host = remote
+                            .url
+                            .split_once("://")
+                            .map(|(_, rest)| rest)
+                            .unwrap_or(&remote.url)
+                            .split(['/', '?'])
+                            .next()
+                            .unwrap_or("")
+                            .to_owned();
+                        (name.clone().into(), host.into())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         match el_engine::spec::load_active_connections(&root) {
             Ok((connections, profile)) => {
                 self.profile = profile.map(Into::into);
@@ -237,15 +266,20 @@ impl ElPanel {
             return rows;
         }
         rows.push(Row::PipelinesHeader);
-        for path in &self.pipelines {
-            rows.push(Row::Pipeline(path.clone()));
+        if !self.collapsed.contains("pipelines") {
+            for path in &self.pipelines {
+                rows.push(Row::Pipeline(path.clone()));
+            }
         }
         if let Some(error) = &self.connections_error {
             rows.push(Row::ConnectionsHeader);
-            rows.push(Row::ConnNote(error.clone(), Color::Error));
+            if !self.collapsed.contains("connections") {
+                rows.push(Row::ConnNote(error.clone(), Color::Error));
+            }
+            self.push_remote_rows(&mut rows);
             return rows;
         }
-        {
+        if !self.collapsed.contains("connections") {
             rows.push(Row::ConnectionsHeader);
             for (name, kind) in &self.connections {
                 rows.push(Row::Connection(name.clone(), kind.clone()));
@@ -273,8 +307,80 @@ impl ElPanel {
                     }
                 }
             }
+        } else {
+            rows.push(Row::ConnectionsHeader);
         }
+        self.push_remote_rows(&mut rows);
         rows
+    }
+
+    fn push_remote_rows(&self, rows: &mut Vec<Row>) {
+        rows.push(Row::RemotesHeader);
+        if self.collapsed.contains("remotes") {
+            return;
+        }
+        if self.remotes.is_empty() {
+            rows.push(Row::ConnNote(
+                "No servers yet — press + to declare one.".into(),
+                Color::Muted,
+            ));
+        }
+        for (name, host) in &self.remotes {
+            rows.push(Row::Remote(name.clone(), host.clone()));
+        }
+    }
+
+    fn toggle_section(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Opens the console's Remote tab on the named server.
+    fn show_remote(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
+                    return;
+                };
+                workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                panel.update(cx, |panel, cx| panel.show_remote(name, cx));
+            })
+            .ok();
+    }
+
+    /// "+" on Remotes: remotes are declared in YAML (a token is a
+    /// ${VAR} reference) — open the file, creating a starter if absent.
+    fn add_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let path = super::el_dir(&root).join("remotes.yml");
+        if !path.exists() {
+            let starter = "# el/remotes.yml — el serve daemons the IDE can drive from the \
+Remote tab.\n# Tokens are ${VAR} references, never literals. Non-loopback URLs must be \
+https.\nversion: 1\nremotes:\n  # local_daemon:\n  #   url: http://127.0.0.1:7431\n  #   \
+token: \"${ZDBT_EL_TOKEN}\"\n";
+            if let Err(error) = std::fs::write(&path, starter) {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        super::toast_error(
+                            workspace,
+                            &format!("could not create remotes.yml: {error}"),
+                            None,
+                            cx,
+                        )
+                    })
+                    .ok();
+                return;
+            }
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                    .detach();
+            })
+            .ok();
     }
 
     fn toggle_connection(&mut self, name: SharedString, cx: &mut Context<Self>) {
@@ -611,6 +717,31 @@ impl Render for ElPanel {
 }
 
 impl ElPanel {
+    /// A section header: chevron + label toggle the fold; callers append
+    /// the section's "+" action.
+    fn render_section_header(
+        &self,
+        base: gpui::Stateful<gpui::Div>,
+        key: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let folded = self.collapsed.contains(key);
+        base.cursor_pointer()
+            .child(
+                Icon::new(if folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+            .child(div().flex_1())
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(key, cx)))
+    }
+
     fn render_row(&self, row: &Row, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let base = h_flex()
             .id(ix)
@@ -628,40 +759,66 @@ impl ElPanel {
                         .color(Color::Muted),
                 )
                 .into_any_element(),
-            Row::PipelinesHeader => base
-                .child(
-                    Label::new("Pipelines")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(div().flex_1())
+            Row::PipelinesHeader => self
+                .render_section_header(base, "pipelines", "Pipelines", cx)
                 .child(
                     IconButton::new("el-new-pipeline", IconName::Plus)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("New pipeline"))
                         .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
                             this.new_pipeline(window, cx)
                         })),
                 )
                 .into_any_element(),
-            Row::ConnectionsHeader => base
-                .child(
-                    Label::new("Connections")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(div().flex_1())
+            Row::ConnectionsHeader => self
+                .render_section_header(base, "connections", "Connections", cx)
                 .child(
                     IconButton::new("el-add-connection", IconName::Plus)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Add connection"))
                         .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
                             this.edit_connection(None, window, cx)
                         })),
                 )
                 .into_any_element(),
+            Row::RemotesHeader => self
+                .render_section_header(base, "remotes", "Remotes", cx)
+                .child(
+                    IconButton::new("el-add-remote", IconName::Plus)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Declare a server (el/remotes.yml)"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.add_remote(window, cx)
+                        })),
+                )
+                .into_any_element(),
+            Row::Remote(name, host) => {
+                let open_name = name.clone();
+                base.cursor_pointer()
+                    .child(
+                        Icon::new(IconName::Server)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(host.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_remote(open_name.clone(), window, cx);
+                    }))
+                    .into_any_element()
+            }
             Row::Note(text) => base
                 .child(Label::new(text.clone()).size(LabelSize::XSmall).color(Color::Muted))
                 .into_any_element(),

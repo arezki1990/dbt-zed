@@ -203,6 +203,24 @@ impl ElRunsPanel {
         cx.notify();
     }
 
+    /// The sidebar's click-a-server entry point: Remote tab, that server.
+    pub fn show_remote(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.preview = None;
+        self.surface = Surface::Remote;
+        self.refresh_connections(cx);
+        if let Some(ix) = self.remotes.iter().position(|remote| *remote == name) {
+            if self.selected_remote != Some(ix) {
+                self.selected_remote = Some(ix);
+                self.remote_pipelines.clear();
+                self.remote_runs.clear();
+            }
+        }
+        self.remote_detail = None;
+        self.remote_run_detail = None;
+        self.start_remote_poll(cx);
+        cx.notify();
+    }
+
     /// A profile switch changed what every connection name means: drop
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
