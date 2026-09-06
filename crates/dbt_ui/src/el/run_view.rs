@@ -27,6 +27,9 @@ pub struct StreamRow {
 
 struct ActiveRun {
     pipeline: SharedString,
+    /// What to re-run: the project and the full spec this run came from.
+    project_root: PathBuf,
+    spec: Arc<Pipeline>,
     started: Instant,
     streams: Vec<StreamRow>,
     cancel: CancelFlag,
@@ -62,12 +65,36 @@ impl ElRunView {
         pipeline: Arc<Pipeline>,
         cx: &mut Context<Self>,
     ) {
+        self.start_run_streams(project_root, pipeline, Vec::new(), cx);
+    }
+
+    /// Runs `only` those streams (all when empty).
+    pub fn start_run_streams(
+        &mut self,
+        project_root: PathBuf,
+        pipeline: Arc<Pipeline>,
+        only: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_running() {
+            return;
+        }
+        let spec = pipeline.clone();
+        let pipeline: Arc<Pipeline> = if only.is_empty() {
+            pipeline
+        } else {
+            let mut subset = (*pipeline).clone();
+            subset.streams.retain(|stream| only.contains(&stream.name));
+            Arc::new(subset)
+        };
+        if pipeline.streams.is_empty() {
             return;
         }
         let cancel = CancelFlag::default();
         self.run = Some(ActiveRun {
             pipeline: pipeline.pipeline.clone().into(),
+            project_root: project_root.clone(),
+            spec,
             started: Instant::now(),
             streams: pipeline
                 .streams
@@ -150,11 +177,73 @@ impl ElRunView {
                         }
                     }
                 }
+                this.announce_verdict(cx);
                 cx.notify();
             })
             .ok();
         });
         cx.notify();
+    }
+
+    /// One toast per run: what happened, in numbers.
+    fn announce_verdict(&self, cx: &mut Context<Self>) {
+        let Some(run) = &self.run else { return };
+        let failed: Vec<&str> = run
+            .streams
+            .iter()
+            .filter(|row| row.error.is_some())
+            .map(|row| row.stream.as_ref())
+            .collect();
+        let rows: u64 = run.streams.iter().map(|row| row.rows_written).sum();
+        let pipeline = run.pipeline.clone();
+        let message = match (&run.fatal, failed.is_empty()) {
+            (Some(fatal), _) => Some((false, format!("{pipeline} failed: {fatal}"))),
+            (None, false) => Some((
+                false,
+                format!(
+                    "{pipeline}: {} of {} stream(s) failed — {}",
+                    failed.len(),
+                    run.streams.len(),
+                    failed.join(", ")
+                ),
+            )),
+            (None, true) if run.finished.is_some() => Some((
+                true,
+                format!(
+                    "{pipeline} finished: {} stream(s), {rows} rows written.",
+                    run.streams.len()
+                ),
+            )),
+            _ => None,
+        };
+        if let Some((ok, message)) = message {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    if ok {
+                        super::toast(workspace, &message, cx);
+                    } else {
+                        super::toast_error(workspace, &message, None, cx);
+                    }
+                })
+                .ok();
+        }
+    }
+
+    /// Re-runs just the streams that failed last time.
+    fn rerun_failed(&mut self, cx: &mut Context<Self>) {
+        let Some(run) = &self.run else { return };
+        let failed: Vec<String> = run
+            .streams
+            .iter()
+            .filter(|row| row.error.is_some())
+            .map(|row| row.stream.to_string())
+            .collect();
+        if failed.is_empty() {
+            return;
+        }
+        let root = run.project_root.clone();
+        let spec = run.spec.clone();
+        self.start_run_streams(root, spec, failed, cx);
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -282,6 +371,21 @@ impl Render for ElRunView {
                             }),
                     )
                     .child(div().flex_1())
+                    .when(
+                        !running && run.streams.iter().any(|row| row.error.is_some()),
+                        |header| {
+                            header.child(
+                                Button::new("el-run-rerun-failed", "Re-run failed")
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(Tooltip::text(
+                                        "Run only the streams that failed",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rerun_failed(cx)
+                                    })),
+                            )
+                        },
+                    )
                     .when(running, |header| {
                         header.child(
                             IconButton::new("el-run-cancel", IconName::Close)

@@ -36,6 +36,8 @@ struct LoadedSpec {
     pipeline: Arc<Pipeline>,
     issues: Vec<SpecIssue>,
     missing_env: Vec<String>,
+    /// The active profile the canvas validated against.
+    profile: Option<String>,
 }
 
 pub struct ElPipelineCanvas {
@@ -53,6 +55,9 @@ pub struct ElPipelineCanvas {
     drag_moved: bool,
     project: Entity<Project>,
     mapping: Option<MappingEditorState>,
+    /// A clean sidebar re-opened by render after the spec reloaded (editors
+    /// need the window, which the reload task doesn't have).
+    pending_reopen: Option<usize>,
     builder: Option<BuilderForm>,
     type_menu: Option<(Entity<ui::ContextMenu>, Point<Pixels>, gpui::Subscription)>,
     _load: Task<()>,
@@ -119,6 +124,7 @@ impl ElPipelineCanvas {
             drag_moved: false,
             project,
             mapping: None,
+            pending_reopen: None,
             builder: None,
             type_menu: None,
             _load: Task::ready(()),
@@ -168,8 +174,26 @@ impl ElPipelineCanvas {
                             &loaded.pipeline,
                             loaded_connections(&this.project_root).as_ref(),
                         );
+                        // A clean sidebar tracks the file (streams may have
+                        // moved); a dirty one keeps the draft.
+                        let reopen = this.mapping.as_ref().and_then(|state| {
+                            (!state.dirty).then(|| state.stream_name.to_string())
+                        });
                         this.loaded = Some(loaded);
                         this.parse_error = None;
+                        if let Some(name) = reopen {
+                            let ix = this.loaded.as_ref().and_then(|loaded| {
+                                loaded
+                                    .pipeline
+                                    .streams
+                                    .iter()
+                                    .position(|stream| stream.name == name)
+                            });
+                            match ix {
+                                Some(ix) => this.reopen_mapping(ix, cx),
+                                None => this.mapping = None,
+                            }
+                        }
                     }
                     Err(error) => {
                         this.parse_error = Some(format!("{error:#}").into());
@@ -455,11 +479,38 @@ impl ElPipelineCanvas {
 
 fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Result<LoadedSpec> {
     let pipeline = el_engine::spec::load_pipeline(spec_path)?;
-    let connections = loaded_connections(project_root);
-    let issues = connections
-        .as_ref()
-        .map(|connections| el_engine::spec::validate(&pipeline, connections))
-        .unwrap_or_default();
+    // A missing or broken connections.yml is a pipeline-level issue the
+    // canvas must show — never a clean-looking graph that can't run.
+    let (connections, profile, mut issues) =
+        match el_engine::spec::load_active_connections(project_root) {
+            Ok((connections, profile)) => (Some(connections), profile, Vec::new()),
+            Err(el_engine::spec::SpecError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                (
+                    None,
+                    None,
+                    vec![SpecIssue {
+                        stream: None,
+                        message: format!(
+                            "el/connections.yml is missing — add {} and {} with + Connection",
+                            pipeline.source, pipeline.target.connection
+                        ),
+                    }],
+                )
+            }
+            Err(error) => (
+                None,
+                None,
+                vec![SpecIssue {
+                    stream: None,
+                    message: format!("connections.yml could not be read: {error}"),
+                }],
+            ),
+        };
+    if let Some(connections) = &connections {
+        issues.extend(el_engine::spec::validate(&pipeline, connections));
+    }
     // Missing env references, checked against real env + project dotenv —
     // names only, values never surface.
     let env = el_engine::env::EnvMap::load(project_root, None);
@@ -482,6 +533,7 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
             .filter(|issue| !issue.message.contains("references ${"))
             .collect(),
         missing_env,
+        profile,
     })
 }
 
@@ -494,17 +546,19 @@ fn loaded_connections(project_root: &std::path::Path) -> Option<Connections> {
 }
 
 impl ElPipelineCanvas {
+    /// Success/info: auto-hides.
     fn toast(&self, message: String, cx: &mut Context<Self>) {
-        struct ElCanvasToast;
+        self.workspace
+            .update(cx, |workspace, cx| super::toast(workspace, &message, cx))
+            .ok();
+    }
+
+    /// Error: persists, with "Open YAML" pointing at this pipeline's file.
+    fn toast_error(&self, message: String, cx: &mut Context<Self>) {
+        let path = self.spec_path.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_toast(
-                    workspace::Toast::new(
-                        workspace::notifications::NotificationId::unique::<ElCanvasToast>(),
-                        message,
-                    ),
-                    cx,
-                );
+                super::toast_error(workspace, &message, Some(path), cx)
             })
             .ok();
     }
@@ -520,7 +574,28 @@ impl ElPipelineCanvas {
         cx.notify();
     }
 
+    /// Leaving the sidebar with unsaved edits arms a "Discard changes?"
+    /// on the first press; the second press proceeds.
+    fn mapping_may_leave(&mut self, cx: &mut Context<Self>) -> bool {
+        match &mut self.mapping {
+            Some(state) if state.dirty && !state.discard_armed => {
+                state.discard_armed = true;
+                cx.notify();
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn reopen_mapping(&mut self, stream_ix: usize, cx: &mut Context<Self>) {
+        self.pending_reopen = Some(stream_ix);
+        cx.notify();
+    }
+
     fn close_mapping(&mut self, cx: &mut Context<Self>) {
+        if !self.mapping_may_leave(cx) {
+            return;
+        }
         self.mapping = None;
         self.type_menu = None;
         cx.notify();
@@ -596,7 +671,7 @@ impl ElPipelineCanvas {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => this.reload(cx),
-                    Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+                    Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
                 }
             })
             .ok();
@@ -686,7 +761,7 @@ impl ElPipelineCanvas {
                 }
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.toast(format!("Preview failed: {error:#}"), cx)
+                        this.toast_error(format!("Preview failed: {error:#}"), cx)
                     })
                     .ok();
                 }
@@ -736,7 +811,7 @@ impl ElPipelineCanvas {
         if let Some(state) = &mut self.mapping {
             if let Some(draft) = state.drafts.get_mut(draft_ix) {
                 draft.cast = cast;
-                state.dirty = true;
+                state.touch();
             }
         }
         cx.notify();
@@ -774,7 +849,7 @@ impl ElPipelineCanvas {
         cx: &mut Context<Self>,
     ) {
         let Some(loaded) = &self.loaded else {
-            self.toast("Fix the pipeline's errors first.".into(), cx);
+            self.toast_error("Fix the pipeline's errors first.".into(), cx);
             return;
         };
         let mut pipeline = (*loaded.pipeline).clone();
@@ -782,7 +857,7 @@ impl ElPipelineCanvas {
             if pipeline.streams.is_empty() {
                 pipeline.source = dragged.connection.to_string();
             } else {
-                self.toast(
+                self.toast_error(
                     format!(
                         "This pipeline reads from {} — drop one of its tables, or start \
                          an empty pipeline for {}.",
@@ -833,7 +908,7 @@ impl ElPipelineCanvas {
                 super::spec_io::write_spec(workspace, project, spec_path, pipeline, cx).await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => this.reload(cx),
-                Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+                Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
             })
             .ok();
         });
@@ -843,7 +918,7 @@ impl ElPipelineCanvas {
         if let Some(state) = &mut self.mapping {
             if state.mode != mode {
                 state.mode = mode;
-                state.dirty = true;
+                state.touch();
             }
         }
         cx.notify();
@@ -875,7 +950,7 @@ impl ElPipelineCanvas {
                                 } else {
                                     state.primary_key = vec![name.clone()];
                                 }
-                                state.dirty = true;
+                                state.touch();
                             }
                             cx.notify();
                         })
@@ -936,7 +1011,7 @@ impl ElPipelineCanvas {
                         if let Some(state) = &mut this.mapping {
                             if let Some(draft) = state.drafts.get_mut(draft_ix) {
                                 draft.include = !draft.include;
-                                state.dirty = true;
+                                state.touch();
                             }
                         }
                         cx.notify();
@@ -986,7 +1061,7 @@ impl ElPipelineCanvas {
                             if let Some(state) = &mut this.mapping {
                                 if let Some(draft) = state.drafts.get_mut(draft_ix) {
                                     draft.strict = !draft.strict;
-                                    state.dirty = true;
+                                    state.touch();
                                 }
                             }
                             cx.notify();
@@ -1015,6 +1090,9 @@ impl ElPipelineCanvas {
                             .icon_size(IconSize::Small)
                             .disabled(stream_ix == 0)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.mapping_may_leave(cx) {
+                                    return;
+                                }
                                 let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
                                 if ix > 0 {
                                     this.open_mapping(ix - 1, window, cx);
@@ -1022,14 +1100,22 @@ impl ElPipelineCanvas {
                             })),
                     )
                     .child(
-                        Label::new(state.stream_name.clone())
-                            .size(LabelSize::Small),
+                        Label::new(if state.dirty {
+                            format!("{} •", state.stream_name)
+                        } else {
+                            state.stream_name.to_string()
+                        })
+                        .size(LabelSize::Small)
+                        .color(if state.dirty { Color::Modified } else { Color::Default }),
                     )
                     .child(
                         IconButton::new("el-map-next", IconName::ChevronRight)
                             .icon_size(IconSize::Small)
                             .disabled(stream_ix + 1 >= stream_count)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.mapping_may_leave(cx) {
+                                    return;
+                                }
                                 let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
                                 this.open_mapping(ix + 1, window, cx);
                             })),
@@ -1159,6 +1245,11 @@ impl ElPipelineCanvas {
                         )
                     })
             })
+            .children(state.sync_warning().map(|warning| {
+                div().px_2().pb_1().child(
+                    Label::new(warning).size(LabelSize::XSmall).color(Color::Warning),
+                )
+            }))
             .children(state.probe_error.clone().map(|error| {
                 div().px_2().py_1().child(
                     Label::new(error).size(LabelSize::XSmall).color(Color::Warning),
@@ -1190,10 +1281,56 @@ impl ElPipelineCanvas {
                                 }
                             })),
                     )
+                    .child(
+                        Button::new("el-map-run-stream", "Run stream")
+                            .label_size(LabelSize::Small)
+                            .disabled(state.dirty)
+                            .tooltip(Tooltip::text(if state.dirty {
+                                "Apply first — runs use the saved YAML"
+                            } else {
+                                "Run just this stream"
+                            }))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let name = this
+                                    .mapping
+                                    .as_ref()
+                                    .map(|state| state.stream_name.to_string());
+                                if let Some(name) = name {
+                                    this.run_streams(vec![name], window, cx);
+                                }
+                            })),
+                    )
                     .child(div().flex_1())
+                    .children(state.discard_armed.then(|| {
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Label::new("Discard changes?")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Button::new("el-map-keep", "Keep")
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(state) = &mut this.mapping {
+                                            state.discard_armed = false;
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                    }))
+                    .children((state.dirty && !state.discard_armed).then(|| {
+                        Label::new("Unsaved changes")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                    }))
                     .child(
                         Button::new("el-map-apply", "Apply")
                             .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .disabled(!state.dirty)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.apply_mapping(window, cx)
                             })),
@@ -1204,11 +1341,59 @@ impl ElPipelineCanvas {
 }
 
 impl ElPipelineCanvas {
+    /// Why Run/Deploy are blocked right now, if they are: the first
+    /// validation issue (+ count), or the parse error.
+    fn blocker(&self) -> Option<String> {
+        match &self.loaded {
+            None => Some(
+                self.parse_error
+                    .as_ref()
+                    .map(|error| format!("Can't run: {error}"))
+                    .unwrap_or_else(|| "Can't run: the pipeline is still loading".into()),
+            ),
+            Some(loaded) => loaded.issues.first().map(|first| {
+                let rest = loaded.issues.len() - 1;
+                let prefix = first
+                    .stream
+                    .as_ref()
+                    .map(|stream| format!("{stream}: "))
+                    .unwrap_or_default();
+                if rest > 0 {
+                    format!("Can't run: {prefix}{} (+{rest} more)", first.message)
+                } else {
+                    format!("Can't run: {prefix}{}", first.message)
+                }
+            }),
+        }
+    }
+
+    /// Whether a local run is in flight (the console's run view knows).
+    fn run_in_progress(&self, cx: &App) -> bool {
+        self.workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElRunsPanel>(cx))
+            .map(|panel| panel.read(cx).run_view().read(cx).is_running())
+            .unwrap_or(false)
+    }
+
     fn run_pipeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_streams(Vec::new(), window, cx);
+    }
+
+    /// Runs the pipeline — all streams when `only` is empty, else just the
+    /// named ones (the fix-one-cast loop must not re-extract everything).
+    fn run_streams(&mut self, only: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(blocker) = self.blocker() {
+            self.toast_error(blocker, cx);
+            return;
+        }
         let Some(loaded) = &self.loaded else {
-            self.toast("The pipeline has errors — fix them before running.".into(), cx);
             return;
         };
+        if self.run_in_progress(cx) {
+            self.toast_error("A run is already in progress — see the EL console.".into(), cx);
+            return;
+        }
         let pipeline = loaded.pipeline.clone();
         let root = self.project_root.clone();
         self.workspace
@@ -1218,7 +1403,9 @@ impl ElPipelineCanvas {
                 };
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
                 let view = panel.read(cx).run_view();
-                view.update(cx, |view, cx| view.start_run(root, pipeline, cx));
+                view.update(cx, |view, cx| {
+                    view.start_run_streams(root, pipeline, only, cx)
+                });
             })
             .ok();
     }
@@ -1339,7 +1526,7 @@ impl ElPipelineCanvas {
                     None
                 }
                 Err(error) => {
-                    self.toast(
+                    self.toast_error(
                         format!("connections.yml could not be read: {error} — fix it first"),
                         cx,
                     );
@@ -1381,7 +1568,7 @@ impl ElPipelineCanvas {
                     }
                     this.update(cx, |this, cx| match result {
                         Ok(()) => this.reload(cx),
-                        Err(error) => this.toast(format!("Write failed: {error:#}"), cx),
+                        Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
                     })
                     .ok();
                 });
@@ -1420,9 +1607,37 @@ impl Item for ElPipelineCanvas {
 }
 
 impl Render for ElPipelineCanvas {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(ix) = self.pending_reopen.take() {
+            self.open_mapping(ix, window, cx);
+        }
         let colors = cx.theme().colors();
 
+        let blocker = self.blocker();
+        let running = self.run_in_progress(cx);
+        let route: Option<SharedString> = self.loaded.as_ref().map(|loaded| {
+            let profile = loaded
+                .profile
+                .as_deref()
+                .map(|profile| format!(" · {profile}"))
+                .unwrap_or_default();
+            format!(
+                "{} → {}{profile}",
+                loaded.pipeline.source, loaded.pipeline.target.connection
+            )
+            .into()
+        });
+        let run_tooltip: SharedString = match (&blocker, running) {
+            (Some(blocker), _) => blocker.clone().into(),
+            (None, true) => "A run is in progress — see the EL console".into(),
+            (None, false) => "Run pipeline (⌘⏎)".into(),
+        };
+        let deploy_tooltip: SharedString = match &blocker {
+            Some(blocker) => blocker.replace("Can't run", "Can't deploy").into(),
+            None => "Ship this pipeline to a remote server — nothing runs there until \
+                     deployed"
+                .into(),
+        };
         let toolbar = h_flex()
             .w_full()
             .p_1()
@@ -1436,26 +1651,29 @@ impl Render for ElPipelineCanvas {
                     .size(LabelSize::Small)
                     .color(Color::Default),
             )
+            .children(route.map(|route| {
+                // Source → target · profile: what Run will actually touch.
+                Label::new(route).size(LabelSize::XSmall).color(Color::Muted)
+            }))
             .child(div().flex_1())
             .child(
                 IconButton::new("el-run", IconName::PlayFilled)
                     .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Run pipeline"))
+                    .disabled(blocker.is_some() || running)
+                    .tooltip(Tooltip::text(run_tooltip))
                     .on_click(cx.listener(|this, _, window, cx| this.run_pipeline(window, cx))),
             )
             .child(
                 Button::new("el-deploy", "Deploy")
                     .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text(
-                        "Ship this pipeline to a remote server — nothing runs there \
-                         until deployed",
-                    ))
+                    .disabled(blocker.is_some())
+                    .tooltip(Tooltip::text(deploy_tooltip))
                     .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(blocker) = this.blocker() {
+                            this.toast_error(blocker.replace("Can't run", "Can't deploy"), cx);
+                            return;
+                        }
                         let Some(loaded) = &this.loaded else {
-                            this.toast(
-                                "Fix the pipeline's errors before deploying.".into(),
-                                cx,
-                            );
                             return;
                         };
                         let name = loaded.pipeline.pipeline.clone();
@@ -1480,7 +1698,23 @@ impl Render for ElPipelineCanvas {
                 Button::new("el-add-conn", "+ Connection")
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_builder(BuilderKind::Connection, window, cx)
+                        // The one connection editor — same modal as the panel.
+                        let root = this.project_root.clone();
+                        this.workspace
+                            .update(cx, |workspace, cx| {
+                                let Some(panel) = workspace.panel::<super::ElPanel>(cx) else {
+                                    return;
+                                };
+                                super::connection_modal::ElConnectionModal::deploy(
+                                    workspace,
+                                    panel.downgrade(),
+                                    root,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .ok();
                     })),
             )
             .child(
@@ -1537,7 +1771,7 @@ impl Render for ElPipelineCanvas {
                         .bg(cx.theme().status().warning_background)
                         .child(
                             Label::new(format!(
-                                "Missing environment variables: {}",
+                                "Warning — missing environment variables: {} (set them in .env)",
                                 loaded.missing_env.join(", ")
                             ))
                             .size(LabelSize::XSmall)
@@ -1545,18 +1779,26 @@ impl Render for ElPipelineCanvas {
                         ),
                 );
             }
-            for issue in &loaded.issues {
+            for (ix, issue) in loaded.issues.iter().enumerate() {
                 let prefix = issue
                     .stream
                     .as_ref()
                     .map(|stream| format!("{stream}: "))
                     .unwrap_or_default();
                 body = body.child(
-                    div().w_full().px_2().py_0p5().child(
-                        Label::new(format!("⚠ {prefix}{}", issue.message))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Warning),
-                    ),
+                    div()
+                        .id(("el-issue", ix))
+                        .w_full()
+                        .px_2()
+                        .py_0p5()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx)))
+                        .child(
+                            Label::new(format!("Won't run — {prefix}{}", issue.message))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        ),
                 );
             }
         }

@@ -41,6 +41,12 @@ pub struct ElConnectionModal {
     root: PathBuf,
     /// The original name when editing; None while adding.
     editing: Option<String>,
+    /// Where the connection lives: None = base `connections:`, Some =
+    /// inside that profile's block. Chosen at open for edits; a chip
+    /// picker while adding.
+    scope: Option<String>,
+    /// Profiles declared in the file (for the add-mode scope chips).
+    declared_profiles: Vec<String>,
     /// The original kind string — drives the unsupported-kind fallback.
     original_kind: Option<&'static str>,
     /// Set when the open-time load failed or the connection is missing —
@@ -167,24 +173,45 @@ impl ElConnectionModal {
     ) -> Self {
         let mut open_error: Option<SharedString> = None;
         let mut broken = false;
+        let mut scope: Option<String> = None;
+        let mut declared_profiles: Vec<String> = Vec::new();
+        let raw = match load_connections_strict(&root) {
+            Ok(connections) => {
+                declared_profiles = connections.profiles.keys().cloned().collect();
+                Some(connections)
+            }
+            Err(error) => {
+                open_error = Some(format!("{error:#}").into());
+                broken = true;
+                None
+            }
+        };
         let existing = editing.as_ref().and_then(|name| {
-            match load_connections_strict(&root) {
-                Ok(connections) => {
-                    let found = connections.connections.get(name).cloned();
-                    if found.is_none() {
-                        open_error = Some(
-                            format!("{name:?} is gone from connections.yml").into(),
-                        );
-                        broken = true;
-                    }
-                    found
-                }
-                Err(error) => {
-                    open_error = Some(format!("{error:#}").into());
-                    broken = true;
-                    None
+            let connections = raw.as_ref()?;
+            // Base first; else the ACTIVE profile if it defines the name;
+            // else the first profile that does.
+            if let Some(found) = connections.connections.get(name) {
+                return Some(found.clone());
+            }
+            let active = el_engine::spec::active_profile(&root, connections);
+            let candidates = active
+                .iter()
+                .cloned()
+                .chain(connections.profiles.keys().cloned())
+                .collect::<Vec<_>>();
+            for profile in candidates {
+                if let Some(found) = connections
+                    .profiles
+                    .get(&profile)
+                    .and_then(|block| block.connections.get(name))
+                {
+                    scope = Some(profile);
+                    return Some(found.clone());
                 }
             }
+            open_error = Some(format!("{name:?} is gone from connections.yml").into());
+            broken = true;
+            None
         });
 
         let mut make = |label: &'static str, placeholder: &str, initial: &str| Field {
@@ -269,6 +296,8 @@ impl ElConnectionModal {
             project,
             root,
             original_kind: existing.as_ref().map(Connection::kind),
+            scope,
+            declared_profiles,
             broken,
             conn_type: existing
                 .as_ref()
@@ -394,15 +423,35 @@ impl ElConnectionModal {
             Err(error) => return self.fail(format!("{error:#}"), cx),
         };
 
+        // The map this edit lives in: base, or one profile's block.
+        let scope = self.scope.clone();
+        if let Some(profile) = &scope {
+            if !connections.profiles.contains_key(profile) {
+                return self.fail(
+                    format!("profile {profile:?} is gone from connections.yml"),
+                    cx,
+                );
+            }
+        }
+        let scope_map = |connections: &Connections| -> IndexMap<String, Connection> {
+            match &scope {
+                None => connections.connections.clone(),
+                Some(profile) => connections
+                    .profiles
+                    .get(profile)
+                    .map(|block| block.connections.clone())
+                    .unwrap_or_default(),
+            }
+        };
         let value = if self.form_supported() {
             match self.build_connection(cx) {
                 Ok(mut value) => {
                     if let Some(stored) = self
                         .editing
                         .as_ref()
-                        .and_then(|name| connections.connections.get(name))
+                        .and_then(|name| scope_map(&connections).get(name).cloned())
                     {
-                        carry_extra(&mut value, stored);
+                        carry_extra(&mut value, &stored);
                     }
                     value
                 }
@@ -413,7 +462,7 @@ impl ElConnectionModal {
             match self
                 .editing
                 .as_ref()
-                .and_then(|name| connections.connections.get(name).cloned())
+                .and_then(|name| scope_map(&connections).get(name).cloned())
             {
                 Some(value) => value,
                 None => return self.fail("the connection is gone from connections.yml".into(), cx),
@@ -430,6 +479,22 @@ impl ElConnectionModal {
                     .any(|profile| profile.connections.contains_key(name))
         };
         let mut renamed_from = None;
+        // In-place replacement inside ONE map, preserving order.
+        let replace_in = |map: &mut IndexMap<String, Connection>,
+                          original: &str,
+                          new_name: &str,
+                          value: &Connection| {
+            *map = map
+                .iter()
+                .map(|(name, existing)| {
+                    if name == original {
+                        (new_name.to_owned(), value.clone())
+                    } else {
+                        (name.clone(), existing.clone())
+                    }
+                })
+                .collect();
+        };
         match &self.editing {
             None => {
                 if name_taken(&connections, &new_name) {
@@ -438,7 +503,16 @@ impl ElConnectionModal {
                         cx,
                     );
                 }
-                connections.connections.insert(new_name.clone(), value);
+                match &scope {
+                    None => {
+                        connections.connections.insert(new_name.clone(), value);
+                    }
+                    Some(profile) => {
+                        if let Some(block) = connections.profiles.get_mut(profile) {
+                            block.connections.insert(new_name.clone(), value);
+                        }
+                    }
+                }
             }
             Some(original) => {
                 if new_name != *original && name_taken(&connections, &new_name) {
@@ -447,37 +521,33 @@ impl ElConnectionModal {
                         cx,
                     );
                 }
-                if !connections.connections.contains_key(original) {
+                if !scope_map(&connections).contains_key(original) {
                     return self.fail("the connection is gone from connections.yml".into(), cx);
                 }
-                // Replace in place, preserving the file's ordering.
-                connections.connections = connections
-                    .connections
-                    .iter()
-                    .map(|(name, existing)| {
-                        if name == original {
-                            (new_name.clone(), value.clone())
-                        } else {
-                            (name.clone(), existing.clone())
+                match &scope {
+                    None => replace_in(&mut connections.connections, original, &new_name, &value),
+                    Some(profile) => {
+                        if let Some(block) = connections.profiles.get_mut(profile) {
+                            replace_in(&mut block.connections, original, &new_name, &value);
                         }
-                    })
-                    .collect();
+                    }
+                }
                 if new_name != *original {
+                    // The logical name changes everywhere it is defined.
+                    if scope.is_some() && connections.connections.contains_key(original) {
+                        let stored = connections.connections[original].clone();
+                        replace_in(&mut connections.connections, original, &new_name, &stored);
+                    }
                     // Profile overrides ride along with the rename — a
                     // detached override would silently resolve the new
                     // name to the wrong environment's base connection.
-                    for profile in connections.profiles.values_mut() {
-                        profile.connections = profile
-                            .connections
-                            .iter()
-                            .map(|(name, existing)| {
-                                if name == original {
-                                    (new_name.clone(), existing.clone())
-                                } else {
-                                    (name.clone(), existing.clone())
-                                }
-                            })
-                            .collect();
+                    for (profile_name, profile) in connections.profiles.iter_mut() {
+                        if scope.as_deref() == Some(profile_name.as_str()) {
+                            continue; // already replaced above
+                        }
+                        if let Some(stored) = profile.connections.get(original).cloned() {
+                            replace_in(&mut profile.connections, original, &new_name, &stored);
+                        }
                     }
                     renamed_from = Some(original.clone());
                 }
@@ -748,10 +818,10 @@ impl Render for ElConnectionModal {
         let colors = cx.theme().colors().clone();
         let editing = self.editing.is_some();
         let supported = self.form_supported();
-        let title = if editing {
-            "Edit connection"
-        } else {
-            "Add connection"
+        let title: SharedString = match (editing, &self.scope) {
+            (true, Some(profile)) => format!("Edit connection · profile {profile}").into(),
+            (true, None) => "Edit connection".into(),
+            (false, _) => "Add connection".into(),
         };
 
         let mut card = v_flex()
@@ -812,6 +882,35 @@ impl Render for ElConnectionModal {
             );
         }
 
+        if !editing && !self.declared_profiles.is_empty() {
+            // Where the new connection goes: shared base, or one profile.
+            let mut scope_row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
+                Label::new("define in").size(LabelSize::XSmall).color(Color::Muted),
+            );
+            scope_row = scope_row.child(
+                Button::new("el-conn-scope-base", "base (all profiles)")
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(self.scope.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scope = None;
+                        cx.notify();
+                    })),
+            );
+            for (ix, profile) in self.declared_profiles.iter().enumerate() {
+                let selected = self.scope.as_deref() == Some(profile);
+                let profile = profile.clone();
+                scope_row = scope_row.child(
+                    Button::new(("el-conn-scope", ix), SharedString::from(profile.clone()))
+                        .label_size(LabelSize::XSmall)
+                        .toggle_state(selected)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scope = Some(profile.clone());
+                            cx.notify();
+                        })),
+                );
+            }
+            card = card.child(scope_row);
+        }
         if supported {
             let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
             for conn_type in ConnType::ALL {

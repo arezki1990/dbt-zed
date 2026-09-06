@@ -129,17 +129,49 @@ pub fn initialize_workspace(
                 canvas_item::ElPipelineCanvas::deploy(workspace, root, example, window, cx);
             }
         }
-        Err(error) => toast(workspace, &format!("EL init failed: {error:#}"), cx),
+        Err(error) => toast_error(workspace, &format!("EL init failed: {error:#}"), None, cx),
     }
 }
 
+/// A success/info toast: auto-hides, and never dismisses a standing error
+/// (errors live under their own notification id).
 pub(crate) fn toast(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspace>) {
-    struct ElNotification;
+    struct ElOk;
     workspace.show_toast(
         workspace::Toast::new(
-            workspace::notifications::NotificationId::unique::<ElNotification>(),
+            workspace::notifications::NotificationId::unique::<ElOk>(),
             message.to_owned(),
-        ),
+        )
+        .autohide(),
         cx,
     );
+}
+
+/// An error toast: stays until dismissed, optionally with a next step
+/// ("Open YAML") that opens the file the error is about.
+pub(crate) fn toast_error(
+    workspace: &mut Workspace,
+    message: &str,
+    open: Option<PathBuf>,
+    cx: &mut Context<Workspace>,
+) {
+    struct ElError;
+    let mut toast = workspace::Toast::new(
+        workspace::notifications::NotificationId::unique::<ElError>(),
+        message.to_owned(),
+    );
+    if let Some(path) = open {
+        let workspace_handle = cx.entity().downgrade();
+        toast = toast.on_click("Open YAML", move |window, cx| {
+            let path = path.clone();
+            workspace_handle
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                        .detach();
+                })
+                .ok();
+        });
+    }
+    workspace.show_toast(toast, cx);
 }

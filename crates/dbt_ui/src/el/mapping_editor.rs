@@ -53,6 +53,8 @@ pub struct MappingEditorState {
     pub probing: bool,
     pub probe_error: Option<SharedString>,
     pub dirty: bool,
+    /// Leaving with unsaved edits needs a second press: first arms.
+    pub discard_armed: bool,
 }
 
 impl MappingEditorState {
@@ -113,6 +115,27 @@ impl MappingEditorState {
             probing: true,
             probe_error: None,
             dirty: false,
+            discard_armed: false,
+        }
+    }
+
+    /// Any edit: unsaved, and any pending "discard?" arm is cancelled.
+    pub fn touch(&mut self) {
+        self.dirty = true;
+        self.discard_armed = false;
+    }
+
+    /// Incremental needs both halves of the cursor story — shown inline
+    /// under the Sync row rather than discovered at Apply.
+    pub fn sync_warning(&self) -> Option<&'static str> {
+        if self.mode != Mode::Incremental {
+            return None;
+        }
+        match (self.primary_key.is_empty(), self.update_key.is_none()) {
+            (true, true) => Some("Incremental needs a key and a cursor column."),
+            (true, false) => Some("Incremental needs a primary key."),
+            (false, true) => Some("Incremental needs a cursor column."),
+            (false, false) => None,
         }
     }
 
@@ -155,8 +178,14 @@ impl MappingEditorState {
     /// Serializes the draft into the pipeline. Returns false when nothing
     /// changed.
     pub fn apply(&self, pipeline: &mut Pipeline, cx: &Context<crate::el::ElPipelineCanvas>) -> Result<bool> {
-        let Some(stream) = pipeline.streams.get_mut(self.stream_ix) else {
-            anyhow::bail!("stream disappeared from the spec");
+        // By NAME, not index: the YAML may have been reordered underneath.
+        let defaults = pipeline.defaults.clone();
+        let Some(stream) = pipeline
+            .streams
+            .iter_mut()
+            .find(|stream| stream.name == self.stream_name.as_ref())
+        else {
+            anyhow::bail!("stream {:?} is gone from the spec", self.stream_name);
         };
 
         let target_table = self.target_table.read(cx).text(cx).trim().to_owned();
@@ -172,7 +201,11 @@ impl MappingEditorState {
                 anyhow::bail!("incremental sync needs a cursor column — pick one under Sync");
             }
         }
-        stream.mode = Some(self.mode);
+        // Minimal diff: pin the mode only when it differs from what the
+        // stream already resolves to, or was already explicit.
+        if stream.mode.is_some() || stream.mode(defaults.as_ref()) != self.mode {
+            stream.mode = Some(self.mode);
+        }
         stream.primary_key = self.primary_key.clone();
         stream.update_key = self.update_key.clone();
 

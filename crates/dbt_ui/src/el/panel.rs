@@ -217,7 +217,11 @@ impl ElPanel {
                 if let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) {
                     panel.update(cx, |panel, cx| panel.profile_changed(cx));
                 }
-                super::toast(workspace, &message, cx);
+                if effective.as_ref() == Some(&name) {
+                    super::toast(workspace, &message, cx);
+                } else {
+                    super::toast_error(workspace, &message, None, cx);
+                }
             })
             .ok();
     }

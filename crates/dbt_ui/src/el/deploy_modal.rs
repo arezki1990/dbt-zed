@@ -55,9 +55,10 @@ impl ElDeployModal {
         .map(|remotes| remotes.remotes.keys().map(|name| name.clone().into()).collect())
         .unwrap_or_default();
         if remotes.is_empty() {
-            super::toast(
+            super::toast_error(
                 workspace,
                 "No remotes declared — add one to el/remotes.yml first.",
+                Some(super::el_dir(&root).join("remotes.yml")),
                 cx,
             );
             return;
