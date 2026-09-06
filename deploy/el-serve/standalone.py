@@ -107,6 +107,12 @@ def main(repo_root: str, out_dir: str) -> None:
     for license in ("LICENSE-GPL", "LICENSE-APACHE"):
         if (repo / license).is_file():
             shutil.copy2(repo / license, out / license)
+    # Pin the same compiler as the IDE (the lockfile's crates need it),
+    # without the IDE's extra targets/components.
+    toolchain = tomllib.loads((repo / "rust-toolchain.toml").read_text())["toolchain"]
+    (out / "rust-toolchain.toml").write_text(
+        f'[toolchain]\nchannel = "{toolchain["channel"]}"\nprofile = "minimal"\n'
+    )
     print(f"standalone EL workspace at {out} ({len(needed)} workspace deps)")
 
 

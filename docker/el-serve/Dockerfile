@@ -7,7 +7,7 @@
 # publish only to localhost (-p 127.0.0.1:7431:7431) or terminate TLS at
 # your ingress for anything reachable from a network.
 
-FROM rust:1.90-bookworm AS build
+FROM rust:1.97-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
