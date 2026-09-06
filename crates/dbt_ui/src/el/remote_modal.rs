@@ -468,15 +468,27 @@ impl Render for ElRemoteModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let editing = self.editing.is_some();
-        let field_row = |label: &'static str, editor: Entity<Editor>| {
+        let input_bg = colors.editor_background;
+        let input_border = colors.border;
+        let field_row = move |label: &'static str, editor: Entity<Editor>| {
             h_flex()
                 .w_full()
-                .gap_2()
+                .gap_3()
                 .items_center()
-                .child(div().w(px(120.)).flex_shrink_0().child(
-                    Label::new(label).size(LabelSize::XSmall).color(Color::Muted),
+                .child(div().w(px(150.)).flex_shrink_0().child(
+                    Label::new(label).size(LabelSize::Default).color(Color::Muted),
                 ))
-                .child(div().flex_1().child(editor))
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(input_border)
+                        .bg(input_bg)
+                        .child(editor),
+                )
         };
         let steps: &[(Step, &str)] = if self.mode == Mode::Install {
             &[(Step::Details, "Server"), (Step::Install, "Install"), (Step::Review, "Review")]
@@ -494,7 +506,7 @@ impl Render for ElRemoteModal {
             .key_context("ElRemoteModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(480.))
+            .w(px(680.))
             .rounded_lg()
             .border_1()
             .border_color(colors.border)
@@ -503,10 +515,11 @@ impl Render for ElRemoteModal {
             .child(
                 h_flex()
                     .w_full()
-                    .p_2()
+                    .px_4()
+                    .py_3()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(Label::new(title).size(LabelSize::Small))
+                    .child(Label::new(title).size(LabelSize::Large))
                     .child(div().flex_1())
                     .child(
                         IconButton::new("el-remote-close", IconName::Close)
@@ -517,17 +530,17 @@ impl Render for ElRemoteModal {
 
         // Step trail (add mode).
         if !editing {
-            let mut trail = h_flex().w_full().px_2().pt_2().gap_1();
+            let mut trail = h_flex().w_full().px_4().pt_3().gap_2();
             for (ix, (step, label)) in steps.iter().enumerate() {
                 let active = *step == self.step;
                 trail = trail.child(
                     Label::new(format!("{}. {label}", ix + 1))
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(if active { Color::Accent } else { Color::Muted }),
                 );
                 if ix + 1 < steps.len() {
                     trail = trail.child(
-                        Label::new("›").size(LabelSize::XSmall).color(Color::Muted),
+                        Label::new("›").size(LabelSize::Default).color(Color::Muted),
                     );
                 }
             }
@@ -536,7 +549,7 @@ impl Render for ElRemoteModal {
 
         let body = match (editing, self.step) {
             (true, _) | (false, Step::Details) => {
-                let mut fields = v_flex().w_full().p_2().gap_1();
+                let mut fields = v_flex().w_full().px_4().py_3().gap_2();
                 if !editing {
                     fields = fields.child(
                         h_flex()
@@ -545,7 +558,7 @@ impl Render for ElRemoteModal {
                             .pb_1()
                             .child(
                                 Button::new("el-remote-mode-existing", "Existing daemon")
-                                    .label_size(LabelSize::XSmall)
+                                    .label_size(LabelSize::Default)
                                     .toggle_state(self.mode == Mode::Existing)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.mode = Mode::Existing;
@@ -554,7 +567,7 @@ impl Render for ElRemoteModal {
                             )
                             .child(
                                 Button::new("el-remote-mode-install", "New server over SSH")
-                                    .label_size(LabelSize::XSmall)
+                                    .label_size(LabelSize::Default)
                                     .toggle_state(self.mode == Mode::Install)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.mode = Mode::Install;
@@ -574,9 +587,9 @@ impl Render for ElRemoteModal {
                             .w_full()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(120.)).flex_shrink_0().child(
+                            .child(div().w(px(150.)).flex_shrink_0().child(
                                 Label::new("token variable")
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Default)
                                     .color(Color::Muted),
                             ))
                             .child(
@@ -584,7 +597,7 @@ impl Render for ElRemoteModal {
                                     "{} — generated for you",
                                     self.generated_token_var(cx)
                                 ))
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Default)
                                 .color(Color::Muted),
                             ),
                     );
@@ -594,14 +607,15 @@ impl Render for ElRemoteModal {
                         "https is required beyond localhost. The token itself lives in .env \
                          under that variable — only its name is stored in YAML.",
                     )
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
                 )
             }
             (false, Step::Install) => v_flex()
                 .w_full()
-                .p_2()
-                .gap_1()
+                .px_4()
+                .py_3()
+                .gap_2()
                 .child(field_row("ssh", self.ssh_host.clone()))
                 .child(field_row("project dir", self.ssh_project.clone()))
                 .child(field_row("profile", self.ssh_profile.clone()))
@@ -611,7 +625,7 @@ impl Render for ElRemoteModal {
                          (sudo needed): builds zdbt-el-serve, creates the service and a \
                          systemd unit. The token is generated here and sent over stdin.",
                     )
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
                 ),
             (false, Step::Review) => {
@@ -633,21 +647,21 @@ impl Render for ElRemoteModal {
                 } else {
                     format!("# .env\n{token_var}=<your token — set it yourself>")
                 };
-                let mut review = v_flex().w_full().p_2().gap_1().child(
+                let mut review = v_flex().w_full().px_4().py_3().gap_2().child(
                     Label::new("This is what gets written:")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Default)
                         .color(Color::Muted),
                 );
                 for block in [yaml, env_line] {
                     let mut pre = v_flex()
                         .w_full()
-                        .p_2()
-                        .rounded_sm()
+                        .p_3()
+                        .rounded_md()
                         .bg(colors.editor_background)
                         .border_1()
                         .border_color(colors.border);
                     for line in block.lines() {
-                        pre = pre.child(Label::new(line.to_owned()).size(LabelSize::XSmall));
+                        pre = pre.child(Label::new(line.to_owned()).size(LabelSize::Default));
                     }
                     review = review.child(pre);
                 }
@@ -662,7 +676,7 @@ impl Render for ElRemoteModal {
                             if dir.is_empty() { "/srv/el-project" } else { &dir },
                             if profile.is_empty() { "prod" } else { &profile }
                         ))
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Muted),
                     );
                 }
@@ -672,19 +686,25 @@ impl Render for ElRemoteModal {
         card = card.child(body);
 
         if let Some(error) = &self.error {
-            card = card.child(div().px_2().pb_1().child(
-                Label::new(error.clone()).size(LabelSize::XSmall).color(Color::Error),
+            card = card.child(div().px_4().pb_2().child(
+                Label::new(error.clone()).size(LabelSize::Small).color(Color::Error),
             ));
         }
 
-        let mut footer = h_flex().w_full().p_2().gap_1().border_t_1().border_color(colors.border);
+        let mut footer = h_flex()
+            .w_full()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(colors.border);
         if editing {
             footer = footer.child(
                 Button::new(
                     "el-remote-delete",
                     if self.delete_armed { "Confirm remove" } else { "Remove" },
                 )
-                .label_size(LabelSize::Small)
+                .label_size(LabelSize::Default)
                 .color(Color::Error)
                 .disabled(self.writing)
                 .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
@@ -694,7 +714,7 @@ impl Render for ElRemoteModal {
         if !editing && self.step != Step::Details {
             footer = footer.child(
                 Button::new("el-remote-back", "Back")
-                    .label_size(LabelSize::Small)
+                    .label_size(LabelSize::Default)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.step = match (this.step, this.mode) {
                             (Step::Review, Mode::Install) => Step::Install,
@@ -707,7 +727,7 @@ impl Render for ElRemoteModal {
         }
         footer = footer.child(
             Button::new("el-remote-cancel", "Cancel")
-                .label_size(LabelSize::Small)
+                .label_size(LabelSize::Default)
                 .disabled(self.writing)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
         );
@@ -722,7 +742,7 @@ impl Render for ElRemoteModal {
         card.child(
             footer.child(
                 Button::new("el-remote-primary", primary)
-                    .label_size(LabelSize::Small)
+                    .label_size(LabelSize::Default)
                     .style(ButtonStyle::Filled)
                     .disabled(self.writing)
                     .on_click(cx.listener(|this, _, window, cx| {
