@@ -12,9 +12,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
     case "$TARGETARCH" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) echo "unsupported arch $TARGETARCH"; exit 1 ;; esac; \
-    curl -fsSL "https://github.com/${REPO}/releases/download/${EL_TAG}/zdbt-el-linux-${arch}.tar.gz" -o /tmp/el.tar.gz; \
-    tar -xzf /tmp/el.tar.gz -C /usr/local/bin zdbt-el-serve zdbt-el-worker; \
-    rm /tmp/el.tar.gz; \
+    asset="zdbt-el-linux-${arch}.tar.gz"; \
+    base="https://github.com/${REPO}/releases/download/${EL_TAG}"; \
+    cd /tmp && curl -fsSL "$base/$asset" -o "$asset" && curl -fsSL "$base/$asset.sha256" -o "$asset.sha256"; \
+    sha256sum -c --quiet "$asset.sha256"; \
+    tar -xzf "$asset" -C /usr/local/bin zdbt-el-serve zdbt-el-worker; \
+    rm -f "$asset" "$asset.sha256"; \
     zdbt-el-serve --help >/dev/null
 EXPOSE 7431
 ENTRYPOINT ["zdbt-el-serve", "--project", "/project", "--listen", "0.0.0.0:7431", "--insecure-http", "--worker", "/usr/local/bin/zdbt-el-worker"]

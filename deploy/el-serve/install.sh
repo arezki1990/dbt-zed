@@ -45,13 +45,16 @@ if [[ "$FROM_SOURCE" != 1 ]]; then
   echo "==> looking for a released binary ($ASSET)"
   API="https://api.github.com/repos/${REPO#https://github.com/}/releases"
   URL=$(curl -fsSL "$API" | grep -o "https://[^\"]*/el-v[^\"]*/${ASSET}" | head -1 || true)
-  if [[ -n "$URL" ]] && curl -fsSL "$URL" -o /tmp/zdbt-el.tar.gz; then
-    tar -xzf /tmp/zdbt-el.tar.gz -C /tmp
+  if [[ -n "$URL" ]] && curl -fsSL "$URL" -o "/tmp/$ASSET" && curl -fsSL "$URL.sha256" -o "/tmp/$ASSET.sha256"; then
+    # The checksum published beside the asset must match — a truncated or
+    # tampered download never gets installed.
+    (cd /tmp && sha256sum -c --quiet "$ASSET.sha256") || { echo "checksum mismatch for $ASSET"; exit 1; }
+    tar -xzf "/tmp/$ASSET" -C /tmp zdbt-el-serve zdbt-el-worker
     install -m 0755 /tmp/zdbt-el-serve "$PREFIX/zdbt-el-serve"
     install -m 0755 /tmp/zdbt-el-worker "$PREFIX/zdbt-el-worker"
-    rm -f /tmp/zdbt-el.tar.gz /tmp/zdbt-el-serve /tmp/zdbt-el-worker
+    rm -f "/tmp/$ASSET" "/tmp/$ASSET.sha256" /tmp/zdbt-el-serve /tmp/zdbt-el-worker
     DOWNLOADED=1
-    echo "==> installed $(basename "$URL")"
+    echo "==> installed $ASSET ($(basename "$(dirname "$URL")"))"
   else
     echo "==> no released binary for linux-$ARCH — building from source"
   fi
