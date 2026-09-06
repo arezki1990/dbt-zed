@@ -45,8 +45,18 @@ DOWNLOADED=0
 if [[ "$FROM_SOURCE" != 1 ]]; then
   echo "==> looking for a released binary ($ASSET)"
   API="https://api.github.com/repos/${REPO#https://github.com/}/releases"
-  URL=$(curl -fsSL "$API" | grep -o "https://[^\"]*/el-v[^\"]*/${ASSET}" | head -1 || true)
-  if [[ -n "$URL" ]] && curl -fsSL "$URL" -o "/tmp/$ASSET" && curl -fsSL "$URL.sha256" -o "/tmp/$ASSET.sha256"; then
+  # A network hiccup must not turn into a 40-minute source build: only a
+  # release that has no asset for this platform falls back to building.
+  if ! LISTING=$(curl -fsSL --retry 3 "$API"); then
+    echo "could not query $API — check the server's network/proxy and retry, or pass --from-source"
+    exit 1
+  fi
+  URL=$(printf '%s' "$LISTING" | grep -o "https://[^\"]*/el-v[^\"]*/${ASSET}" | head -1 || true)
+  if [[ -z "$URL" ]]; then
+    echo "==> no released binary for linux-$ARCH — building from source"
+  else
+    curl -fsSL --retry 3 "$URL" -o "/tmp/$ASSET" && curl -fsSL --retry 3 "$URL.sha256" -o "/tmp/$ASSET.sha256" \
+      || { echo "download of $ASSET failed — retry, or pass --from-source"; exit 1; }
     # The checksum published beside the asset must match — a truncated or
     # tampered download never gets installed.
     (cd /tmp && sha256sum -c --quiet "$ASSET.sha256") || { echo "checksum mismatch for $ASSET"; exit 1; }
@@ -56,8 +66,6 @@ if [[ "$FROM_SOURCE" != 1 ]]; then
     rm -f "/tmp/$ASSET" "/tmp/$ASSET.sha256" /tmp/zdbt-el-serve /tmp/zdbt-el-worker
     DOWNLOADED=1
     echo "==> installed $ASSET ($(basename "$(dirname "$URL")"))"
-  else
-    echo "==> no released binary for linux-$ARCH — building from source"
   fi
 fi
 
@@ -120,20 +128,23 @@ ZDBT_EL_PROFILE=$PROFILE
 # Database credentials referenced as \${VAR} in el/connections.yml
 # EL_PG_URL_PROD=postgres://user:pass@host:5432/db
 ENV
-  chmod 0600 /etc/zdbt-el-serve/env
 else
   # Re-install: keep the operator's env (database URLs) but apply what this
   # run brought — the fresh token `zdbt el install-remote` just placed, and
   # an explicit --profile.
   set_env() {
     { grep -v "^$1=" /etc/zdbt-el-serve/env || true; echo "$1=$2"; } > /etc/zdbt-el-serve/env.new
-    mv /etc/zdbt-el-serve/env.new /etc/zdbt-el-serve/env && chmod 0600 /etc/zdbt-el-serve/env
+    mv /etc/zdbt-el-serve/env.new /etc/zdbt-el-serve/env
   }
   [[ -f /etc/zdbt-el-serve/token ]] && set_env ZDBT_EL_TOKEN "$(head -1 /etc/zdbt-el-serve/token)"
   [[ "$PROFILE_SET" == 1 ]] && set_env ZDBT_EL_PROFILE "$PROFILE"
 fi
 # The pre-placed token is consumed — a later manual re-run keeps the env as is.
 rm -f /etc/zdbt-el-serve/token
+# The daemon runs as zdbt and reads this file itself (the launcher sources
+# it); root-only would leave it token-less. Readable by root and zdbt only.
+chown root:zdbt /etc/zdbt-el-serve/env
+chmod 0640 /etc/zdbt-el-serve/env
 
 # A launcher that works with or without systemd (containers have none).
 cat > "$PREFIX/zdbt-el-serve-start" <<START
