@@ -32,7 +32,7 @@ done
 
 echo "==> build dependencies"
 apt-get update -qq
-apt-get install -y -qq build-essential cmake pkg-config libssl-dev git curl ca-certificates >/dev/null
+apt-get install -y -qq build-essential cmake pkg-config libssl-dev git curl ca-certificates python3 >/dev/null
 if ! command -v cargo >/dev/null; then
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
   # shellcheck disable=SC1091
@@ -47,10 +47,14 @@ else
   git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$SRC"
 fi
 
+echo "==> standalone workspace (only the EL crates — none of the IDE's dependencies)"
+EL=/opt/zdbt-el
+python3 "$SRC/deploy/el-serve/standalone.py" "$SRC" "$EL"
+
 echo "==> build (this takes a while: polars + duckdb)"
-( cd "$SRC" && cargo build --release -p el_serve -p el_worker )
-install -m 0755 "$SRC/target/release/zdbt-el-serve" "$PREFIX/zdbt-el-serve"
-install -m 0755 "$SRC/target/release/zdbt-el-worker" "$PREFIX/zdbt-el-worker"
+( cd "$EL" && cargo build --release -p el_serve -p el_worker )
+install -m 0755 "$EL/target/release/zdbt-el-serve" "$PREFIX/zdbt-el-serve"
+install -m 0755 "$EL/target/release/zdbt-el-worker" "$PREFIX/zdbt-el-worker"
 
 echo "==> service user, dirs, env"
 id -u zdbt >/dev/null 2>&1 || useradd --system --home "$PROJECT" --shell /usr/sbin/nologin zdbt
