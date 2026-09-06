@@ -48,16 +48,17 @@ enum TablesState {
 
 enum Row {
     Header(SharedString),
+    /// Section headers with their "+" action beside the label.
+    PipelinesHeader,
+    ConnectionsHeader,
     Pipeline(PathBuf),
     Connection(SharedString, SharedString),
-    AddConnection,
     Table {
         connection: SharedString,
         schema: String,
         table: String,
     },
     ConnNote(SharedString, Color),
-    NewPipeline,
     Initialize,
     Note(SharedString),
 }
@@ -235,18 +236,17 @@ impl ElPanel {
             rows.push(Row::Initialize);
             return rows;
         }
-        rows.push(Row::Header("Pipelines".into()));
+        rows.push(Row::PipelinesHeader);
         for path in &self.pipelines {
             rows.push(Row::Pipeline(path.clone()));
         }
-        rows.push(Row::NewPipeline);
         if let Some(error) = &self.connections_error {
-            rows.push(Row::Header("Connections".into()));
+            rows.push(Row::ConnectionsHeader);
             rows.push(Row::ConnNote(error.clone(), Color::Error));
             return rows;
         }
         {
-            rows.push(Row::Header("Connections".into()));
+            rows.push(Row::ConnectionsHeader);
             for (name, kind) in &self.connections {
                 rows.push(Row::Connection(name.clone(), kind.clone()));
                 if !self.expanded.contains(name) {
@@ -273,7 +273,6 @@ impl ElPanel {
                     }
                 }
             }
-            rows.push(Row::AddConnection);
         }
         rows
     }
@@ -629,6 +628,40 @@ impl ElPanel {
                         .color(Color::Muted),
                 )
                 .into_any_element(),
+            Row::PipelinesHeader => base
+                .child(
+                    Label::new("Pipelines")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(
+                    IconButton::new("el-new-pipeline", IconName::Plus)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("New pipeline"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_pipeline(window, cx)
+                        })),
+                )
+                .into_any_element(),
+            Row::ConnectionsHeader => base
+                .child(
+                    Label::new("Connections")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(
+                    IconButton::new("el-add-connection", IconName::Plus)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Add connection"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.edit_connection(None, window, cx)
+                        })),
+                )
+                .into_any_element(),
             Row::Note(text) => base
                 .child(Label::new(text.clone()).size(LabelSize::XSmall).color(Color::Muted))
                 .into_any_element(),
@@ -691,18 +724,6 @@ impl ElPanel {
                 })
                 .into_any_element()
             }
-            Row::AddConnection => base
-                .cursor_pointer()
-                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                .child(
-                    Label::new("Add connection")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.edit_connection(None, window, cx)
-                }))
-                .into_any_element(),
             Row::Table {
                 connection,
                 schema,
@@ -745,16 +766,6 @@ impl ElPanel {
             Row::ConnNote(text, color) => base
                 .pl_6()
                 .child(Label::new(text.clone()).size(LabelSize::XSmall).color(*color))
-                .into_any_element(),
-            Row::NewPipeline => base
-                .cursor_pointer()
-                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                .child(
-                    Label::new("New pipeline")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.new_pipeline(window, cx)))
                 .into_any_element(),
             Row::Initialize => base
                 .cursor_pointer()
