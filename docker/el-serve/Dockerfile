@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake python3 \
 WORKDIR /src
 # Only what the carve-out needs: the three crates, the root manifests,
 # and the generator.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock LICENSE-GPL ./
 COPY crates/el_engine crates/el_engine
 COPY crates/el_worker crates/el_worker
 COPY crates/el_serve crates/el_serve
