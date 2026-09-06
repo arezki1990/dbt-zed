@@ -203,6 +203,15 @@ impl ElRunsPanel {
         cx.notify();
     }
 
+    /// The EL panel's choice of connection for ad-hoc queries.
+    pub fn select_connection(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        self.refresh_connections(cx);
+        if let Some(ix) = self.connections.iter().position(|(n, _)| *n == name) {
+            self.selected = Some(ix);
+        }
+        cx.notify();
+    }
+
     /// The sidebar's click-a-server entry point: Remote tab, that server.
     pub fn show_remote(&mut self, name: SharedString, cx: &mut Context<Self>) {
         self.preview = None;
@@ -540,24 +549,25 @@ impl ElRunsPanel {
 
     fn render_query(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = cx.theme().colors();
-        let chips = h_flex().gap_1().flex_wrap().children(
-            self.connections
-                .iter()
-                .enumerate()
-                .map(|(ix, (name, kind))| {
-                    let selected = self.selected == Some(ix);
-                    Button::new(("el-query-conn", ix), name.clone())
-                        .label_size(LabelSize::Small)
-                        .toggle_state(selected)
-                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                        .tooltip(ui::Tooltip::text(format!("{kind} connection")))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected = Some(ix);
-                            cx.notify();
-                        }))
-                })
-                .collect::<Vec<_>>(),
-        );
+        // The connection comes from the EL panel (expand one, or click a
+        // table); here it is only stated, not chosen.
+        let target: gpui::AnyElement = match self.selected.and_then(|ix| self.connections.get(ix)) {
+            Some((name, kind)) => h_flex()
+                .gap_1()
+                .items_center()
+                .child(Label::new("on").size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(name.clone()).size(LabelSize::Small).color(Color::Accent))
+                .child(
+                    Label::new(kind.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            None => Label::new("Pick a connection in the EL panel")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
 
         let status: Option<SharedString> = if self.running {
             Some("Running…".into())
@@ -578,7 +588,7 @@ impl ElRunsPanel {
             .p_1()
             .gap_2()
             .items_center()
-            .child(chips)
+            .child(target)
             .child(div().flex_1())
             .children(status.map(|status| {
                 Label::new(status).size(LabelSize::XSmall).color(Color::Muted)
@@ -636,7 +646,8 @@ impl ElRunsPanel {
                 .p_2()
                 .child(
                     Label::new(
-                        "Pick a connection and run a query — or click a table in the EL panel.",
+                        "Write a query and run it — or click a table in the EL panel to \
+                         start from SELECT *.",
                     )
                     .size(LabelSize::Small)
                     .color(Color::Muted),

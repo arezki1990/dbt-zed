@@ -389,9 +389,17 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
         } else {
             self.expanded.insert(name.clone());
             if !self.tables.contains_key(&name) {
-                self.load_tables(name, cx);
+                self.load_tables(name.clone(), cx);
             }
         }
+        // Touching a connection here is how the Query tab picks its target.
+        self.workspace
+            .update(cx, |workspace, cx| {
+                if let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.select_connection(name.clone(), cx));
+                }
+            })
+            .ok();
         cx.notify();
     }
 
