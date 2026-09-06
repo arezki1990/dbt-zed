@@ -42,9 +42,13 @@ pub struct ElPanel {
     _list_tasks: std::collections::HashMap<SharedString, Task<()>>,
     scroll: UniformListScrollHandle,
     scroll_lower: UniformListScrollHandle,
-    /// Height of the Pipelines section; the splitter drags it.
+    scroll_remotes: UniformListScrollHandle,
+    /// Heights of the Pipelines and Connections sections (Remotes takes
+    /// the rest); the two splitters drag them.
     split: f32,
-    split_drag: Option<(f32, f32)>,
+    split_connections: f32,
+    /// (which splitter, pointer y at drag start, split at drag start).
+    split_drag: Option<(usize, f32, f32)>,
     _refresh: Task<()>,
 }
 
@@ -131,7 +135,9 @@ impl ElPanel {
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
             scroll_lower: UniformListScrollHandle::new(),
+            scroll_remotes: UniformListScrollHandle::new(),
             split: 200.,
+            split_connections: 220.,
             split_drag: None,
             _refresh: Task::ready(()),
         })
@@ -288,15 +294,14 @@ impl ElPanel {
         rows
     }
 
-    /// The lower list: connections (with their explorer trees) and remotes.
-    fn lower_rows(&self) -> Vec<Row> {
+    /// The middle list: connections with their explorer trees.
+    fn connection_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         if let Some(error) = &self.connections_error {
             rows.push(Row::ConnectionsHeader);
             if !self.collapsed.contains("connections") {
                 rows.push(Row::ConnNote(error.clone(), Color::Error));
             }
-            self.push_remote_rows(&mut rows);
             return rows;
         }
         if !self.collapsed.contains("connections") {
@@ -330,14 +335,15 @@ impl ElPanel {
         } else {
             rows.push(Row::ConnectionsHeader);
         }
-        self.push_remote_rows(&mut rows);
         rows
     }
 
-    fn push_remote_rows(&self, rows: &mut Vec<Row>) {
+    /// The bottom list: declared servers.
+    fn remote_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
         rows.push(Row::RemotesHeader);
         if self.collapsed.contains("remotes") {
-            return;
+            return rows;
         }
         if self.remotes.is_empty() {
             rows.push(Row::ConnNote(
@@ -348,6 +354,7 @@ impl ElPanel {
         for (name, host) in &self.remotes {
             rows.push(Row::Remote(name.clone(), host.clone()));
         }
+        rows
     }
 
     fn toggle_section(&mut self, key: &'static str, cx: &mut Context<Self>) {
@@ -652,8 +659,41 @@ impl Render for ElPanel {
         };
         let empty = self.is_empty_project();
         let upper = make_list("el-panel-upper", self.upper_rows(), &self.scroll, cx);
-        let lower = make_list("el-panel-lower", self.lower_rows(), &self.scroll_lower, cx);
+        let middle = make_list("el-panel-connections", self.connection_rows(), &self.scroll_lower, cx);
+        let bottom = make_list("el-panel-remotes", self.remote_rows(), &self.scroll_remotes, cx);
         let dragging = self.split_drag.is_some();
+        const HEADER_ONLY: f32 = 26.;
+        // A 1px line with a 5px grab area — drag to trade space.
+        let splitter = |which: usize, dragging: bool, cx: &mut Context<Self>| {
+            div()
+                .id(("el-panel-split", which))
+                .w_full()
+                .h(px(5.))
+                .flex_shrink_0()
+                .cursor(gpui::CursorStyle::ResizeRow)
+                .border_t_1()
+                .border_color(if dragging {
+                    colors.border_focused
+                } else {
+                    colors.border
+                })
+                .hover(|style| style.border_color(colors.border_focused))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let start = if which == 0 { this.split } else { this.split_connections };
+                        this.split_drag = Some((which, f32::from(event.position.y), start));
+                        cx.notify();
+                    }),
+                )
+        };
+        let pipelines_h = if self.collapsed.contains("pipelines") { HEADER_ONLY } else { self.split };
+        let connections_h = if self.collapsed.contains("connections") {
+            HEADER_ONLY
+        } else {
+            self.split_connections
+        };
         let list: gpui::AnyElement = if empty {
             upper.flex_1().into_any_element()
         } else {
@@ -662,43 +702,26 @@ impl Render for ElPanel {
                 .min_h_0()
                 .child(
                     div()
-                        .h(px(self.split))
+                        .h(px(pipelines_h))
                         .flex_shrink_0()
                         .child(upper.size_full())
                         .vertical_scrollbar_for(&self.scroll, window, cx),
                 )
+                .child(splitter(0, dragging, cx))
                 .child(
-                    // The splitter: a 1px line with a 5px grab area — drag
-                    // to trade space between pipelines and the rest.
                     div()
-                        .id("el-panel-split")
-                        .w_full()
-                        .h(px(5.))
+                        .h(px(connections_h))
                         .flex_shrink_0()
-                        .cursor(gpui::CursorStyle::ResizeRow)
-                        .border_t_1()
-                        .border_color(if dragging {
-                            colors.border_focused
-                        } else {
-                            colors.border
-                        })
-                        .hover(|style| style.border_color(colors.border_focused))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.split_drag =
-                                    Some((f32::from(event.position.y), this.split));
-                                cx.notify();
-                            }),
-                        ),
+                        .child(middle.size_full())
+                        .vertical_scrollbar_for(&self.scroll_lower, window, cx),
                 )
+                .child(splitter(1, dragging, cx))
                 .child(
                     div()
                         .flex_1()
                         .min_h_0()
-                        .child(lower.size_full())
-                        .vertical_scrollbar_for(&self.scroll_lower, window, cx),
+                        .child(bottom.size_full())
+                        .vertical_scrollbar_for(&self.scroll_remotes, window, cx),
                 )
                 .into_any_element()
         };
@@ -710,9 +733,14 @@ impl Render for ElPanel {
             .bg(colors.panel_background)
             .when(dragging, |flex| {
                 flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    if let Some((start_y, start_split)) = this.split_drag {
-                        this.split =
+                    if let Some((which, start_y, start_split)) = this.split_drag {
+                        let next =
                             (start_split + f32::from(event.position.y) - start_y).clamp(60., 900.);
+                        if which == 0 {
+                            this.split = next;
+                        } else {
+                            this.split_connections = next;
+                        }
                         cx.notify();
                     }
                 }))
@@ -835,7 +863,11 @@ impl ElPanel {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let folded = self.collapsed.contains(key);
+        let colors = cx.theme().colors();
         base.cursor_pointer()
+            .bg(colors.element_background)
+            .border_b_1()
+            .border_color(colors.border)
             .child(
                 Icon::new(if folded {
                     IconName::ChevronRight
