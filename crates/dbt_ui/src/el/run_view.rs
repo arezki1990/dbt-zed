@@ -27,8 +27,10 @@ pub struct StreamRow {
 
 struct ActiveRun {
     pipeline: SharedString,
-    /// What to re-run: the project and the full spec this run came from.
+    /// What to re-run: the project, the spec's file (re-read fresh so a
+    /// re-run picks up fixes), and the snapshot as a fallback.
     project_root: PathBuf,
+    spec_path: Option<PathBuf>,
     spec: Arc<Pipeline>,
     started: Instant,
     streams: Vec<StreamRow>,
@@ -65,7 +67,7 @@ impl ElRunView {
         pipeline: Arc<Pipeline>,
         cx: &mut Context<Self>,
     ) {
-        self.start_run_streams(project_root, pipeline, Vec::new(), cx);
+        self.start_run_streams(project_root, pipeline, None, Vec::new(), cx);
     }
 
     /// Runs `only` those streams (all when empty).
@@ -73,6 +75,7 @@ impl ElRunView {
         &mut self,
         project_root: PathBuf,
         pipeline: Arc<Pipeline>,
+        spec_path: Option<PathBuf>,
         only: Vec<String>,
         cx: &mut Context<Self>,
     ) {
@@ -94,6 +97,7 @@ impl ElRunView {
         self.run = Some(ActiveRun {
             pipeline: pipeline.pipeline.clone().into(),
             project_root: project_root.clone(),
+            spec_path,
             spec,
             started: Instant::now(),
             streams: pipeline
@@ -197,6 +201,7 @@ impl ElRunView {
         let rows: u64 = run.streams.iter().map(|row| row.rows_written).sum();
         let pipeline = run.pipeline.clone();
         let message = match (&run.fatal, failed.is_empty()) {
+            _ if run.cancelling => Some((true, format!("{pipeline} cancelled."))),
             (Some(fatal), _) => Some((false, format!("{pipeline} failed: {fatal}"))),
             (None, false) => Some((
                 false,
@@ -242,8 +247,30 @@ impl ElRunView {
             return;
         }
         let root = run.project_root.clone();
-        let spec = run.spec.clone();
-        self.start_run_streams(root, spec, failed, cx);
+        let spec_path = run.spec_path.clone();
+        // Re-read the YAML: the whole point of re-running is that the
+        // user fixed something since.
+        let spec = match spec_path
+            .as_ref()
+            .map(|path| el_engine::spec::load_pipeline(path))
+        {
+            Some(Ok(fresh)) => Arc::new(fresh),
+            Some(Err(error)) => {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        super::toast_error(
+                            workspace,
+                            &format!("Can't re-run: {error}"),
+                            spec_path.clone(),
+                            cx,
+                        )
+                    })
+                    .ok();
+                return;
+            }
+            None => run.spec.clone(),
+        };
+        self.start_run_streams(root, spec, spec_path, failed, cx);
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {

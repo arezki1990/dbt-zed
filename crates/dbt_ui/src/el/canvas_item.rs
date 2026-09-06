@@ -236,6 +236,17 @@ impl ElPipelineCanvas {
             .ok();
     }
 
+    fn open_connections_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = super::el_dir(&self.project_root).join("connections.yml");
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                    .detach();
+            })
+            .ok();
+    }
+
     fn pipeline_name(&self) -> SharedString {
         self.loaded
             .as_ref()
@@ -300,7 +311,10 @@ impl ElPipelineCanvas {
                         this.preview_to_grid(stream_ix, false, window, cx);
                     }
                     Some(ElNodeKind::Map { stream_ix }) => {
-                        this.open_mapping(stream_ix, window, cx);
+                        let same = this.mapping_stream_ix() == Some(stream_ix);
+                        if same || this.mapping_may_leave("node", cx) {
+                            this.open_mapping(stream_ix, window, cx);
+                        }
                     }
                     Some(ElNodeKind::TargetTable { stream_ix }) => {
                         this.preview_target_table(stream_ix, window, cx);
@@ -574,12 +588,28 @@ impl ElPipelineCanvas {
         cx.notify();
     }
 
-    /// Leaving the sidebar with unsaved edits arms a "Discard changes?"
-    /// on the first press; the second press proceeds.
-    fn mapping_may_leave(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn mapping_mut(&mut self) -> Option<&mut MappingEditorState> {
+        self.mapping.as_mut()
+    }
+
+    /// The open sidebar's stream index in the CURRENT spec, by name —
+    /// the stored index goes stale when the YAML is reordered underneath.
+    fn mapping_stream_ix(&self) -> Option<usize> {
+        let state = self.mapping.as_ref()?;
+        let loaded = self.loaded.as_ref()?;
+        loaded
+            .pipeline
+            .streams
+            .iter()
+            .position(|stream| stream.name == state.stream_name.as_ref())
+    }
+
+    /// Leaving the sidebar with unsaved edits arms "Discard changes?" for
+    /// THIS action on the first press; only the same action confirms it.
+    fn mapping_may_leave(&mut self, action: &str, cx: &mut Context<Self>) -> bool {
         match &mut self.mapping {
-            Some(state) if state.dirty && !state.discard_armed => {
-                state.discard_armed = true;
+            Some(state) if state.dirty && state.discard_armed.as_deref() != Some(action) => {
+                state.discard_armed = Some(action.to_owned());
                 cx.notify();
                 false
             }
@@ -593,7 +623,7 @@ impl ElPipelineCanvas {
     }
 
     fn close_mapping(&mut self, cx: &mut Context<Self>) {
-        if !self.mapping_may_leave(cx) {
+        if !self.mapping_may_leave("close", cx) {
             return;
         }
         self.mapping = None;
@@ -655,24 +685,36 @@ impl ElPipelineCanvas {
         match state.apply(&mut pipeline, cx) {
             Ok(_) => {}
             Err(error) => {
-                self.toast(format!("Apply failed: {error:#}"), cx);
+                self.toast_error(format!("Apply failed: {error:#}"), cx);
                 return;
             }
         }
-        if let Some(state) = &mut self.mapping {
-            state.dirty = false;
-        }
+        let stream_name = state.stream_name.clone();
         let workspace = self.workspace.clone();
         let project = self.project.clone();
         let spec_path = self.spec_path.clone();
+        let file_name = spec_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("the pipeline")
+            .to_owned();
         self._write = cx.spawn_in(_window, async move |this, cx| {
             let result =
                 super::spec_io::write_spec(workspace, project, spec_path, pipeline, cx).await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => this.reload(cx),
-                    Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    // Clean only once the file really holds the edits; a
+                    // refused write leaves the draft dirty and Apply live.
+                    if let Some(state) = &mut this.mapping {
+                        if state.stream_name == stream_name {
+                            state.dirty = false;
+                            state.discard_armed = None;
+                        }
+                    }
+                    this.toast(format!("Saved {stream_name} to {file_name}."), cx);
+                    this.reload(cx);
                 }
+                Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
             })
             .ok();
         });
@@ -978,7 +1020,7 @@ impl ElPipelineCanvas {
             .as_ref()
             .map(|loaded| loaded.pipeline.streams.len())
             .unwrap_or(0);
-        let stream_ix = state.stream_ix;
+        let stream_ix = self.mapping_stream_ix().unwrap_or(state.stream_ix);
 
         let mut rows = v_flex().id("el-map-rows").flex_1().min_h_0().overflow_y_scroll().gap_0p5().p_1();
         for (draft_ix, draft) in state.drafts.iter().enumerate() {
@@ -1090,10 +1132,10 @@ impl ElPipelineCanvas {
                             .icon_size(IconSize::Small)
                             .disabled(stream_ix == 0)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if !this.mapping_may_leave(cx) {
+                                if !this.mapping_may_leave("prev", cx) {
                                     return;
                                 }
-                                let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
+                                let ix = this.mapping_stream_ix().unwrap_or(0);
                                 if ix > 0 {
                                     this.open_mapping(ix - 1, window, cx);
                                 }
@@ -1113,10 +1155,10 @@ impl ElPipelineCanvas {
                             .icon_size(IconSize::Small)
                             .disabled(stream_ix + 1 >= stream_count)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if !this.mapping_may_leave(cx) {
+                                if !this.mapping_may_leave("next", cx) {
                                     return;
                                 }
-                                let ix = this.mapping.as_ref().map(|s| s.stream_ix).unwrap_or(0);
+                                let ix = this.mapping_stream_ix().unwrap_or(0);
                                 this.open_mapping(ix + 1, window, cx);
                             })),
                     )
@@ -1267,7 +1309,7 @@ impl ElPipelineCanvas {
                         Button::new("el-map-preview", "Preview")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(ix) = this.mapping.as_ref().map(|s| s.stream_ix) {
+                                if let Some(ix) = this.mapping_stream_ix() {
                                     this.preview_to_grid(ix, false, window, cx)
                                 }
                             })),
@@ -1276,7 +1318,7 @@ impl ElPipelineCanvas {
                         Button::new("el-map-failed", "Failed casts")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(ix) = this.mapping.as_ref().map(|s| s.stream_ix) {
+                                if let Some(ix) = this.mapping_stream_ix() {
                                     this.preview_to_grid(ix, true, window, cx)
                                 }
                             })),
@@ -1301,7 +1343,7 @@ impl ElPipelineCanvas {
                             })),
                     )
                     .child(div().flex_1())
-                    .children(state.discard_armed.then(|| {
+                    .children(state.discard_armed.is_some().then(|| {
                         h_flex()
                             .gap_1()
                             .items_center()
@@ -1315,13 +1357,13 @@ impl ElPipelineCanvas {
                                     .label_size(LabelSize::XSmall)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some(state) = &mut this.mapping {
-                                            state.discard_armed = false;
+                                            state.discard_armed = None;
                                         }
                                         cx.notify();
                                     })),
                             )
                     }))
-                    .children((state.dirty && !state.discard_armed).then(|| {
+                    .children((state.dirty && state.discard_armed.is_none()).then(|| {
                         Label::new("Unsaved changes")
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
@@ -1344,6 +1386,9 @@ impl ElPipelineCanvas {
     /// Why Run/Deploy are blocked right now, if they are: the first
     /// validation issue (+ count), or the parse error.
     fn blocker(&self) -> Option<String> {
+        if let Some(error) = &self.parse_error {
+            return Some(format!("Can't run: {error}"));
+        }
         match &self.loaded {
             None => Some(
                 self.parse_error
@@ -1396,6 +1441,7 @@ impl ElPipelineCanvas {
         }
         let pipeline = loaded.pipeline.clone();
         let root = self.project_root.clone();
+        let spec_path = self.spec_path.clone();
         self.workspace
             .update(cx, |workspace, cx| {
                 let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
@@ -1404,7 +1450,7 @@ impl ElPipelineCanvas {
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
                 let view = panel.read(cx).run_view();
                 view.update(cx, |view, cx| {
-                    view.start_run_streams(root, pipeline, only, cx)
+                    view.start_run_streams(root, pipeline, Some(spec_path), only, cx)
                 });
             })
             .ok();
@@ -1630,10 +1676,15 @@ impl Render for ElPipelineCanvas {
         let run_tooltip: SharedString = match (&blocker, running) {
             (Some(blocker), _) => blocker.clone().into(),
             (None, true) => "A run is in progress — see the EL console".into(),
-            (None, false) => "Run pipeline (⌘⏎)".into(),
+            (None, false) => if cfg!(target_os = "macos") {
+                "Run pipeline (⌘⏎)".into()
+            } else {
+                "Run pipeline (ctrl-enter)".into()
+            },
         };
-        let deploy_tooltip: SharedString = match &blocker {
-            Some(blocker) => blocker.replace("Can't run", "Can't deploy").into(),
+        let deploy_blocked = self.parse_error.is_some() || self.loaded.is_none();
+        let deploy_tooltip: SharedString = match &self.parse_error {
+            Some(error) => format!("Can't deploy: {error}").into(),
             None => "Ship this pipeline to a remote server — nothing runs there until \
                      deployed"
                 .into(),
@@ -1666,11 +1717,11 @@ impl Render for ElPipelineCanvas {
             .child(
                 Button::new("el-deploy", "Deploy")
                     .label_size(LabelSize::Small)
-                    .disabled(blocker.is_some())
+                    .disabled(deploy_blocked)
                     .tooltip(Tooltip::text(deploy_tooltip))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(blocker) = this.blocker() {
-                            this.toast_error(blocker.replace("Can't run", "Can't deploy"), cx);
+                        if let Some(error) = &this.parse_error {
+                            this.toast_error(format!("Can't deploy: {error}"), cx);
                             return;
                         }
                         let Some(loaded) = &this.loaded else {
@@ -1785,6 +1836,8 @@ impl Render for ElPipelineCanvas {
                     .as_ref()
                     .map(|stream| format!("{stream}: "))
                     .unwrap_or_default();
+                let about_connections =
+                    issue.stream.is_none() && issue.message.contains("connections.yml");
                 body = body.child(
                     div()
                         .id(("el-issue", ix))
@@ -1793,7 +1846,13 @@ impl Render for ElPipelineCanvas {
                         .py_0p5()
                         .cursor_pointer()
                         .hover(|style| style.bg(cx.theme().colors().element_hover))
-                        .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if about_connections {
+                                this.open_connections_yaml(window, cx);
+                            } else {
+                                this.open_yaml(window, cx);
+                            }
+                        }))
                         .child(
                             Label::new(format!("Won't run — {prefix}{}", issue.message))
                                 .size(LabelSize::XSmall)

@@ -4,8 +4,8 @@
 //! spec and writes the YAML through the buffer.
 
 use anyhow::Result;
-use editor::Editor;
-use gpui::{Context, Entity, SharedString, Window};
+use editor::{Editor, EditorEvent};
+use gpui::{Context, Entity, SharedString, Subscription, Window};
 use ui::prelude::*;
 
 use el_engine::spec::{ColumnSpec, Mode, Pipeline, Select};
@@ -53,8 +53,26 @@ pub struct MappingEditorState {
     pub probing: bool,
     pub probe_error: Option<SharedString>,
     pub dirty: bool,
-    /// Leaving with unsaved edits needs a second press: first arms.
-    pub discard_armed: bool,
+    /// Which leave action is armed for "Discard changes?" — only that
+    /// same action confirms it (Escape can't confirm a prev/next arm).
+    pub discard_armed: Option<String>,
+    /// Typed edits (rename, target table) must dirty the draft too.
+    _edit_watchers: Vec<Subscription>,
+}
+
+/// Marks the sidebar dirty whenever the given editor's buffer changes.
+fn watch_edits(
+    editor: &Entity<Editor>,
+    cx: &mut Context<crate::el::ElPipelineCanvas>,
+) -> Subscription {
+    cx.subscribe(editor, |canvas, _, event: &EditorEvent, cx| {
+        if matches!(event, EditorEvent::BufferEdited) {
+            if let Some(state) = canvas.mapping_mut() {
+                state.touch();
+            }
+            cx.notify();
+        }
+    })
 }
 
 impl MappingEditorState {
@@ -86,9 +104,11 @@ impl MappingEditorState {
             .map(|select| select.exclude.iter().map(String::as_str).collect())
             .unwrap_or_default();
 
+        let mut watchers = Vec::new();
         let mut drafts = Vec::with_capacity(stream.columns.len());
         for rule in &stream.columns {
             let rename = make_editor(rule.rename.as_deref().unwrap_or(""), "rename…", cx);
+            watchers.push(watch_edits(&rename, cx));
             drafts.push(ColumnDraft {
                 name: rule.name.clone().into(),
                 inferred: None,
@@ -100,29 +120,32 @@ impl MappingEditorState {
             });
         }
 
+        let target_table = make_editor(
+            stream.target_table.as_deref().unwrap_or(""),
+            &stream.target_table(&pipeline.target),
+            cx,
+        );
+        watchers.push(watch_edits(&target_table, cx));
         Self {
             stream_ix,
             stream_name: stream.name.clone().into(),
             mode: stream.mode(pipeline.defaults.as_ref()),
             primary_key: stream.primary_key.clone(),
             update_key: stream.update_key.clone(),
-            target_table: make_editor(
-                stream.target_table.as_deref().unwrap_or(""),
-                &stream.target_table(&pipeline.target),
-                cx,
-            ),
+            target_table,
             drafts,
             probing: true,
             probe_error: None,
             dirty: false,
-            discard_armed: false,
+            discard_armed: None,
+            _edit_watchers: watchers,
         }
     }
 
     /// Any edit: unsaved, and any pending "discard?" arm is cancelled.
     pub fn touch(&mut self) {
         self.dirty = true;
-        self.discard_armed = false;
+        self.discard_armed = None;
     }
 
     /// Incremental needs both halves of the cursor story — shown inline
@@ -162,6 +185,7 @@ impl MappingEditorState {
                     editor.set_placeholder_text("rename…", window, cx);
                     editor
                 });
+                self._edit_watchers.push(watch_edits(&rename, cx));
                 self.drafts.push(ColumnDraft {
                     name: column.name.clone().into(),
                     inferred: Some(column.source_dtype.clone().into()),
