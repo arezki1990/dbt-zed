@@ -54,6 +54,9 @@ pub struct ElRemoteModal {
     /// Wizard position (add mode only; edit is a single page).
     step: Step,
     mode: Mode,
+    /// A token generated here for an existing daemon: (variable, value).
+    /// Written to .env; the value is only ever copied, never displayed.
+    generated: Option<(String, String)>,
     delete_armed: bool,
     writing: bool,
     error: Option<SharedString>,
@@ -168,6 +171,7 @@ impl ElRemoteModal {
             ssh_profile,
             step: Step::Details,
             mode: Mode::Existing,
+            generated: None,
             delete_armed: false,
             writing: false,
             error,
@@ -253,6 +257,58 @@ impl ElRemoteModal {
         }
         self.error = None;
         true
+    }
+
+    /// Generates a token for an existing daemon: random 48 hex chars,
+    /// appended to the project's .env under the token variable (defaulting
+    /// to ZDBT_EL_TOKEN_<NAME>), then offered for copying to the server.
+    fn generate_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut var = var_name_of(&self.token_var.read(cx).text(cx));
+        if var.is_empty() {
+            var = self.generated_token_var(cx);
+        }
+        if !(var.len() <= 64 && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            return self.fail("the token variable must be a plain NAME (e.g. ZDBT_EL_TOKEN)".into(), cx);
+        }
+        let mut bytes = [0u8; 24];
+        if let Err(error) = std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
+        {
+            return self.fail(format!("could not generate a token: {error}"), cx);
+        }
+        let value: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let env_path = self.root.join(".env");
+        let write = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+            if existing.lines().any(|line| line.starts_with(&format!("{var}="))) {
+                return Err(std::io::Error::other(format!(
+                    "{var} already exists in .env — pick another variable name"
+                )));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&env_path)?;
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                writeln!(file)?;
+            }
+            writeln!(file, "{var}={value}")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = write {
+            return self.fail(format!("could not write .env: {error}"), cx);
+        }
+        self.error = None;
+        // Reflect the variable actually used in the field.
+        self.token_var.update(cx, |editor, cx| editor.set_text(var.clone(), window, cx));
+        self.generated = Some((var, value));
+        cx.notify();
     }
 
     /// The generated token variable for an SSH install.
@@ -580,7 +636,51 @@ impl Render for ElRemoteModal {
                     .child(field_row("name", self.name.clone()))
                     .child(field_row("url", self.url.clone()));
                 if editing || self.mode == Mode::Existing {
-                    fields = fields.child(field_row("token variable", self.token_var.clone()));
+                    fields = fields.child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().child(field_row("token variable", self.token_var.clone())))
+                            .child(
+                                Button::new("el-remote-gen-token", "Generate")
+                                    .label_size(LabelSize::Default)
+                                    .tooltip(ui::Tooltip::text(
+                                        "Make a random token, store it in this project's .env \
+                                         under the variable, and offer it for copying to the \
+                                         server",
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate_token(window, cx)
+                                    })),
+                            ),
+                    );
+                    if let Some((var, value)) = self.generated.clone() {
+                        // Update the field to the variable we wrote.
+                        fields = fields.child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Label::new(format!(
+                                        "Token written to .env as {var}. Put the same value \
+                                         in the server's /etc/zdbt-el-serve/env:"
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Success),
+                                )
+                                .child(
+                                    Button::new("el-remote-copy-token", "Copy token")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                value.clone(),
+                                            ));
+                                        })),
+                                ),
+                        );
+                    }
                 } else {
                     fields = fields.child(
                         h_flex()
