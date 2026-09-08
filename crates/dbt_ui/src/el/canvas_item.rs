@@ -60,6 +60,9 @@ pub struct ElPipelineCanvas {
     pending_reopen: Option<usize>,
     builder: Option<BuilderForm>,
     type_menu: Option<(Entity<ui::ContextMenu>, Point<Pixels>, gpui::Subscription)>,
+    /// While the sidebar is open: a run finishing in the console refreshes
+    /// the failure marks without reopening.
+    _run_observers: Vec<gpui::Subscription>,
     _load: Task<()>,
     _probe: Task<()>,
     _write: Task<()>,
@@ -127,6 +130,7 @@ impl ElPipelineCanvas {
             pending_reopen: None,
             builder: None,
             type_menu: None,
+            _run_observers: Vec::new(),
             _load: Task::ready(()),
             _probe: Task::ready(()),
             _write: Task::ready(()),
@@ -584,8 +588,101 @@ impl ElPipelineCanvas {
         }
         let pipeline = loaded.pipeline.clone();
         self.mapping = Some(MappingEditorState::open(&pipeline, stream_ix, window, cx));
+        self.watch_runs(cx);
+        self.refresh_run_failures(cx);
         self.kick_probe(pipeline, stream_ix, window, cx);
         cx.notify();
+    }
+
+    /// Observes the console (local run view and remote surface) so the
+    /// sidebar's failure marks follow the latest run.
+    fn watch_runs(&mut self, cx: &mut Context<Self>) {
+        self._run_observers.clear();
+        let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElRunsPanel>(cx))
+        else {
+            return;
+        };
+        let run_view = panel.read(cx).run_view();
+        self._run_observers.push(cx.observe(&run_view, |this, _, cx| {
+            this.refresh_run_failures(cx);
+        }));
+        self._run_observers.push(cx.observe(&panel, |this, _, cx| {
+            this.refresh_run_failures(cx);
+        }));
+    }
+
+    /// Recomputes the open sidebar's run failures from the console's last
+    /// run of this pipeline, keyed back to source column names through
+    /// the SAVED rename rules. Notifies only when the marks change.
+    fn refresh_run_failures(&mut self, cx: &mut Context<Self>) {
+        let (Some(loaded), Some(state)) = (&self.loaded, &self.mapping) else {
+            return;
+        };
+        let pipeline = loaded.pipeline.clone();
+        let stream_name = state.stream_name.to_string();
+        let failures = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElRunsPanel>(cx))
+            .map(|panel| {
+                panel
+                    .read(cx)
+                    .last_stream_failures(&pipeline.pipeline, &stream_name, cx)
+            })
+            .unwrap_or_default();
+        let rules = pipeline
+            .streams
+            .iter()
+            .find(|stream| stream.name == stream_name)
+            .map(|stream| stream.columns.as_slice())
+            .unwrap_or_default();
+        let mapped: std::collections::HashMap<String, el_engine::ColumnFailures> = failures
+            .into_iter()
+            .map(|failure| {
+                let source = rules
+                    .iter()
+                    .find(|rule| rule.rename.as_deref() == Some(failure.column.as_str()))
+                    .map(|rule| rule.name.clone())
+                    .unwrap_or_else(|| failure.column.clone());
+                (source, failure)
+            })
+            .collect();
+        let Some(state) = &mut self.mapping else { return };
+        let changed = state.run_failures.len() != mapped.len()
+            || state
+                .run_failures
+                .iter()
+                .any(|(name, failure)| mapped.get(name) != Some(failure));
+        if changed {
+            state.run_failures = mapped;
+            cx.notify();
+        }
+    }
+
+    /// Opens the last run's failing columns for the sidebar's stream in
+    /// the console grid — the same grid the run badge opens.
+    fn show_run_failures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.mapping else { return };
+        let mut failures: Vec<el_engine::ColumnFailures> =
+            state.run_failures.values().cloned().collect();
+        if failures.is_empty() {
+            return;
+        }
+        failures.sort_by(|a, b| a.column.cmp(&b.column));
+        let title = super::runs_panel::failures_title(&state.stream_name);
+        let (columns, rows) = super::runs_panel::failures_table(&failures);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
+                    return;
+                };
+                workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                panel.update(cx, |panel, cx| panel.show_preview(title, columns, rows, cx));
+            })
+            .ok();
     }
 
     pub(crate) fn mapping_mut(&mut self) -> Option<&mut MappingEditorState> {
@@ -628,6 +725,7 @@ impl ElPipelineCanvas {
         }
         self.mapping = None;
         self.type_menu = None;
+        self._run_observers.clear();
         cx.notify();
     }
 
@@ -757,20 +855,7 @@ impl ElPipelineCanvas {
                 Ok(preview) => {
                     let (columns, rows): (Vec<SharedString>, Vec<Vec<SharedString>>) =
                         if failures_only {
-                            (
-                                vec!["column".into(), "failed".into(), "sample values".into()],
-                                preview
-                                    .failures
-                                    .iter()
-                                    .map(|failure| {
-                                        vec![
-                                            failure.column.clone().into(),
-                                            failure.count.to_string().into(),
-                                            failure.samples.join(" · ").into(),
-                                        ]
-                                    })
-                                    .collect(),
-                            )
+                            super::runs_panel::failures_table(&preview.failures)
                         } else {
                             (
                                 preview
@@ -1029,6 +1114,7 @@ impl ElPipelineCanvas {
         for (draft_ix, draft) in state.drafts.iter().enumerate() {
             let include = draft.include;
             let strict = draft.strict;
+            let run_failure = state.run_failures.get(draft.name.as_ref());
             let row = h_flex()
                 .w_full()
                 .gap_1()
@@ -1066,7 +1152,16 @@ impl ElPipelineCanvas {
                     v_flex()
                         .w(px(120.))
                         .flex_shrink_0()
-                        .child(Label::new(draft.name.clone()).size(LabelSize::Small).truncate())
+                        .child(
+                            Label::new(draft.name.clone())
+                                .size(LabelSize::Small)
+                                .color(if run_failure.is_some() {
+                                    Color::Error
+                                } else {
+                                    Color::Default
+                                })
+                                .truncate(),
+                        )
                         .child(
                             Label::new(draft.inferred.clone().unwrap_or_else(|| "…".into()))
                                 .size(LabelSize::XSmall)
@@ -1111,7 +1206,24 @@ impl ElPipelineCanvas {
                             }
                             cx.notify();
                         })),
-                );
+                )
+                .children(run_failure.map(|failure| {
+                    let samples = if failure.samples.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — e.g. {}", failure.samples.join(" · "))
+                    };
+                    IconButton::new(("el-cast-fail", draft_ix), IconName::XCircle)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Error)
+                        .tooltip(ui::Tooltip::text(format!(
+                            "{} rows failed to cast in the last run{samples}",
+                            failure.count
+                        )))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_run_failures(window, cx)
+                        }))
+                }));
             rows = rows.child(row);
         }
 

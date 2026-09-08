@@ -8,6 +8,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use polars::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::spec::{ColumnSpec, StreamSpec};
 use crate::types::SnowflakeType;
@@ -28,12 +29,43 @@ struct PlannedColumn {
 }
 
 /// Per-column lax-cast failures in one chunk: count plus up to
-/// `sample_limit` offending source values (stringified).
-#[derive(Clone, Debug, PartialEq)]
+/// `sample_limit` offending source values (stringified, each capped at
+/// [`MAX_SAMPLE_CHARS`]). `column` is the TARGET name — renames apply.
+/// Serializable: it rides in run events between the daemon and the IDE.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColumnFailures {
     pub column: String,
     pub count: u64,
     pub samples: Vec<String>,
+}
+
+/// Bounded sample width keeps one pathological cell from bloating a run
+/// log or the failures grid.
+pub const MAX_SAMPLE_CHARS: usize = 200;
+
+impl ColumnFailures {
+    /// Folds one chunk's failures into a per-stream total: counts add up
+    /// per column, samples accumulate until `sample_cap` per column.
+    pub fn merge_into(into: &mut Vec<ColumnFailures>, chunk: Vec<ColumnFailures>, sample_cap: usize) {
+        for incoming in chunk {
+            match into.iter_mut().find(|existing| existing.column == incoming.column) {
+                Some(existing) => {
+                    existing.count += incoming.count;
+                    for sample in incoming.samples {
+                        if existing.samples.len() >= sample_cap {
+                            break;
+                        }
+                        existing.samples.push(sample);
+                    }
+                }
+                None => {
+                    let mut fresh = incoming;
+                    fresh.samples.truncate(sample_cap);
+                    into.push(fresh);
+                }
+            }
+        }
+    }
 }
 
 pub struct CastOutcome {
@@ -280,7 +312,16 @@ fn sample_failures(
         let is_null = dst.get(row).map(|v| v.is_null()).unwrap_or(true);
         if is_null && !was_null {
             if let Ok(value) = src.get(row) {
-                samples.push(value.to_string().trim_matches('"').to_owned());
+                let mut text = value.to_string().trim_matches('"').to_owned();
+                if text.len() > MAX_SAMPLE_CHARS {
+                    let mut cut = MAX_SAMPLE_CHARS;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    text.truncate(cut);
+                    text.push('…');
+                }
+                samples.push(text);
             }
         }
     }
@@ -398,6 +439,64 @@ mod tests {
             .expect("must fail")
             .to_string();
         assert!(error.contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn merge_into_sums_counts_and_caps_samples() {
+        let mut total = Vec::new();
+        ColumnFailures::merge_into(
+            &mut total,
+            vec![ColumnFailures {
+                column: "amount".into(),
+                count: 2,
+                samples: vec!["a".into(), "b".into()],
+            }],
+            3,
+        );
+        ColumnFailures::merge_into(
+            &mut total,
+            vec![
+                ColumnFailures {
+                    column: "amount".into(),
+                    count: 3,
+                    samples: vec!["c".into(), "d".into(), "e".into()],
+                },
+                ColumnFailures {
+                    column: "placed_at".into(),
+                    count: 1,
+                    samples: vec!["never".into()],
+                },
+            ],
+            3,
+        );
+        assert_eq!(
+            total,
+            vec![
+                ColumnFailures {
+                    column: "amount".into(),
+                    count: 5,
+                    samples: vec!["a".into(), "b".into(), "c".into()],
+                },
+                ColumnFailures {
+                    column: "placed_at".into(),
+                    count: 1,
+                    samples: vec!["never".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn samples_are_capped_in_length() {
+        let long = "x".repeat(MAX_SAMPLE_CHARS + 50);
+        let df = df!["amount" => [long.as_str(), "1.5"]].unwrap();
+        let stream = stream(vec![rule("amount", "FLOAT")], None);
+        let plan = CastPlan::build(&df.schema(), &stream).unwrap();
+        let outcome = plan.apply(df, 8).unwrap();
+        assert_eq!(outcome.failures.len(), 1);
+        let sample = &outcome.failures[0].samples[0];
+        assert!(sample.ends_with('…'), "{sample}");
+        assert_eq!(sample.chars().count(), MAX_SAMPLE_CHARS + 1);
     }
 
     #[test]

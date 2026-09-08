@@ -65,6 +65,7 @@ struct RunRecord {
     status: RunStatus,
     error: Option<String>,
     rows_written: u64,
+    cast_failures: u64,
     events: Vec<ProgressEvent>,
     cancel: CancelFlag,
 }
@@ -166,6 +167,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
             status: RunStatus::Running,
             error: None,
             rows_written: 0,
+            cast_failures: 0,
             events: Vec::new(),
             cancel: cancel.clone(),
         });
@@ -204,8 +206,14 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
         while let Some(event) = futures::executor::block_on(rx.next()) {
             let mut registry = consumer_state.registry.lock().unwrap();
             if let Some(run) = registry.runs.iter_mut().find(|run| run.id == run_id) {
-                if let ProgressEvent::StreamFinished { rows_written, .. } = &event {
+                if let ProgressEvent::StreamFinished {
+                    rows_written,
+                    cast_failures,
+                    ..
+                } = &event
+                {
                     run.rows_written += rows_written;
+                    run.cast_failures += cast_failures;
                 }
                 run.events.push(event);
             }
@@ -593,6 +601,9 @@ struct RunInfo {
     started_unix: u64,
     finished_unix: Option<u64>,
     rows_written: u64,
+    /// Lax casts that produced NULLs across the run — the per-column
+    /// detail lives in the StreamFinished events.
+    cast_failures: u64,
     error: Option<String>,
 }
 
@@ -611,6 +622,7 @@ fn run_info(run: &RunRecord) -> RunInfo {
         started_unix: unix_secs(run.started),
         finished_unix: run.finished.map(unix_secs),
         rows_written: run.rows_written,
+        cast_failures: run.cast_failures,
         error: run.error.clone(),
     }
 }
@@ -1094,6 +1106,9 @@ pub struct RemoteRun {
     #[serde(default)]
     pub finished_unix: Option<u64>,
     pub rows_written: u64,
+    /// Older daemons don't report it; 0 then reads as "none".
+    #[serde(default)]
+    pub cast_failures: u64,
     pub error: Option<String>,
 }
 

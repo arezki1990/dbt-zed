@@ -56,6 +56,10 @@ pub struct MappingEditorState {
     /// Which leave action is armed for "Discard changes?" — only that
     /// same action confirms it (Escape can't confirm a prev/next arm).
     pub discard_armed: Option<String>,
+    /// Columns that failed to cast in the last run of this stream, keyed
+    /// by SOURCE column name (runs report the target name; the canvas
+    /// maps it back through the saved rename rules).
+    pub run_failures: std::collections::HashMap<String, el_engine::ColumnFailures>,
     /// Typed edits (rename, target table) must dirty the draft too.
     _edit_watchers: Vec<Subscription>,
 }
@@ -138,6 +142,7 @@ impl MappingEditorState {
             probe_error: None,
             dirty: false,
             discard_armed: None,
+            run_failures: Default::default(),
             _edit_watchers: watchers,
         }
     }

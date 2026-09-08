@@ -21,6 +21,8 @@ pub struct StreamRow {
     pub rows_read: u64,
     pub rows_written: u64,
     pub cast_failures: u64,
+    /// Which columns failed, with samples — arrives with StreamFinished.
+    pub column_failures: Vec<el_engine::ColumnFailures>,
     pub error: Option<SharedString>,
     pub done: bool,
 }
@@ -59,6 +61,39 @@ impl ElRunView {
         self.run
             .as_ref()
             .is_some_and(|run| run.finished.is_none() && run.fatal.is_none())
+    }
+
+    /// The failing columns of `stream` in the current run of `pipeline`
+    /// (empty when the run is for another pipeline, or clean).
+    pub fn stream_failures(&self, pipeline: &str, stream: &str) -> Vec<el_engine::ColumnFailures> {
+        self.run
+            .as_ref()
+            .filter(|run| run.pipeline.as_ref() == pipeline)
+            .and_then(|run| run.streams.iter().find(|row| row.stream.as_ref() == stream))
+            .map(|row| row.column_failures.clone())
+            .unwrap_or_default()
+    }
+
+    /// Opens the failing-columns grid for stream `ix` in the console.
+    fn show_cast_failures(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.run.as_ref().and_then(|run| run.streams.get(ix)) else {
+            return;
+        };
+        if row.column_failures.is_empty() {
+            return;
+        }
+        let title = super::runs_panel::failures_title(&row.stream);
+        let (columns, rows) = super::runs_panel::failures_table(&row.column_failures);
+        // Leases Workspace then the panel; show_preview never reads this
+        // view back, so the chain stays single-ownership.
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<super::ElRunsPanel>(cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| panel.show_preview(title, columns, rows, cx));
+            })
+            .ok();
     }
 
     pub fn start_run(
@@ -311,6 +346,7 @@ impl ElRunView {
                 rows_read,
                 rows_written,
                 cast_failures,
+                column_failures,
             } => {
                 if let Some(row) = run.streams.iter_mut().find(|row| row.stream.as_ref() == stream)
                 {
@@ -318,6 +354,7 @@ impl ElRunView {
                     row.rows_read = rows_read;
                     row.rows_written = rows_written;
                     row.cast_failures = cast_failures;
+                    row.column_failures = column_failures;
                     row.done = true;
                 }
             }
@@ -472,11 +509,28 @@ impl Render for ElRunView {
                     .color(Color::Muted),
                 );
             if row.cast_failures > 0 {
-                line = line.child(
-                    Label::new(format!("{} cast failures", row.cast_failures))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                );
+                let badge = format!("{} cast failures", row.cast_failures);
+                if row.column_failures.is_empty() {
+                    // Count only, until the stream finishes and reports
+                    // which columns failed.
+                    line = line.child(
+                        Label::new(badge)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    );
+                } else {
+                    line = line.child(
+                        Button::new(("el-run-casts", ix), badge)
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .tooltip(Tooltip::text(
+                                "Show the failing columns and sample values",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_cast_failures(ix, cx)
+                            })),
+                    );
+                }
             }
             if let Some(error) = &row.error {
                 line = line.child(
@@ -489,7 +543,6 @@ impl Render for ElRunView {
                 );
             }
             body = body.child(line);
-            let _ = ix;
         }
         let _ = &self.workspace;
         body.into_any_element()

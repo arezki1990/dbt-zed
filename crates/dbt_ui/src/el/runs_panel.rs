@@ -89,6 +89,105 @@ pub struct PreviewTable {
     pub rows: std::sync::Arc<Vec<Vec<SharedString>>>,
 }
 
+/// The failing-columns grid: one row per column with its count and
+/// sample values. Shared by the mapping preview and the run badges so
+/// a failure looks the same wherever it is opened.
+pub(crate) fn failures_table(
+    failures: &[el_engine::ColumnFailures],
+) -> (Vec<SharedString>, Vec<Vec<SharedString>>) {
+    (
+        vec!["column".into(), "failed".into(), "sample values".into()],
+        failures
+            .iter()
+            .map(|failure| {
+                vec![
+                    failure.column.clone().into(),
+                    failure.count.to_string().into(),
+                    failure.samples.join(" · ").into(),
+                ]
+            })
+            .collect(),
+    )
+}
+
+/// Title of the failing-columns grid for `stream` — the same name from
+/// the mapping sidebar's Failed casts through both run badges.
+pub(crate) fn failures_title(stream: &str) -> SharedString {
+    format!("{stream} · failed casts").into()
+}
+
+/// One remote stream's state, folded from the run's event log.
+#[derive(Default)]
+pub(crate) struct StreamAgg {
+    pub(crate) phase: Option<String>,
+    pub(crate) read: u64,
+    pub(crate) written: u64,
+    pub(crate) casts: u64,
+    pub(crate) failures: Vec<el_engine::ColumnFailures>,
+    pub(crate) error: Option<String>,
+    pub(crate) done: bool,
+}
+
+/// Replays a run's events into per-stream rows, in the order the run
+/// announced them.
+pub(crate) fn fold_stream_events(
+    events: &[el_engine::ProgressEvent],
+) -> (Vec<String>, std::collections::HashMap<String, StreamAgg>) {
+    use el_engine::ProgressEvent as E;
+    let mut order: Vec<String> = Vec::new();
+    let mut agg: std::collections::HashMap<String, StreamAgg> = Default::default();
+    for event in events {
+        match event {
+            E::RunStarted { streams, .. } => {
+                for stream in streams {
+                    if !order.contains(stream) {
+                        order.push(stream.clone());
+                        agg.entry(stream.clone()).or_default();
+                    }
+                }
+            }
+            E::StreamStarted { stream } => {
+                agg.entry(stream.clone()).or_default().phase = Some("connect".to_owned());
+            }
+            E::Chunk {
+                stream,
+                phase,
+                rows_read,
+                rows_written,
+                cast_failures,
+            } => {
+                let entry = agg.entry(stream.clone()).or_default();
+                entry.phase = Some(format!("{phase:?}").to_lowercase());
+                entry.read = *rows_read;
+                entry.written = *rows_written;
+                entry.casts = *cast_failures;
+            }
+            E::StreamFinished {
+                stream,
+                rows_read,
+                rows_written,
+                cast_failures,
+                column_failures,
+            } => {
+                let entry = agg.entry(stream.clone()).or_default();
+                entry.phase = None;
+                entry.read = *rows_read;
+                entry.written = *rows_written;
+                entry.casts = *cast_failures;
+                entry.failures = column_failures.clone();
+                entry.done = true;
+            }
+            E::StreamFailed { stream, error } => {
+                let entry = agg.entry(stream.clone()).or_default();
+                entry.phase = None;
+                entry.error = Some(error.clone());
+            }
+            E::RunFinished { .. } => {}
+        }
+    }
+    (order, agg)
+}
+
 impl ElRunsPanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -187,6 +286,35 @@ impl ElRunsPanel {
 
     pub fn run_view(&self) -> Entity<ElRunView> {
         self.run_view.clone()
+    }
+
+    /// The last run's failing columns for `stream` of `pipeline`: the
+    /// local run first, else the remote run whose detail is open. Reads
+    /// only — safe from a canvas that holds no workspace lease.
+    pub fn last_stream_failures(
+        &self,
+        pipeline: &str,
+        stream: &str,
+        cx: &App,
+    ) -> Vec<el_engine::ColumnFailures> {
+        let local = self.run_view.read(cx).stream_failures(pipeline, stream);
+        if !local.is_empty() {
+            return local;
+        }
+        let Some(run_id) = self.remote_run_detail else {
+            return Vec::new();
+        };
+        let same_pipeline = self
+            .remote_runs
+            .iter()
+            .any(|run| run.id == run_id && run.pipeline == pipeline);
+        if !same_pipeline {
+            return Vec::new();
+        }
+        let (_, mut agg) = fold_stream_events(&self.remote_run_events);
+        agg.remove(stream)
+            .map(|entry| entry.failures)
+            .unwrap_or_default()
     }
 
     pub fn show_preview(
@@ -1173,66 +1301,7 @@ impl ElRunsPanel {
             }));
 
         // Fold the event log into per-stream rows.
-        #[derive(Default)]
-        struct StreamAgg {
-            phase: Option<String>,
-            read: u64,
-            written: u64,
-            casts: u64,
-            error: Option<String>,
-            done: bool,
-        }
-        let mut order: Vec<String> = Vec::new();
-        let mut agg: std::collections::HashMap<String, StreamAgg> = Default::default();
-        for event in &self.remote_run_events {
-            use el_engine::ProgressEvent as E;
-            match event {
-                E::RunStarted { streams, .. } => {
-                    for stream in streams {
-                        if !order.contains(stream) {
-                            order.push(stream.clone());
-                            agg.entry(stream.clone()).or_default();
-                        }
-                    }
-                }
-                E::StreamStarted { stream } => {
-                    agg.entry(stream.clone()).or_default().phase =
-                        Some("connect".to_owned());
-                }
-                E::Chunk {
-                    stream,
-                    phase,
-                    rows_read,
-                    rows_written,
-                    cast_failures,
-                } => {
-                    let entry = agg.entry(stream.clone()).or_default();
-                    entry.phase = Some(format!("{phase:?}").to_lowercase());
-                    entry.read = *rows_read;
-                    entry.written = *rows_written;
-                    entry.casts = *cast_failures;
-                }
-                E::StreamFinished {
-                    stream,
-                    rows_read,
-                    rows_written,
-                    cast_failures,
-                } => {
-                    let entry = agg.entry(stream.clone()).or_default();
-                    entry.phase = None;
-                    entry.read = *rows_read;
-                    entry.written = *rows_written;
-                    entry.casts = *cast_failures;
-                    entry.done = true;
-                }
-                E::StreamFailed { stream, error } => {
-                    let entry = agg.entry(stream.clone()).or_default();
-                    entry.phase = None;
-                    entry.error = Some(error.clone());
-                }
-                E::RunFinished { .. } => {}
-            }
-        }
+        let (order, agg) = fold_stream_events(&self.remote_run_events);
 
         let head = |width: f32, text: &'static str| {
             div().w(px(width)).flex_shrink_0().child(
@@ -1271,18 +1340,63 @@ impl ElRunsPanel {
         };
         for (ix, stream) in order.iter().enumerate() {
             let entry = agg.get(stream);
-            let (phase, read, written, casts, error, done) = entry
+            let (phase, read, written, casts, failures, error, done) = entry
                 .map(|entry| {
                     (
                         entry.phase.clone(),
                         entry.read,
                         entry.written,
                         entry.casts,
+                        entry.failures.clone(),
                         entry.error.clone(),
                         entry.done,
                     )
                 })
-                .unwrap_or((None, 0, 0, 0, None, false));
+                .unwrap_or((None, 0, 0, 0, Vec::new(), None, false));
+            // The count is a badge that opens the failing columns; an
+            // older daemon sends the count alone, which stays a plain cell.
+            let casts_cell: gpui::AnyElement = if casts > 0 && !failures.is_empty() {
+                let stream_name = stream.clone();
+                div()
+                    .w(px(80.))
+                    .flex_shrink_0()
+                    .child(
+                        Button::new(("el-remote-casts", ix), casts.to_string())
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .tooltip(ui::Tooltip::text(
+                                "Show the failing columns and sample values",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (columns, rows) = failures_table(&failures);
+                                this.show_preview(
+                                    failures_title(&stream_name),
+                                    columns,
+                                    rows,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .into_any_element()
+            } else if casts > 0 {
+                div()
+                    .id(("el-remote-casts-count", ix))
+                    .w(px(80.))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .tooltip(ui::Tooltip::text(
+                        "This server doesn't report failing columns — update the daemon to see them",
+                    ))
+                    .child(
+                        Label::new(casts.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            } else {
+                cell(80., casts.to_string(), Color::Muted).into_any_element()
+            };
             let (status_text, status_color) = match (&error, done, &phase) {
                 (Some(error), _, _) => (error.clone(), Color::Error),
                 (None, true, _) => ("done".to_owned(), Color::Success),
@@ -1306,11 +1420,7 @@ impl ElRunsPanel {
                     ))
                     .child(cell(90., read.to_string(), Color::Muted))
                     .child(cell(90., written.to_string(), Color::Default))
-                    .child(cell(
-                        80.,
-                        casts.to_string(),
-                        if casts > 0 { Color::Warning } else { Color::Muted },
-                    ))
+                    .child(casts_cell)
                     .child(
                         Label::new(status_text)
                             .size(LabelSize::XSmall)
@@ -1358,6 +1468,7 @@ impl ElRunsPanel {
             .child(head(80., "started"))
             .child(head(64., "duration"))
             .child(head(70., "rows"))
+            .child(head(64., "cast fails"))
             .child(head(50., "attempt"))
             .child(
                 Label::new("error")
@@ -1437,6 +1548,15 @@ impl ElRunsPanel {
                             run.rows_written.to_string()
                         },
                         Color::Default,
+                    ))
+                    .child(cell(
+                        64.,
+                        if run.cast_failures == 0 {
+                            "—".to_owned()
+                        } else {
+                            run.cast_failures.to_string()
+                        },
+                        if run.cast_failures == 0 { Color::Muted } else { Color::Warning },
                     ))
                     .child(cell(
                         50.,

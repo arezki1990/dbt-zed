@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::channel::mpsc::UnboundedSender;
 
-use crate::cast::CastPlan;
+use crate::cast::{CastPlan, ColumnFailures};
 use crate::connectors::SourceContext;
 use crate::env::EnvMap;
 use crate::load::adbc_sidecar::{AdbcSidecarLoader, SidecarConfig};
@@ -36,6 +36,20 @@ pub struct RunReport {
     pub streams_failed: usize,
     pub rows_written: u64,
 }
+
+/// What one committed stream produced.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct StreamOutcome {
+    rows_read: u64,
+    rows_written: u64,
+    cast_failures: u64,
+    /// Per-column lax failures with samples — the count above, explained.
+    column_failures: Vec<ColumnFailures>,
+}
+
+/// Samples kept per failing column over a whole stream: enough to see the
+/// shape of the bad data, small enough to ride in every run record.
+const RUN_SAMPLE_CAP: usize = 8;
 
 /// Runs the whole pipeline, blocking. Call on a background thread; watch
 /// `progress` for live state and `cancel` to stop between chunks.
@@ -123,7 +137,12 @@ pub fn run_pipeline(
             &emit,
             cancel,
         ) {
-            Ok((rows_read, rows_written, cast_failures)) => {
+            Ok(StreamOutcome {
+                rows_read,
+                rows_written,
+                cast_failures,
+                column_failures,
+            }) => {
                 report.streams_ok += 1;
                 report.rows_written += rows_written;
                 let _ = state.record_run(
@@ -138,6 +157,7 @@ pub fn run_pipeline(
                     rows_read,
                     rows_written,
                     cast_failures,
+                    column_failures,
                 });
             }
             Err(error) => {
@@ -243,7 +263,7 @@ fn run_stream(
     state: &crate::state::StateStore,
     emit: &dyn Fn(ProgressEvent),
     cancel: &CancelFlag,
-) -> Result<(u64, u64, u64)> {
+) -> Result<StreamOutcome> {
     let mode = stream.mode(pipeline.defaults.as_ref());
     // The incremental cursor from the last successful commit. Stream name
     // is the cursor's identity: rename the stream, reset the cursor.
@@ -302,6 +322,7 @@ fn run_stream(
     let mut rows_read = 0u64;
     let mut rows_written = 0u64;
     let mut cast_failures = 0u64;
+    let mut column_failures: Vec<ColumnFailures> = Vec::new();
     let result = (|| -> Result<()> {
         loop {
             if cancel.is_cancelled() {
@@ -318,12 +339,13 @@ fn run_stream(
                 rows_written,
                 cast_failures,
             });
-            let outcome = plan.apply(chunk, 8)?;
+            let outcome = plan.apply(chunk, RUN_SAMPLE_CAP)?;
             cast_failures += outcome
                 .failures
                 .iter()
                 .map(|failure| failure.count)
                 .sum::<u64>();
+            ColumnFailures::merge_into(&mut column_failures, outcome.failures, RUN_SAMPLE_CAP);
             let mut shaped = outcome.df;
             emit(ProgressEvent::Chunk {
                 stream: stream.name.clone(),
@@ -371,7 +393,12 @@ fn run_stream(
                             );
                         }
                     }
-                    Ok((rows_read, commit.rows_written, cast_failures))
+                    Ok(StreamOutcome {
+                        rows_read,
+                        rows_written: commit.rows_written,
+                        cast_failures,
+                        column_failures,
+                    })
                 }
                 Err(error) => {
                     // A failed commit must not leak the staging table.
@@ -460,7 +487,7 @@ streams:
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ZDBT_EL_STATE_DIR", state_dir.path()) };
         let state = crate::state::StateStore::open(dir.path(), None).unwrap();
-        let (rows_read, rows_written, cast_failures) = run_stream(
+        let outcome = run_stream(
             &ctx,
             &pipeline,
             &pipeline.streams[0],
@@ -473,9 +500,18 @@ streams:
         .unwrap();
         unsafe { std::env::remove_var("ZDBT_EL_STATE_DIR") };
 
-        assert_eq!(rows_read, 3);
-        assert_eq!(rows_written, 3);
-        assert_eq!(cast_failures, 1, "the 'oops' cell");
+        assert_eq!(outcome.rows_read, 3);
+        assert_eq!(outcome.rows_written, 3);
+        assert_eq!(outcome.cast_failures, 1, "the 'oops' cell");
+        // The failure is explained, not just counted.
+        assert_eq!(
+            outcome.column_failures,
+            vec![ColumnFailures {
+                column: "amount".into(),
+                count: 1,
+                samples: vec!["oops".into()],
+            }]
+        );
         let sql = loader.statements.join("\n");
         assert!(sql.contains("CREATE OR REPLACE TRANSIENT TABLE"), "{sql}");
         assert!(sql.contains("INGEST 2"), "chunked: {sql}");
