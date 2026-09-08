@@ -266,3 +266,86 @@ profiles:
     assert!(rewritten.contains("profiles:"), "{rewritten}");
     assert!(rewritten.contains("default_profile: dev"), "{rewritten}");
 }
+
+/// Renaming re-keys the stream's canvas entries in place (order and
+/// unrelated keys kept), refuses empty and duplicate names, and the
+/// canonical form stays a fixed point.
+#[test]
+fn rename_stream_rekeys_canvas_and_rejects_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pipeline = spec::load_pipeline(&write(dir.path(), "p.yml", PIPELINE)).unwrap();
+    // Pin the other two keys of the row so every prefix is exercised.
+    let canvas = pipeline.canvas.as_mut().unwrap();
+    canvas.nodes.insert("map:customers".into(), spec::NodePos { x: 1., y: 2. });
+    canvas.nodes.insert("target:customers".into(), spec::NodePos { x: 3., y: 4. });
+
+    assert_eq!(pipeline.rename_stream("customers", "  "), Err("stream name can't be empty".into()));
+    assert_eq!(
+        pipeline.rename_stream("customers", "events"),
+        Err("events already exists in this pipeline".into())
+    );
+    assert!(pipeline.rename_stream("ghost", "x").unwrap_err().contains("gone"));
+
+    pipeline.rename_stream("customers", " clients ").unwrap();
+    assert_eq!(pipeline.streams[0].name, "clients");
+    // target_table is untouched: the derived name follows the stream.
+    assert_eq!(pipeline.streams[0].target_table(&pipeline.target), "CLIENTS");
+    let keys: Vec<&str> = pipeline.canvas.as_ref().unwrap().nodes.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["stream:clients", "cast", "map:clients", "target:clients"]);
+    assert_eq!(pipeline.canvas.as_ref().unwrap().nodes["stream:clients"].x, 40.0);
+    assert_eq!(pipeline.canvas.as_ref().unwrap().nodes["target:clients"].y, 4.0);
+
+    let once = spec::to_canonical_yaml(&pipeline);
+    let reloaded = spec::load_pipeline(&write(dir.path(), "p2.yml", &once)).unwrap();
+    assert_eq!(once, spec::to_canonical_yaml(&reloaded));
+}
+
+#[test]
+fn remove_stream_drops_canvas_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pipeline = spec::load_pipeline(&write(dir.path(), "p.yml", PIPELINE)).unwrap();
+    assert!(!pipeline.remove_stream("ghost"));
+    assert!(pipeline.remove_stream("customers"));
+    assert_eq!(pipeline.streams.len(), 1);
+    assert_eq!(pipeline.streams[0].name, "events");
+    let keys: Vec<&str> = pipeline.canvas.as_ref().unwrap().nodes.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["cast"]);
+
+    // A canvas holding only that stream's keys goes away entirely.
+    let mut pipeline = spec::load_pipeline(&write(dir.path(), "p3.yml", PIPELINE)).unwrap();
+    pipeline.canvas.as_mut().unwrap().nodes.shift_remove("cast");
+    assert!(pipeline.remove_stream("customers"));
+    assert!(pipeline.canvas.is_none());
+    assert!(!spec::to_canonical_yaml(&pipeline).contains("canvas:"));
+}
+
+#[test]
+fn move_stream_swaps_and_clamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pipeline = spec::load_pipeline(&write(dir.path(), "p.yml", PIPELINE)).unwrap();
+    let names = |pipeline: &spec::Pipeline| -> Vec<String> {
+        pipeline.streams.iter().map(|stream| stream.name.clone()).collect()
+    };
+    assert!(!pipeline.move_stream("customers", true));
+    assert!(!pipeline.move_stream("ghost", false));
+    assert_eq!(names(&pipeline), ["customers", "events"]);
+
+    // Only customers is pinned: the pin stays put.
+    assert!(pipeline.move_stream("customers", false));
+    assert_eq!(names(&pipeline), ["events", "customers"]);
+    assert_eq!(pipeline.canvas.as_ref().unwrap().nodes["stream:customers"].y, 120.0);
+    assert!(!pipeline.move_stream("customers", false));
+
+    // Both pinned: the pins follow the swap.
+    pipeline
+        .canvas
+        .as_mut()
+        .unwrap()
+        .nodes
+        .insert("stream:events".into(), spec::NodePos { x: 40., y: 40. });
+    assert!(pipeline.move_stream("customers", true));
+    assert_eq!(names(&pipeline), ["customers", "events"]);
+    let nodes = &pipeline.canvas.as_ref().unwrap().nodes;
+    assert_eq!(nodes["stream:customers"].y, 40.0);
+    assert_eq!(nodes["stream:events"].y, 120.0);
+}

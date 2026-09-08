@@ -500,6 +500,99 @@ impl StreamSpec {
     }
 }
 
+/// The `canvas.nodes` key prefixes the canvas writes per stream (see
+/// `NodeId::spec_key` in the UI layout): one row = stream, map, target.
+const CANVAS_NODE_PREFIXES: [&str; 3] = ["stream:", "map:", "target:"];
+
+impl Pipeline {
+    /// Renames a stream and re-keys its canvas positions, keeping their
+    /// order. The name is also the incremental cursor's identity, so the
+    /// saved watermark stays under the old name and the next run
+    /// re-extracts; a derived target table (`{stream}` template) follows
+    /// the new name — `target_table` is left alone either way.
+    pub fn rename_stream(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let to = to.trim();
+        if to.is_empty() {
+            return Err("stream name can't be empty".to_owned());
+        }
+        if to != from && self.streams.iter().any(|stream| stream.name == to) {
+            return Err(format!("{to} already exists in this pipeline"));
+        }
+        let Some(stream) = self.streams.iter_mut().find(|stream| stream.name == from) else {
+            return Err(format!("stream {from} is gone from the spec"));
+        };
+        stream.name = to.to_owned();
+        if let Some(canvas) = &mut self.canvas {
+            let nodes = std::mem::take(&mut canvas.nodes);
+            canvas.nodes = nodes
+                .into_iter()
+                .map(|(key, pos)| {
+                    let rekeyed = CANVAS_NODE_PREFIXES
+                        .iter()
+                        .find(|prefix| key == format!("{prefix}{from}"))
+                        .map(|prefix| format!("{prefix}{to}"));
+                    (rekeyed.unwrap_or(key), pos)
+                })
+                .collect();
+        }
+        Ok(())
+    }
+
+    /// Drops a stream and its canvas positions; an emptied canvas block
+    /// goes away rather than serializing as `nodes: {}`. Returns false
+    /// when no stream has that name.
+    pub fn remove_stream(&mut self, name: &str) -> bool {
+        let before = self.streams.len();
+        self.streams.retain(|stream| stream.name != name);
+        if self.streams.len() == before {
+            return false;
+        }
+        if let Some(canvas) = &mut self.canvas {
+            for prefix in CANVAS_NODE_PREFIXES {
+                canvas.nodes.shift_remove(&format!("{prefix}{name}"));
+            }
+            if canvas.nodes.is_empty() {
+                self.canvas = None;
+            }
+        }
+        true
+    }
+
+    /// Swaps a stream with its neighbour (`up` = towards the top of the
+    /// list). Streams are laid out in list order, so this reorders the
+    /// canvas too; pinned positions swap only when BOTH neighbours are
+    /// pinned, otherwise a lone pin keeps its spot. Returns false at the
+    /// boundary or when no stream has that name.
+    pub fn move_stream(&mut self, name: &str, up: bool) -> bool {
+        let Some(ix) = self.streams.iter().position(|stream| stream.name == name) else {
+            return false;
+        };
+        let other = if up {
+            ix.checked_sub(1)
+        } else {
+            (ix + 1 < self.streams.len()).then_some(ix + 1)
+        };
+        let Some(other) = other else { return false };
+        let other_name = self.streams[other].name.clone();
+        self.streams.swap(ix, other);
+        if let Some(canvas) = &mut self.canvas {
+            for prefix in CANVAS_NODE_PREFIXES {
+                let mine = format!("{prefix}{name}");
+                let theirs = format!("{prefix}{other_name}");
+                if let (Some(a), Some(b)) = (
+                    canvas.nodes.get(&mine).copied(),
+                    canvas.nodes.get(&theirs).copied(),
+                ) {
+                    // insert on an existing key keeps its position.
+                    canvas.nodes.insert(mine, b);
+                    canvas.nodes.insert(theirs, a);
+                }
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum SourceObject {

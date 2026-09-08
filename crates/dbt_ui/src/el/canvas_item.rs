@@ -1,7 +1,8 @@
 //! The pipeline canvas: a center-pane Item rendering one `el/pipelines/*.yml`
-//! as source → Cast & Map → Snowflake graph. U1 is read-only: pan, zoom,
-//! session-local node drags, live refresh when the file changes on disk —
-//! the mapping editor and YAML writes arrive next.
+//! as source → Cast & Map → Snowflake graph. Pan, zoom, session-local node
+//! drags, live refresh when the file changes on disk; the mapping sidebar
+//! and the node's right-click menu (rename, remove, reorder a stream)
+//! write the YAML back through the project's buffer.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -304,6 +305,23 @@ impl ElPipelineCanvas {
                     this.drag = Some(CanvasDrag::Node(ix, event.position));
                     this.drag_moved = false;
                     cx.notify();
+                }),
+            )
+            // Every node of a row belongs to one stream: the menu is the
+            // stream's. Right-click never arms a drag.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let stream_ix = match this.layout.nodes.get(ix).map(|node| &node.kind) {
+                        Some(
+                            ElNodeKind::Stream { stream_ix }
+                            | ElNodeKind::Map { stream_ix }
+                            | ElNodeKind::TargetTable { stream_ix },
+                        ) => *stream_ix,
+                        None => return,
+                    };
+                    this.deploy_stream_menu(stream_ix, event.position, window, cx);
                 }),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1023,12 +1041,225 @@ impl ElPipelineCanvas {
         self.write_pipeline(pipeline, window, cx);
     }
 
+    /// The right-click menu on a stream's row: rename, remove, reorder.
+    /// Handlers capture the stream NAME — the spec can reload between
+    /// opening the menu and choosing, and every lookup here is by name.
+    fn deploy_stream_menu(
+        &mut self,
+        stream_ix: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = &self.loaded else { return };
+        let Some(stream) = loaded.pipeline.streams.get(stream_ix) else { return };
+        let name = stream.name.clone();
+        let last = loaded.pipeline.streams.len().saturating_sub(1);
+        let entity = cx.entity().downgrade();
+        let menu = ui::ContextMenu::build(window, cx, |menu, _, _| {
+            menu.header(name.clone())
+                .entry("Rename stream…", None, {
+                    let (entity, name) = (entity.clone(), name.clone());
+                    move |window, cx| {
+                        entity
+                            .update(cx, |this, cx| {
+                                this.open_rename_stream(name.clone(), window, cx)
+                            })
+                            .ok();
+                    }
+                })
+                .entry("Remove stream…", None, {
+                    let (entity, name) = (entity.clone(), name.clone());
+                    move |window, cx| {
+                        entity
+                            .update(cx, |this, cx| this.remove_stream(name.clone(), window, cx))
+                            .ok();
+                    }
+                })
+                .separator()
+                .item(
+                    ui::ContextMenuEntry::new("Move up")
+                        .disabled(stream_ix == 0)
+                        .handler({
+                            let (entity, name) = (entity.clone(), name.clone());
+                            move |window, cx| {
+                                entity
+                                    .update(cx, |this, cx| {
+                                        this.move_stream(name.clone(), true, window, cx)
+                                    })
+                                    .ok();
+                            }
+                        }),
+                )
+                .item(
+                    ui::ContextMenuEntry::new("Move down")
+                        .disabled(stream_ix == last)
+                        .handler({
+                            let (entity, name) = (entity.clone(), name.clone());
+                            move |window, cx| {
+                                entity
+                                    .update(cx, |this, cx| {
+                                        this.move_stream(name.clone(), false, window, cx)
+                                    })
+                                    .ok();
+                            }
+                        }),
+                )
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.type_menu.take();
+            cx.notify();
+        });
+        self.type_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// A dirty sidebar on `name` would strand its draft under the old
+    /// name (rename) or leave an Apply that fails (remove): refuse.
+    fn sidebar_blocks(&self, name: &str, cx: &mut Context<Self>) -> bool {
+        let blocked = self
+            .mapping
+            .as_ref()
+            .is_some_and(|state| state.dirty && state.stream_name.as_ref() == name);
+        if blocked {
+            self.toast_error(
+                format!("Apply or discard the mapping changes for {name} first."),
+                cx,
+            );
+        }
+        blocked
+    }
+
+    fn spec_file_name(&self) -> String {
+        self.spec_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("the pipeline")
+            .to_owned()
+    }
+
+    fn open_rename_stream(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_blocks(&name, cx) {
+            return;
+        }
+        let Some(loaded) = &self.loaded else { return };
+        let pipeline = loaded.pipeline.clone();
+        let canvas = cx.entity().downgrade();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                super::rename_stream_modal::ElRenameStreamModal::deploy(
+                    workspace, canvas, pipeline, name, window, cx,
+                );
+            })
+            .ok();
+    }
+
+    /// Called back by the rename popup. The engine re-keys the canvas
+    /// positions; a clean sidebar on that stream follows the new name
+    /// once the file holds it.
+    pub(crate) fn rename_stream(
+        &mut self,
+        from: String,
+        to: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = &self.loaded else { return };
+        let mut pipeline = (*loaded.pipeline).clone();
+        if let Err(error) = pipeline.rename_stream(&from, &to) {
+            self.toast_error(format!("Rename failed: {error}."), cx);
+            return;
+        }
+        let file_name = self.spec_file_name();
+        self.write_pipeline_then(pipeline, window, cx, move |this, cx| {
+            if let Some(state) = &mut this.mapping {
+                if state.stream_name.as_ref() == from {
+                    state.stream_name = to.clone().into();
+                }
+            }
+            this.toast(format!("Renamed {from} to {to} in {file_name}."), cx);
+        });
+    }
+
+    /// Confirms with a native prompt, then drops the stream from the
+    /// YAML. The warehouse table is never touched.
+    fn remove_stream(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_blocks(&name, cx) {
+            return;
+        }
+        let Some(loaded) = &self.loaded else { return };
+        let Some(stream) = loaded.pipeline.streams.iter().find(|stream| stream.name == name)
+        else {
+            return;
+        };
+        let table = stream.target_table(&loaded.pipeline.target);
+        let file_name = self.spec_file_name();
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Remove stream {name}?"),
+            Some(&format!(
+                "It leaves {file_name}; the warehouse table {table} is not dropped."
+            )),
+            &["Remove stream", "Cancel"],
+            cx,
+        );
+        // Detached like Zed's own prompts: the write below owns `_write`.
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                let Some(loaded) = &this.loaded else { return };
+                let mut pipeline = (*loaded.pipeline).clone();
+                if !pipeline.remove_stream(&name) {
+                    return;
+                }
+                this.write_pipeline_then(pipeline, window, cx, move |this, cx| {
+                    if this
+                        .mapping
+                        .as_ref()
+                        .is_some_and(|state| state.stream_name.as_ref() == name)
+                    {
+                        this.mapping = None;
+                        this._run_observers.clear();
+                    }
+                    this.toast(format!("Removed {name} from {file_name}."), cx);
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Swaps the stream with its neighbour in the YAML; the canvas
+    /// re-reads and the row moves. No toast: the move is the feedback.
+    fn move_stream(&mut self, name: String, up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else { return };
+        let mut pipeline = (*loaded.pipeline).clone();
+        if pipeline.move_stream(&name, up) {
+            self.write_pipeline(pipeline, window, cx);
+        }
+    }
+
     /// Buffer-routed write of an updated pipeline, then reload.
     fn write_pipeline(
         &mut self,
         pipeline: Pipeline,
         window: &mut Window,
         cx: &mut Context<Self>,
+    ) {
+        self.write_pipeline_then(pipeline, window, cx, |_, _| {});
+    }
+
+    /// Same, running `then` once the file really holds the edits and
+    /// before the reload — a refused write (dirty buffer) skips it.
+    fn write_pipeline_then(
+        &mut self,
+        pipeline: Pipeline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
     ) {
         let workspace = self.workspace.clone();
         let project = self.project.clone();
@@ -1037,7 +1268,10 @@ impl ElPipelineCanvas {
             let result =
                 super::spec_io::write_spec(workspace, project, spec_path, pipeline, cx).await;
             this.update(cx, |this, cx| match result {
-                Ok(()) => this.reload(cx),
+                Ok(()) => {
+                    then(this, cx);
+                    this.reload(cx);
+                }
                 Err(error) => this.toast_error(format!("Write failed: {error:#}"), cx),
             })
             .ok();

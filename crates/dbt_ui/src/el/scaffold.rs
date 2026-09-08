@@ -33,7 +33,7 @@ connections:
 
 const PIPELINE_EXAMPLE: &str = r#"# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json
 # An example pipeline: edit it in YAML or on the canvas — both write this
-# file. Preview streams before ever loading: right-click a node.
+# file. Click a node to preview it; right-click to rename, remove, or reorder.
 version: 1
 pipeline: example
 source: files

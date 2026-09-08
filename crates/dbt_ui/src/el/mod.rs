@@ -7,6 +7,7 @@ pub mod cli;
 pub mod connection_modal;
 pub mod deploy_modal;
 pub mod remote_modal;
+pub mod rename_stream_modal;
 pub mod layout;
 pub mod mapping_editor;
 pub mod panel;
