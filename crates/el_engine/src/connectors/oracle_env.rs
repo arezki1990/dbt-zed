@@ -6,6 +6,7 @@
 //! the worker side (which reads them back) share it whether or not the
 //! `oracle` feature is on.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, Result};
@@ -20,6 +21,17 @@ pub const ENV_CONNECT: &str = "ZDBT_EL_SRC_ORACLE_CONNECT";
 /// `sqlnet.ora` and (for Autonomous Database) the wallet. ODPI-C reads it
 /// from the process environment, so we set it on the child directly.
 pub const ENV_TNS_ADMIN: &str = "TNS_ADMIN";
+/// The directory holding Oracle Instant Client. The worker hands it to
+/// ODPI-C explicitly instead of trusting the loader's search path: macOS
+/// 12+ dropped `~/lib` from the fallback path, and a hardened runtime
+/// strips `DYLD_*` / `LD_*` from the children of a signed app. Set it in
+/// the process environment or in the project's `.env`.
+pub const ENV_CLIENT_DIR: &str = "ZDBT_EL_ORACLE_CLIENT_DIR";
+/// Opt-in to connecting through the macOS Instant Client. Oracle's only
+/// Apple Silicon build (23.3) crashes inside its own crypto library at
+/// connect time (Oracle bug 36790189), so the worker refuses on that
+/// platform unless this is set — a clear error beats a silent segfault.
+pub const ENV_TRY_MACOS_CLIENT: &str = "ZDBT_EL_ORACLE_TRY_MACOS_CLIENT";
 
 /// A connection's credentials with every `${VAR}` resolved. Values are
 /// `Secret`s: they print as «redacted» and only reach the child's
@@ -29,22 +41,37 @@ pub struct OracleCreds {
     pub password: Secret,
     pub connect: Secret,
     /// `tns_admin` when set, else `wallet_dir` — an Autonomous Database
-    /// wallet directory is also where its `tnsnames.ora` lives.
+    /// wallet directory is also where its `tnsnames.ora` lives. Relative
+    /// paths were resolved against the project root.
     pub tns_admin: Option<Secret>,
+    /// Client settings the project's `.env` (or the real environment)
+    /// carries for the worker: [`ENV_CLIENT_DIR`], [`ENV_TRY_MACOS_CLIENT`].
+    pub client_settings: Vec<(&'static str, String)>,
 }
 
 impl OracleCreds {
-    pub fn resolve(conn: &OracleConn, env: &EnvMap) -> Result<Self> {
+    pub fn resolve(conn: &OracleConn, env: &EnvMap, project_root: &Path) -> Result<Self> {
         let resolve = |value: &str| -> Result<Secret> {
             crate::env::resolve_templates(value, env)
                 .map_err(|missing| anyhow::anyhow!("{missing}"))
         };
         let tns_admin = conn.tns_admin.as_deref().or(conn.wallet_dir.as_deref());
+        // A wallet or tnsnames directory is a path like every other path
+        // in a spec: relative to the project, as the connection form's
+        // `el/wallet` placeholder suggests.
+        let tns_admin = tns_admin
+            .map(|dir| resolve(dir).map(|dir| Secret::new(anchor(project_root, dir.expose()))))
+            .transpose()?;
+        let client_settings = [ENV_CLIENT_DIR, ENV_TRY_MACOS_CLIENT]
+            .into_iter()
+            .filter_map(|name| env.get(name).map(|value| (name, value)))
+            .collect();
         Ok(Self {
             user: resolve(&conn.user)?,
             password: resolve(&conn.password)?,
             connect: resolve(&conn.connect)?,
-            tns_admin: tns_admin.map(resolve).transpose()?,
+            tns_admin,
+            client_settings,
         })
     }
 
@@ -57,6 +84,24 @@ impl OracleCreds {
         if let Some(dir) = &self.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
         }
+        self.apply_client_settings(command);
+    }
+
+    /// Only the client-location settings — what the loader sidecar needs
+    /// besides the password it receives on its own channel.
+    pub fn apply_client_settings(&self, command: &mut Command) {
+        for (name, value) in &self.client_settings {
+            command.env(name, value);
+        }
+    }
+}
+
+fn anchor(project_root: &Path, dir: &str) -> String {
+    let path = PathBuf::from(dir);
+    if path.is_absolute() {
+        dir.to_owned()
+    } else {
+        project_root.join(path).to_string_lossy().into_owned()
     }
 }
 
@@ -86,4 +131,75 @@ pub fn creds_from_env() -> Result<WorkerCreds> {
         password: read(ENV_PASSWORD)?,
         connect: read(ENV_CONNECT)?,
     })
+}
+
+/// Where the worker was told the client library lives, if anywhere.
+pub fn client_dir_from_env() -> Option<String> {
+    std::env::var(ENV_CLIENT_DIR)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(tns_admin: Option<&str>, wallet_dir: Option<&str>) -> OracleConn {
+        OracleConn {
+            user: "${U}".to_owned(),
+            password: "${P}".to_owned(),
+            connect: "db:1521/svc".to_owned(),
+            schema: None,
+            wallet_dir: wallet_dir.map(str::to_owned),
+            tns_admin: tns_admin.map(str::to_owned),
+            extra: Default::default(),
+        }
+    }
+
+    fn env() -> EnvMap {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "U=scott\nP=tiger\nZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/ic\n",
+        )
+        .unwrap();
+        EnvMap::load(dir.path(), None)
+    }
+
+    #[test]
+    fn wallet_and_tns_dirs_anchor_on_the_project() {
+        let root = Path::new("/proj");
+        let creds = OracleCreds::resolve(&conn(None, Some("el/wallet")), &env(), root).unwrap();
+        assert_eq!(creds.tns_admin.unwrap().expose(), "/proj/el/wallet");
+        // tns_admin wins over wallet_dir; an absolute path is left alone.
+        let creds =
+            OracleCreds::resolve(&conn(Some("/etc/tns"), Some("el/wallet")), &env(), root)
+                .unwrap();
+        assert_eq!(creds.tns_admin.unwrap().expose(), "/etc/tns");
+        assert!(
+            OracleCreds::resolve(&conn(None, None), &env(), root)
+                .unwrap()
+                .tns_admin
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn client_settings_travel_from_the_env_map() {
+        let creds = OracleCreds::resolve(&conn(None, None), &env(), Path::new("/proj")).unwrap();
+        assert_eq!(
+            creds.client_settings,
+            vec![(ENV_CLIENT_DIR, "/opt/oracle/ic".to_owned())]
+        );
+        let mut command = Command::new("true");
+        creds.apply(&mut command);
+        let set: Vec<String> = command
+            .get_envs()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [ENV_USER, ENV_PASSWORD, ENV_CONNECT, ENV_CLIENT_DIR] {
+            assert!(set.iter().any(|n| n == name), "{name} not set: {set:?}");
+        }
+        assert!(!set.iter().any(|n| n == ENV_TNS_ADMIN), "{set:?}");
+    }
 }

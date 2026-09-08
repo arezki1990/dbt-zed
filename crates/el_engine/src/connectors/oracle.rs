@@ -1,8 +1,11 @@
 //! Oracle source connector (worker-side, feature "oracle"). The `oracle`
 //! crate wraps ODPI-C, which compiles anywhere but dlopens Oracle Instant
 //! Client at run time — a missing client is DPI-1047 and becomes the
-//! actionable message in [`INSTANT_CLIENT_HELP`]. Credentials come from
-//! the environment (`ZDBT_EL_SRC_ORACLE_*`, see `oracle_env`), never argv.
+//! actionable message in [`INSTANT_CLIENT_HELP`]. When the environment
+//! names the client directory (`ZDBT_EL_ORACLE_CLIENT_DIR`) it is handed
+//! to ODPI-C explicitly, since neither `~/lib` nor a stripped `DYLD_*` /
+//! `LD_*` variable can be relied on. Credentials come from the
+//! environment (`ZDBT_EL_SRC_ORACLE_*`, see `oracle_env`), never argv.
 //! Setup, the test container and the live tests: `el_engine/ORACLE.md`.
 //!
 //! Reading is a single server-side cursor with the fetch array size set to
@@ -16,26 +19,43 @@
 //! `CREATE TABLE employees` really made); to address a case-sensitive
 //! table, quote it in the spec (`"MixedCase"`).
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
 use oracle::sql_type::ToSql;
 use oracle::{Connection, ResultSet, Row};
 use polars::prelude::*;
 
+use super::oracle_env::{ENV_CLIENT_DIR, ENV_TRY_MACOS_CLIENT, client_dir_from_env};
 use crate::oracle_types::{OracleColumnType, normalize_ident, quote_ident, quote_stored};
 use crate::state::WatermarkValue;
 
 /// What every live path says when ODPI-C cannot find a client library.
 pub const INSTANT_CLIENT_HELP: &str = concat!(
     "Oracle Instant Client is not installed on the machine running the connector worker ",
-    "(ODPI-C reported DPI-1047). Install the Basic or Basic Light package and make it ",
-    "visible to the process: macOS — the arm64 instantclient dmg from oracle.com, kept in ",
-    "~/lib or named by DYLD_LIBRARY_PATH; Linux — unzip the client, install libaio, then add ",
-    "the directory to LD_LIBRARY_PATH or /etc/ld.so.conf.d and run ldconfig; Windows — add ",
-    "the directory to PATH."
+    "(ODPI-C reported DPI-1047). Install the Basic or Basic Light package and name its ",
+    "directory in ZDBT_EL_ORACLE_CLIENT_DIR (in the project's .env, or on a server in ",
+    "/etc/zdbt-el-serve/env). Linux also needs libaio; Windows also accepts the directory ",
+    "on PATH. Oracle publishes no working client for Apple Silicon: run Oracle pipelines ",
+    "from a Linux remote (crates/el_engine/ORACLE.md)."
 );
+
+/// Why the worker will not connect from an Apple Silicon Mac.
+pub const MACOS_CLIENT_HELP: &str = concat!(
+    "Oracle pipelines cannot run on this Mac: Oracle Instant Client 23.3, the only build ",
+    "for Apple Silicon, crashes inside its own crypto library at connect time (Oracle bug ",
+    "36790189), and the worker would die without an error. Deploy the pipeline to a Linux ",
+    "remote instead, or set ZDBT_EL_ORACLE_TRY_MACOS_CLIENT=1 to try a newer client anyway."
+);
+
+/// Rows fetched per server round trip. ODPI-C allocates every column's
+/// fetch buffer at this size before the first row arrives (a VARCHAR2(4000)
+/// column costs 16 KB per row in AL32UTF8), so the chunk size — 50,000 by
+/// default — must not drive it. The chunk is still assembled lazily, one
+/// fetch at a time.
+const FETCH_ARRAY_ROWS: u32 = 1_000;
 
 /// Whole-handshake budget. Oracle's own connect timeout only covers the
 /// TCP leg, and loading the client library plus a TNS lookup can be slow
@@ -106,11 +126,37 @@ pub fn connect_from_env() -> Result<Connection> {
     connect(&creds.user, &creds.password, &creds.connect)
 }
 
+/// Points ODPI-C at the client directory the environment names, once per
+/// process. Without a named directory the driver's own search applies.
+fn init_client() -> Result<()> {
+    static OUTCOME: OnceLock<Result<(), String>> = OnceLock::new();
+    OUTCOME
+        .get_or_init(|| {
+            let Some(dir) = client_dir_from_env() else {
+                return Ok(());
+            };
+            let mut params = oracle::InitParams::new();
+            params
+                .oracle_client_lib_dir(dir.as_str())
+                .and_then(|params| params.init())
+                .map(|_| ())
+                .map_err(|error| format!("loading Oracle Instant Client from {dir}: {error}"))
+        })
+        .clone()
+        .map_err(|message| anyhow!("{message} ({ENV_CLIENT_DIR})"))
+}
+
 /// Connects, bounding the WHOLE handshake: ODPI-C's own timeouts cover
 /// the socket only, so the attempt runs on its own thread and is
 /// abandoned at the deadline. Errors never echo the user or the connect
 /// string.
 pub fn connect(user: &str, password: &str, connect_string: &str) -> Result<Connection> {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && std::env::var_os(ENV_TRY_MACOS_CLIENT).is_none()
+    {
+        bail!(MACOS_CLIENT_HELP);
+    }
+    init_client()?;
     let (user, password, connect_string) = (
         user.to_owned(),
         password.to_owned(),
@@ -258,8 +304,7 @@ impl OracleExtractor {
 
         let statement = conn
             .statement(&sql)
-            // One server round trip per chunk.
-            .fetch_array_size(chunk_rows as u32)
+            .fetch_array_size(fetch_array_size(chunk_rows))
             .build()
             .map_err(describe_error)
             .with_context(|| format!("preparing the read of {owner}.{table_name}"))?;
@@ -275,6 +320,13 @@ impl OracleExtractor {
             _conn: conn,
         })
     }
+}
+
+/// Rows per fetch: the chunk size for small chunks, the cap otherwise.
+fn fetch_array_size(chunk_rows: usize) -> u32 {
+    u32::try_from(chunk_rows)
+        .unwrap_or(u32::MAX)
+        .clamp(1, FETCH_ARRAY_ROWS)
 }
 
 /// The source schema, from the dictionary rather than the driver's own
@@ -375,8 +427,10 @@ fn push_row(row: &Row, columns: &[(String, Fetch)], buffers: &mut [Values]) -> R
                     .map_err(fail)?
                     .map(|value| value.and_utc().timestamp_micros()),
             ),
+            // Fetched WITH its stored offset: the driver's `DateTime<Utc>`
+            // conversion copies the wall clock and drops the zone.
             Values::TimestampTz(values) => values.push(
-                row.get::<_, Option<DateTime<Utc>>>(index)
+                row.get::<_, Option<DateTime<FixedOffset>>>(index)
                     .map_err(fail)?
                     .map(|value| value.timestamp_micros()),
             ),
@@ -397,12 +451,16 @@ fn flush(columns: &[(String, Fetch)], buffers: Vec<Values>) -> Result<DataFrame>
                 Values::Int(values) => Series::new(name.into(), values),
                 Values::Float(values) => Series::new(name.into(), values),
                 Values::Text(values) => Series::new(name.into(), values),
+                // Strict: a value that does not fit is an error, never a
+                // silent NULL. Text with more decimals than the scale is
+                // rounded by the parser, which only the unconstrained
+                // NUMBER mapping (scale 10) can hit.
                 Values::Decimal(values) => Series::new(name.into(), values)
-                    .cast(&fetch.dtype())
+                    .strict_cast(&fetch.dtype())
                     .map_err(|error| anyhow!("decimal column {name}: {error}"))?,
                 Values::Timestamp(values) | Values::TimestampTz(values) => {
                     Series::new(name.into(), values)
-                        .cast(&fetch.dtype())
+                        .strict_cast(&fetch.dtype())
                         .map_err(|error| anyhow!("timestamp column {name}: {error}"))?
                 }
                 Values::Binary(values) => Series::new(name.into(), values),
@@ -574,6 +632,45 @@ mod tests {
             "10.50"
         );
         assert!(frame.column("AMOUNT").unwrap().get(2).unwrap().is_null());
+    }
+
+    /// Unconstrained NUMBER lands as Decimal(38,10): a 19-digit id stays
+    /// exact (it would not in an f64), Oracle's leading-dot and exponent
+    /// spellings parse, and a value too wide for the column is an error
+    /// rather than a NULL.
+    #[test]
+    fn unconstrained_numbers_stay_exact() {
+        let columns = vec![("N".to_owned(), Fetch::Decimal(38, 10))];
+        let mut buffers = make_buffers(&columns);
+        let Values::Decimal(values) = &mut buffers[0] else {
+            panic!("decimal buffer");
+        };
+        values.push(Some("1234567890123456789".to_owned()));
+        values.push(Some(".5".to_owned()));
+        values.push(Some("-1.5E+3".to_owned()));
+        values.push(Some("3.14159265358979".to_owned()));
+        let frame = flush(&columns, buffers).unwrap();
+        let column = frame.column("N").unwrap();
+        assert_eq!(column.get(0).unwrap().to_string(), "1234567890123456789.0000000000");
+        assert_eq!(column.get(1).unwrap().to_string(), "0.5000000000");
+        assert_eq!(column.get(2).unwrap().to_string(), "-1500.0000000000");
+        assert_eq!(column.get(3).unwrap().to_string(), "3.1415926536");
+
+        let mut buffers = make_buffers(&columns);
+        let Values::Decimal(values) = &mut buffers[0] else {
+            panic!("decimal buffer");
+        };
+        values.push(Some("1".repeat(30)));
+        let error = flush(&columns, buffers).unwrap_err().to_string();
+        assert!(error.contains("decimal column N"), "{error}");
+    }
+
+    /// The default chunk (50,000 rows) must not size the fetch buffers.
+    #[test]
+    fn fetch_array_size_is_capped() {
+        assert_eq!(fetch_array_size(50_000), FETCH_ARRAY_ROWS);
+        assert_eq!(fetch_array_size(2), 2);
+        assert_eq!(fetch_array_size(0), 1);
     }
 
     /// Live smoke, gated: `EL_ORACLE_SMOKE_URL=host:1521/service

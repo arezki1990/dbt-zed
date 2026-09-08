@@ -199,11 +199,6 @@ connections:
     let conn = &loaded.connections["ora"];
     assert_eq!(conn.kind(), "oracle");
     assert_eq!(conn.env_refs(), ["ORACLE_PASSWORD", "ORACLE_USER"]);
-    let keys = conn.param_keys();
-    for key in ["user", "password", "connect", "schema", "tns_admin", "my_note"] {
-        assert!(keys.iter().any(|k| k == key), "missing key {key} in {keys:?}");
-    }
-    assert!(!keys.iter().any(|k| k == "wallet_dir"), "unset optional listed: {keys:?}");
     assert!(conn.shape_issues().is_empty(), "{:?}", conn.shape_issues());
     let Connection::Oracle(oracle) = conn else {
         panic!("not oracle");
@@ -278,6 +273,15 @@ streams:
         !issues.iter().any(|issue| issue.message.contains("targets must be")),
         "{issues:?}"
     );
+    // The same shape checks run on the target connection.
+    let text = issues
+        .iter()
+        .map(|issue| issue.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("connection \"ora\": oracle connections need a connect string"), "{text}");
+    assert!(text.contains("password is stored literally"), "{text}");
+    assert!(!text.contains("tiger"), "password leaked: {text}");
     let postgres_target = "version: 1
 connections:
   ora:

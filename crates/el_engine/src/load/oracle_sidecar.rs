@@ -20,6 +20,7 @@ use super::{LoadReport, Loader, StreamPlan, oracle_sql};
 use crate::connectors::oracle_env::ENV_TNS_ADMIN;
 use crate::env::Secret;
 use crate::oracle_types::OracleDialect;
+use crate::types::SfBase;
 
 /// Resolved Oracle target details. `user` and `connect` are locations;
 /// `password` is a [`Secret`] and only reaches the child's environment.
@@ -31,6 +32,9 @@ pub struct OracleSidecarConfig {
     /// Directory holding `tnsnames.ora` / a wallet, when the connection
     /// names one.
     pub tns_admin: Option<Secret>,
+    /// Client-location settings from the project's `.env`
+    /// (`ZDBT_EL_ORACLE_CLIENT_DIR`, …), forwarded to the sidecar.
+    pub client_settings: Vec<(&'static str, String)>,
     /// Target-side DDL choices (23ai native `BOOLEAN`, …).
     pub dialect: OracleDialect,
 }
@@ -54,6 +58,9 @@ impl OracleSidecarLoader {
             .env(ENV_ORACLE_PASSWORD, config.password.expose());
         if let Some(dir) = &config.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
+        }
+        for (name, value) in &config.client_settings {
+            command.env(name, value);
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -127,6 +134,44 @@ impl OracleSidecarLoader {
     }
 }
 
+/// A `VARCHAR2(n CHAR)` column holds n characters and, on a standard
+/// server, at most 4000 bytes. Oracle would reject an oversize value with
+/// ORA-12899 after the chunk was shipped; this names the column and the
+/// cast that fixes it before anything is sent.
+fn check_text_widths(plan: &StreamPlan, chunk: &DataFrame) -> Result<()> {
+    for (index, (name, sf_type)) in plan.columns.iter().enumerate() {
+        if sf_type.base != SfBase::Varchar {
+            continue;
+        }
+        let max_chars = sf_type.length.unwrap_or(OracleDialect::MAX_VARCHAR2);
+        if max_chars > OracleDialect::MAX_VARCHAR2 {
+            continue; // lands as CLOB
+        }
+        let Some(column) = chunk.columns().get(index) else {
+            continue;
+        };
+        let Ok(text) = column.str() else {
+            continue;
+        };
+        let (mut widest_bytes, mut widest_chars) = (0usize, 0usize);
+        for value in text.iter().flatten() {
+            widest_bytes = widest_bytes.max(value.len());
+            widest_chars = widest_chars.max(value.chars().count());
+        }
+        if widest_chars > max_chars as usize
+            || widest_bytes > OracleDialect::MAX_VARCHAR2 as usize
+        {
+            bail!(
+                "column {name:?}: a value of {widest_chars} characters ({widest_bytes} bytes) \
+                 does not fit VARCHAR2({max_chars} CHAR) — Oracle caps VARCHAR2 at 4000 \
+                 bytes; add `cast: VARCHAR({})` to the stream so the column lands as CLOB",
+                OracleDialect::MAX_VARCHAR2 + 1
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Drop for OracleSidecarLoader {
     fn drop(&mut self) {
         let _ = self.request(&Request::Shutdown);
@@ -156,6 +201,7 @@ impl Loader for OracleSidecarLoader {
     }
 
     fn stage_chunk(&mut self, plan: &StreamPlan, chunk: &mut DataFrame) -> Result<u64> {
+        check_text_widths(plan, chunk)?;
         let insert_sql =
             oracle_sql::insert_staging(&plan.schema, &plan.target_table, &plan.columns)?;
         let path = self

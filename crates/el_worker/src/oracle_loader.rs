@@ -133,7 +133,13 @@ fn ingest(connection: &Connection, insert_sql: &str, ipc_path: &std::path::Path)
         .finish()
         .map_err(|error| anyhow!("reading chunk ipc: {error}"))?;
     let height = frame.height();
-    let columns: Vec<&Column> = frame.columns().iter().collect();
+    // Nested columns were created as CLOB and travel as JSON text.
+    let columns = frame
+        .columns()
+        .iter()
+        .map(nested_as_json)
+        .collect::<Result<Vec<Column>>>()?;
+    let columns: Vec<&Column> = columns.iter().collect();
     if columns.is_empty() || height == 0 {
         let _ = std::fs::remove_file(ipc_path);
         let mut response = Response::ok();
@@ -191,18 +197,21 @@ fn bind_type(column: &Column) -> Result<OracleType> {
         DataType::Datetime(_, None) => OracleType::Timestamp(6),
         DataType::Datetime(_, Some(_)) => OracleType::TimestampTZ(6),
         DataType::Binary | DataType::BinaryOffset => OracleType::BLOB,
+        // Oracle has no TIME: the DDL made it VARCHAR2(18) text.
+        DataType::Time => OracleType::Varchar2(18),
         DataType::String => {
             let text = column.str().map_err(|error| anyhow!("{error}"))?;
-            let longest = text
-                .iter()
-                .flatten()
-                .map(|value| value.chars().count())
-                .max()
-                .unwrap_or(0);
-            if longest > el_engine::oracle_types::OracleDialect::MAX_VARCHAR2 as usize {
+            let (mut widest_bytes, mut widest_chars) = (0usize, 0usize);
+            for value in text.iter().flatten() {
+                widest_bytes = widest_bytes.max(value.len());
+                widest_chars = widest_chars.max(value.chars().count());
+            }
+            // A VARCHAR2 bind is capped at 4000 BYTES; anything wider is a
+            // LOB (and our DDL made that column CLOB).
+            if widest_bytes > el_engine::oracle_types::OracleDialect::MAX_VARCHAR2 as usize {
                 OracleType::CLOB
             } else {
-                OracleType::Varchar2(longest.max(1) as u32)
+                OracleType::Varchar2(widest_chars.max(1) as u32)
             }
         }
         other => bail!("column {} has dtype {other} which Oracle cannot load", column.name()),
@@ -283,9 +292,72 @@ fn bind_value(column: &Column, row: usize) -> Result<Box<dyn ToSql>> {
                 )
             }
         }
-        AnyValue::Decimal(value, scale, _) => Box::new(decimal_text(value, scale)),
+        AnyValue::Decimal(..) => Box::new(
+            decimal_cell(&value).ok_or_else(|| anyhow!("decimal expected in {}", column.name()))?,
+        ),
+        AnyValue::Time(nanos) => Box::new(time_text(nanos)),
         other => Box::new(other.to_string()),
     })
+}
+
+/// A decimal cell as exact text. polars spells the variant
+/// (value, precision, scale) — taking the precision for the scale once
+/// turned 111.00 into 0.000000000000011100.
+fn decimal_cell(value: &AnyValue) -> Option<String> {
+    match value {
+        AnyValue::Decimal(unscaled, _precision, scale) => Some(decimal_text(*unscaled, *scale)),
+        _ => None,
+    }
+}
+
+/// A polars time (nanoseconds since midnight) as `HH:MM:SS.ffffff`, the
+/// text shape the DDL's VARCHAR2(18) was sized for.
+fn time_text(nanos: i64) -> String {
+    let micros = nanos.rem_euclid(86_400_000_000_000) / 1_000;
+    format!(
+        "{:02}:{:02}:{:02}.{:06}",
+        micros / 3_600_000_000,
+        micros / 60_000_000 % 60,
+        micros / 1_000_000 % 60,
+        micros % 1_000_000
+    )
+}
+
+/// A list or struct column as one JSON text per row, via polars' own
+/// writer; every other column is returned as it is. The frame is written
+/// as JSON lines with the column renamed to a fixed key, so each line is
+/// `{"v":…}` and the value is what lies between.
+fn nested_as_json(column: &Column) -> Result<Column> {
+    if !matches!(column.dtype(), DataType::List(_) | DataType::Struct(_)) {
+        return Ok(column.clone());
+    }
+    let mut frame = DataFrame::new(column.len(), vec![column.clone().with_name("v".into())])
+        .map_err(|error| anyhow!("{}: {error}", column.name()))?;
+    let mut buffer = Vec::new();
+    JsonWriter::new(&mut buffer)
+        .with_json_format(JsonFormat::JsonLines)
+        .finish(&mut frame)
+        .map_err(|error| anyhow!("serialising {}: {error}", column.name()))?;
+    let text = String::from_utf8(buffer).context("json is utf-8")?;
+    let values = text
+        .lines()
+        .map(|line| {
+            let inner = line
+                .strip_prefix("{\"v\":")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .ok_or_else(|| anyhow!("unexpected json line for {}: {line}", column.name()))?;
+            Ok((inner != "null").then(|| inner.to_owned()))
+        })
+        .collect::<Result<Vec<Option<String>>>>()?;
+    if values.len() != column.len() {
+        bail!(
+            "serialising {}: {} rows became {} json lines",
+            column.name(),
+            column.len(),
+            values.len()
+        );
+    }
+    Ok(Series::new(column.name().clone(), values).into())
 }
 
 /// A polars decimal as exact text: the unscaled integer with a decimal
@@ -316,4 +388,42 @@ fn to_micros(value: i64, unit: TimeUnit) -> i64 {
 fn date_from_days(days: i32) -> Option<NaiveDateTime> {
     NaiveDate::from_num_days_from_ce_opt(days + 719_163)
         .map(|date| date.and_time(NaiveTime::MIN))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimals_and_times_bind_as_exact_text() {
+        let amounts = Series::new("A".into(), ["111.00", "-0.05"])
+            .cast(&DataType::Decimal(18, 2))
+            .unwrap();
+        assert_eq!(decimal_cell(&amounts.get(0).unwrap()).unwrap(), "111.00");
+        assert_eq!(decimal_cell(&amounts.get(1).unwrap()).unwrap(), "-0.05");
+        assert_eq!(decimal_text(1050, 2), "10.50");
+        assert_eq!(decimal_text(-5, 2), "-0.05");
+        assert_eq!(decimal_text(7, 0), "7");
+        assert_eq!(time_text(0), "00:00:00.000000");
+        assert_eq!(time_text(45_296_123_456_789), "12:34:56.123456");
+    }
+
+    #[test]
+    fn nested_columns_become_json_text() {
+        let list = Series::new(
+            "TAGS".into(),
+            [Some(vec![1i64, 2]), None, Some(vec![])]
+                .into_iter()
+                .map(|value| value.map(|items| Series::new("".into(), items)))
+                .collect::<Vec<Option<Series>>>(),
+        );
+        let json = nested_as_json(&list.into()).unwrap();
+        assert_eq!(json.dtype(), &DataType::String);
+        assert_eq!(json.get(0).unwrap().to_string(), "\"[1,2]\"");
+        assert!(json.get(1).unwrap().is_null());
+        assert_eq!(json.get(2).unwrap().to_string(), "\"[]\"");
+        // Flat columns pass through untouched.
+        let flat: Column = Series::new("N".into(), [1i64, 2]).into();
+        assert_eq!(nested_as_json(&flat).unwrap().dtype(), &DataType::Int64);
+    }
 }

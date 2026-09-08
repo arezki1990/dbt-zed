@@ -8,17 +8,19 @@
 //! - `NUMBER(p,0)` with `p <= 18` fits an i64 and reads as `Int64`; wider
 //!   integers and any scale > 0 keep exactness as `Decimal(p,s)`, the
 //!   same convention `types.rs` uses for `NUMBER` casts.
-//! - Unconstrained `NUMBER`, `FLOAT`, `BINARY_FLOAT` and `BINARY_DOUBLE`
-//!   read as `Float64`; add a `cast: NUMBER(p,s)` in the stream when a
-//!   column must stay exact.
+//! - `FLOAT`, `BINARY_FLOAT` and `BINARY_DOUBLE` are floating point and
+//!   read as `Float64`. A bare `NUMBER` is not: Oracle stores it with 38
+//!   significant digits, so it reads as `Decimal(38,10)` — exact to ten
+//!   decimals, wide enough for any integer id — and `NUMBER(*,s)` as
+//!   `Decimal(38,s)`. Add a `cast:` in the stream to choose another scale.
 //! - `DATE` carries a time of day in Oracle, so it is a `Datetime(us)`,
 //!   not a polars `Date`. `TIMESTAMP WITH [LOCAL] TIME ZONE` lands as
 //!   UTC micros (the connector pins the session time zone to UTC).
 //! - Character, LOB, interval, rowid, JSON and XML types read as text;
 //!   `RAW`/`LONG RAW`/`BLOB`/`BFILE` as bytes; 23ai `BOOLEAN` as bool.
 //!
-//! Target side (`OracleDialect::ddl_type`): `VARCHAR2(4000)` unless the
-//! spec asks for more (then `CLOB`), `NUMBER(19,0)` for bare integers,
+//! Target side (`OracleDialect::ddl_type`): `VARCHAR2(4000 CHAR)` unless
+//! the spec asks for more (then `CLOB`), `NUMBER(19,0)` for bare integers,
 //! `BINARY_DOUBLE` for floats, `NUMBER(p,s)` for decimals, `TIMESTAMP(6)`
 //! [WITH TIME ZONE], `DATE`, `BLOB`, and `NUMBER(1)` for booleans unless
 //! the dialect opts into the 23ai native `BOOLEAN`. Oracle has no TIME
@@ -116,6 +118,9 @@ pub enum OracleColumnType {
     Other(String),
 }
 
+/// The scale a bare `NUMBER` column reads at (`Decimal(38, this)`).
+pub const UNCONSTRAINED_NUMBER_SCALE: usize = 10;
+
 impl OracleColumnType {
     /// From the dictionary columns of `ALL_TAB_COLUMNS`: `DATA_TYPE`
     /// spelled as Oracle stores it, plus `DATA_PRECISION` / `DATA_SCALE`
@@ -146,10 +151,14 @@ impl OracleColumnType {
                 // Integers: i64 while they fit, exact decimal beyond.
                 (Some(precision), _) if *precision <= 18 => DataType::Int64,
                 (Some(precision), _) => DataType::Decimal(*precision as usize, 0),
+                // NUMBER(*,s): 38 digits at a declared scale.
+                (None, Some(scale)) if *scale > 0 => DataType::Decimal(38, *scale as usize),
                 // INTEGER: NULL precision with scale 0 is a 38-digit integer.
-                (None, Some(0)) => DataType::Decimal(38, 0),
-                // Unconstrained NUMBER — approximate, like FLOAT.
-                (None, _) => DataType::Float64,
+                (None, Some(_)) => DataType::Decimal(38, 0),
+                // Unconstrained NUMBER: exact, at a scale that keeps every
+                // integer id and ordinary money exact. Float64 would round
+                // a 19-digit id the moment it was parsed.
+                (None, None) => DataType::Decimal(38, UNCONSTRAINED_NUMBER_SCALE),
             },
             OracleColumnType::Float
             | OracleColumnType::BinaryFloat
@@ -401,10 +410,14 @@ impl OracleDialect {
                 _ => "NUMBER(19,0)".to_owned(),
             },
             SfBase::Float => "BINARY_DOUBLE".to_owned(),
+            // CHAR semantics: a VARCHAR(n) cast means n characters, as it
+            // does on every other target. The 4000-byte ceiling of a
+            // standard server still applies; the loader checks it and
+            // names the column before Oracle would reject the row.
             SfBase::Varchar => match sf_type.length {
                 Some(length) if length > Self::MAX_VARCHAR2 => "CLOB".to_owned(),
-                Some(length) => format!("VARCHAR2({length})"),
-                None => format!("VARCHAR2({})", Self::MAX_VARCHAR2),
+                Some(length) => format!("VARCHAR2({length} CHAR)"),
+                None => format!("VARCHAR2({} CHAR)", Self::MAX_VARCHAR2),
             },
             SfBase::Boolean if self.native_boolean => "BOOLEAN".to_owned(),
             SfBase::Boolean => "NUMBER(1)".to_owned(),
@@ -416,25 +429,6 @@ impl OracleDialect {
             SfBase::Binary => "BLOB".to_owned(),
             // Same v1 stance as the other targets: nested data lands as text.
             SfBase::Variant => "CLOB".to_owned(),
-        }
-    }
-
-    /// The Oracle DDL type for a column with no explicit `cast:` — from
-    /// its polars dtype. Integers get `NUMBER(19,0)` (an i64 needs 19
-    /// digits, 38 would only waste the optimizer's estimates); everything
-    /// else follows the spec-type table above.
-    pub fn ddl_type_for_polars(&self, dtype: &DataType) -> String {
-        match dtype {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::Duration(_) => "NUMBER(19,0)".to_owned(),
-            DataType::UInt64 => "NUMBER(20,0)".to_owned(),
-            other => self.ddl_type(&SnowflakeType::from_polars(other)),
         }
     }
 }
@@ -466,7 +460,7 @@ mod tests {
             ("NUMBER(38,0)", DataType::Decimal(38, 0)),
             ("NUMBER(18,2)", DataType::Decimal(18, 2)),
             ("NUMBER(5,-2)", DataType::Int64),
-            ("NUMBER", DataType::Float64),
+            ("NUMBER", DataType::Decimal(38, 10)),
             ("INTEGER", DataType::Decimal(38, 0)),
             ("FLOAT", DataType::Float64),
             ("FLOAT(126)", DataType::Float64),
@@ -514,11 +508,16 @@ mod tests {
         );
         assert_eq!(
             OracleColumnType::from_dictionary("NUMBER", None, None).polars_dtype(),
-            DataType::Float64
+            DataType::Decimal(38, 10)
         );
         assert_eq!(
             OracleColumnType::from_dictionary("NUMBER", None, Some(0)).polars_dtype(),
             DataType::Decimal(38, 0)
+        );
+        // NUMBER(*,2): no precision, a scale.
+        assert_eq!(
+            OracleColumnType::from_dictionary("NUMBER", None, Some(2)).polars_dtype(),
+            DataType::Decimal(38, 2)
         );
         assert_eq!(
             OracleColumnType::from_dictionary("TIMESTAMP(6) WITH TIME ZONE", None, None),
@@ -570,9 +569,9 @@ mod tests {
             ("NUMBER(10)", "NUMBER(10,0)"),
             ("NUMBER", "NUMBER(19,0)"),
             ("FLOAT", "BINARY_DOUBLE"),
-            ("VARCHAR", "VARCHAR2(4000)"),
-            ("VARCHAR(255)", "VARCHAR2(255)"),
-            ("VARCHAR(4000)", "VARCHAR2(4000)"),
+            ("VARCHAR", "VARCHAR2(4000 CHAR)"),
+            ("VARCHAR(255)", "VARCHAR2(255 CHAR)"),
+            ("VARCHAR(4000)", "VARCHAR2(4000 CHAR)"),
             ("VARCHAR(4001)", "CLOB"),
             ("VARCHAR(16777216)", "CLOB"),
             ("BOOLEAN", "NUMBER(1)"),
@@ -600,36 +599,6 @@ mod tests {
         assert_eq!(dialect.ddl_type(&wide), "NUMBER(38,38)");
     }
 
-    #[test]
-    fn ddl_from_polars_dtypes() {
-        let dialect = OracleDialect::default();
-        for (dtype, expected) in [
-            (DataType::Boolean, "NUMBER(1)"),
-            (DataType::Int8, "NUMBER(19,0)"),
-            (DataType::Int64, "NUMBER(19,0)"),
-            (DataType::UInt32, "NUMBER(19,0)"),
-            (DataType::UInt64, "NUMBER(20,0)"),
-            (DataType::Float32, "BINARY_DOUBLE"),
-            (DataType::Float64, "BINARY_DOUBLE"),
-            (DataType::Decimal(18, 2), "NUMBER(18,2)"),
-            (DataType::Decimal(38, 0), "NUMBER(38,0)"),
-            (DataType::String, "VARCHAR2(4000)"),
-            (DataType::Date, "DATE"),
-            (DataType::Time, "VARCHAR2(18)"),
-            (DataType::Datetime(TimeUnit::Microseconds, None), "TIMESTAMP(6)"),
-            (
-                DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC)),
-                "TIMESTAMP(6) WITH TIME ZONE",
-            ),
-            (DataType::Duration(TimeUnit::Microseconds), "NUMBER(19,0)"),
-            (DataType::Binary, "BLOB"),
-            (DataType::List(Box::new(DataType::Int64)), "CLOB"),
-            (DataType::Null, "VARCHAR2(4000)"),
-        ] {
-            assert_eq!(dialect.ddl_type_for_polars(&dtype), expected, "ddl for {dtype:?}");
-        }
-    }
-
     /// Source → polars → DDL round trip: whatever we read from Oracle we
     /// can write back to Oracle without a cast in the spec.
     #[test]
@@ -647,7 +616,7 @@ mod tests {
             "BOOLEAN",
         ] {
             let parsed: OracleColumnType = spelling.parse().unwrap();
-            let ddl = dialect.ddl_type_for_polars(&parsed.polars_dtype());
+            let ddl = dialect.ddl_type(&SnowflakeType::from_polars(&parsed.polars_dtype()));
             assert!(!ddl.is_empty(), "no DDL for {spelling}");
         }
     }

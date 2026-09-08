@@ -1,7 +1,12 @@
--- Seeds the demo schema for the Oracle connector tests. Runs once, as SYS
--- against FREEPDB1, on the first start of an empty database — after the
--- image has created the APP_USER (zdbt) named in compose.yml.
+-- Seeds the demo schema for the Oracle connector tests. Runs once, as SYS,
+-- on the first start of an empty database — after the image has created
+-- the APP_USER (zdbt) named in compose.yml.
 --
+-- The image runs these scripts against the container root (CDB$ROOT),
+-- where the zdbt user does not exist; everything below lives in the
+-- pluggable database the user was created in.
+ALTER SESSION SET CONTAINER = FREEPDB1;
+
 -- The tables cover every branch of the type mapping: NUMBER with and
 -- without a scale, VARCHAR2, BINARY_DOUBLE, native 23ai BOOLEAN, DATE,
 -- TIMESTAMP, TIMESTAMP WITH TIME ZONE, CLOB and RAW, each with a NULL row

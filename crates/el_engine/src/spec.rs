@@ -257,17 +257,6 @@ impl Connection {
             .collect()
     }
 
-    /// The parameter keys this connection carries (known fields that are
-    /// set, plus any hand-added extras) — for summaries in the UI. Keys
-    /// only: a value is never returned, so a credential typed literally
-    /// into the file still cannot reach a label or a log.
-    pub fn param_keys(&self) -> Vec<String> {
-        let yaml = serde_yaml_ng::to_string(self).unwrap_or_default();
-        let mapping: IndexMap<String, serde_yaml_ng::Value> =
-            serde_yaml_ng::from_str(&yaml).unwrap_or_default();
-        mapping.into_keys().filter(|key| key != "type").collect()
-    }
-
     /// Shape problems in the connection itself (no pipeline needed).
     /// Messages name fields and variables only, never values.
     pub fn shape_issues(&self) -> Vec<String> {
@@ -1028,22 +1017,30 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
         }
     }
 
-    // Connection shape, then env references (names only in the messages).
+    // Connection shape, then env references (names only in the messages),
+    // for the source and — once, if it is a different connection — the
+    // target: a target with a literal password or no connect string
+    // fails just as surely, only later.
+    let mut checked: Vec<(&str, &Connection)> = Vec::new();
     if let Some(conn) = source_conn {
+        checked.push((pipeline.source.as_str(), conn));
+    }
+    if pipeline.target.connection != pipeline.source {
+        if let Some(conn) = connections.connections.get(&pipeline.target.connection) {
+            checked.push((pipeline.target.connection.as_str(), conn));
+        }
+    }
+    for (name, conn) in checked {
         for problem in conn.shape_issues() {
-            issue(
-                None,
-                format!("connection {:?}: {problem}", pipeline.source),
-            );
+            issue(None, format!("connection {name:?}: {problem}"));
         }
         for var in conn.env_refs() {
             if std::env::var_os(&var).is_none() {
                 issue(
                     None,
                     format!(
-                        "connection {:?} references ${{{var}}} which is not set \
-                         (checked real env only; .env files load at run time)",
-                        pipeline.source
+                        "connection {name:?} references ${{{var}}} which is not set \
+                         (checked real env only; .env files load at run time)"
                     ),
                 );
             }

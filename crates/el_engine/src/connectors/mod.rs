@@ -91,7 +91,7 @@ pub fn make_extractor(
                 postgres_extractor(ctx, url, schema.as_deref(), table, chunk_rows, cursor)
             }
             Some(Connection::Oracle(conn)) => {
-                let creds = oracle_env::OracleCreds::resolve(conn, ctx.env)?;
+                let creds = oracle_env::OracleCreds::resolve(conn, ctx.env, ctx.project_root)?;
                 // A stream without a schema reads from the connection's
                 // own schema (its user's, unless it names another).
                 let owner = match schema.as_deref() {

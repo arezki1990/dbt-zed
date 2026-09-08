@@ -54,7 +54,8 @@ fn connection_args(
             command.env("ZDBT_EL_SRC_URL", url.expose());
         }
         Connection::Oracle(conn) => {
-            let creds = crate::connectors::oracle_env::OracleCreds::resolve(conn, env)?;
+            let creds =
+                crate::connectors::oracle_env::OracleCreds::resolve(conn, env, project_root)?;
             command.arg("--kind").arg("oracle");
             creds.apply(command);
         }

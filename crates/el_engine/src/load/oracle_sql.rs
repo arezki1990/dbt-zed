@@ -190,31 +190,36 @@ pub fn insert_staging(
 }
 
 /// Full-refresh commit: publish staging by renaming it over the target.
-/// The steps must run in this order; each is a separate statement because
-/// Oracle DDL commits as it goes.
+/// Oracle DDL commits as it goes, so the two renames form one PL/SQL
+/// block that puts the live table back under its name when the second
+/// rename fails (a lock, a full tablespace): the target is never left
+/// missing, and the run's abort only ever drops staging.
 pub fn full_refresh_swap(schema: &str, target_table: &str) -> Result<Vec<String>> {
     let names = names(schema, target_table)?;
     let drop_old = guarded(
         &format!("DROP TABLE {} PURGE", names.old_fqn()),
         ORA_TABLE_MISSING,
     );
+    let rename = |from: String, to: &str| format!("ALTER TABLE {from} RENAME TO \"{to}\"");
+    let swap = format!(
+        "BEGIN \
+         BEGIN EXECUTE IMMEDIATE '{aside}'; \
+         EXCEPTION WHEN OTHERS THEN IF SQLCODE != {missing} THEN RAISE; END IF; END; \
+         BEGIN EXECUTE IMMEDIATE '{publish}'; \
+         EXCEPTION WHEN OTHERS THEN \
+         BEGIN EXECUTE IMMEDIATE '{restore}'; EXCEPTION WHEN OTHERS THEN NULL; END; \
+         RAISE; END; \
+         END;",
+        // First run: there is no target yet, which is not an error.
+        aside = rename(names.target_fqn(), &names.old).replace('\'', "''"),
+        missing = ORA_TABLE_MISSING,
+        publish = rename(names.staging_fqn(), &names.target).replace('\'', "''"),
+        restore = rename(names.old_fqn(), &names.target).replace('\'', "''"),
+    );
     Ok(vec![
         // A previous run killed mid-swap could have left one behind.
         drop_old.clone(),
-        // First run: there is no target yet, which is not an error.
-        guarded(
-            &format!(
-                "ALTER TABLE {} RENAME TO \"{}\"",
-                names.target_fqn(),
-                names.old
-            ),
-            ORA_TABLE_MISSING,
-        ),
-        format!(
-            "ALTER TABLE {} RENAME TO \"{}\"",
-            names.staging_fqn(),
-            names.target
-        ),
+        swap,
         drop_old,
     ])
 }
@@ -232,6 +237,17 @@ pub fn merge(
 ) -> Result<String> {
     if primary_key.is_empty() {
         bail!("an incremental oracle load needs a primary key to merge on");
+    }
+    // The dedupe subquery selects `s.*` plus the helper: a stream column
+    // of the same name would make the MERGE fail with ORA-00918.
+    if let Some((name, _)) = columns
+        .iter()
+        .find(|(name, _)| normalize_ident(name).ok().as_deref() == Some(ROW_NUMBER_COLUMN))
+    {
+        bail!(
+            "column {name:?} clashes with the {ROW_NUMBER_COLUMN} helper the incremental \
+             MERGE adds — rename it in the stream"
+        );
     }
     let names = names(schema, target_table)?;
     // A LOB cannot be compared, so it can be neither the key we match on
@@ -374,14 +390,14 @@ mod tests {
                  EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
                     .to_owned(),
                 "CREATE TABLE \"LANDING\".\"ORDERS__ZDBT_STAGING\" (\"ID\" NUMBER(38,0), \
-                 \"AMOUNT\" NUMBER(18,2), \"NOTE\" VARCHAR2(4000), \"UPDATED_AT\" TIMESTAMP(6))"
+                 \"AMOUNT\" NUMBER(18,2), \"NOTE\" VARCHAR2(4000 CHAR), \"UPDATED_AT\" TIMESTAMP(6))"
                     .to_owned(),
             ]
         );
         assert_eq!(
             create_target_if_not_exists("landing", "orders", &columns(), &dialect).unwrap(),
             "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE \"LANDING\".\"ORDERS\" \
-             (\"ID\" NUMBER(38,0), \"AMOUNT\" NUMBER(18,2), \"NOTE\" VARCHAR2(4000), \
+             (\"ID\" NUMBER(38,0), \"AMOUNT\" NUMBER(18,2), \"NOTE\" VARCHAR2(4000 CHAR), \
              \"UPDATED_AT\" TIMESTAMP(6))'; EXCEPTION WHEN OTHERS THEN \
              IF SQLCODE != -955 THEN RAISE; END IF; END;"
         );
@@ -404,20 +420,29 @@ mod tests {
 
     #[test]
     fn full_refresh_swaps_by_rename() {
+        let drop_old = "BEGIN EXECUTE IMMEDIATE 'DROP TABLE \"LANDING\".\"ORDERS__ZDBT_OLD\" \
+                        PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; \
+                        END IF; END;";
         assert_eq!(
             full_refresh_swap("landing", "orders").unwrap(),
             vec![
-                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE \"LANDING\".\"ORDERS__ZDBT_OLD\" PURGE'; \
-                 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
+                drop_old.to_owned(),
+                // One block: step the live table aside (absent on a first
+                // run), publish staging, and on failure put the live
+                // table back before re-raising.
+                "BEGIN \
+                 BEGIN EXECUTE IMMEDIATE 'ALTER TABLE \"LANDING\".\"ORDERS\" RENAME TO \
+                 \"ORDERS__ZDBT_OLD\"'; \
+                 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END; \
+                 BEGIN EXECUTE IMMEDIATE 'ALTER TABLE \"LANDING\".\"ORDERS__ZDBT_STAGING\" \
+                 RENAME TO \"ORDERS\"'; \
+                 EXCEPTION WHEN OTHERS THEN \
+                 BEGIN EXECUTE IMMEDIATE 'ALTER TABLE \"LANDING\".\"ORDERS__ZDBT_OLD\" \
+                 RENAME TO \"ORDERS\"'; EXCEPTION WHEN OTHERS THEN NULL; END; \
+                 RAISE; END; \
+                 END;"
                     .to_owned(),
-                "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE \"LANDING\".\"ORDERS\" \
-                 RENAME TO \"ORDERS__ZDBT_OLD\"'; EXCEPTION WHEN OTHERS THEN \
-                 IF SQLCODE != -942 THEN RAISE; END IF; END;"
-                    .to_owned(),
-                "ALTER TABLE \"LANDING\".\"ORDERS__ZDBT_STAGING\" RENAME TO \"ORDERS\"".to_owned(),
-                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE \"LANDING\".\"ORDERS__ZDBT_OLD\" PURGE'; \
-                 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
-                    .to_owned(),
+                drop_old.to_owned(),
             ]
         );
     }
@@ -487,6 +512,15 @@ mod tests {
         .to_string();
         assert!(error.contains("CLOB"), "{error}");
         assert!(merge("landing", "docs", &columns, &[], "id", &dialect).is_err());
+        // The dedupe helper's name is reserved, however it is spelled.
+        let clashing = vec![
+            ("id".to_owned(), "NUMBER(38,0)".parse().unwrap()),
+            ("zdbt_rn".to_owned(), "NUMBER(38,0)".parse().unwrap()),
+        ];
+        let error = merge("landing", "docs", &clashing, &["id".to_owned()], "id", &dialect)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ZDBT_RN"), "{error}");
     }
 
     /// The read-back text must be exactly what the state store parses.

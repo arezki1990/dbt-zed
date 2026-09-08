@@ -157,8 +157,8 @@ streams:
     let amount: String = conn
         .query_row_as::<String>(
             &format!(
-                "SELECT TO_CHAR(\"AMOUNT\") FROM \"{schema}\".\"ZDBT_EL_ORDERS\" \
-                 WHERE \"ID\" = 1"
+                "SELECT TO_CHAR(\"AMOUNT\", 'FM9999990.00') \
+                 FROM \"{schema}\".\"ZDBT_EL_ORDERS\" WHERE \"ID\" = 1"
             ),
             &[],
         )

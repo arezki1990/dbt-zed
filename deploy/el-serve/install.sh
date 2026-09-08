@@ -196,8 +196,10 @@ else
 fi
 # Where the worker finds Oracle Instant Client. The launcher sources this
 # file and the systemd unit reads it as EnvironmentFile, so the worker the
-# daemon spawns inherits it. A hand-written LD_LIBRARY_PATH is replaced,
-# not appended to.
+# daemon spawns inherits it. ZDBT_EL_ORACLE_CLIENT_DIR is what the worker
+# hands to the driver; LD_LIBRARY_PATH covers the client's own dependent
+# libraries. A hand-written value is replaced, not appended to.
+[[ -n "$ORACLE_LIB_DIR" ]] && set_env ZDBT_EL_ORACLE_CLIENT_DIR "$ORACLE_LIB_DIR"
 [[ -n "$ORACLE_LIB_DIR" ]] && set_env LD_LIBRARY_PATH "$ORACLE_LIB_DIR"
 # The pre-placed token is consumed — a later manual re-run keeps the env as is.
 rm -f /etc/zdbt-el-serve/token
@@ -239,8 +241,8 @@ Installed and started. Next:
   1. /etc/zdbt-el-serve/env holds the token, the profile and the database URL
      slots — fill the URLs your el/connections.yml references.
      Oracle connections also need Oracle Instant Client on this machine:
-     re-run with --oracle-client, or install it and point LD_LIBRARY_PATH
-     at it in the same file (crates/el_engine/ORACLE.md).
+     re-run with --oracle-client, or install it and point
+     ZDBT_EL_ORACLE_CLIENT_DIR at it in the same file (crates/el_engine/ORACLE.md).
   2. Put el/connections.yml (with its profiles) under $PROJECT/el/, then restart.
   3. TLS: set ZDBT_EL_SERVE_FLAGS="--tls-cert /path/cert.pem --tls-key /path/key.pem"
      in /etc/zdbt-el-serve/env and drop --insecure-http from the launcher, or keep

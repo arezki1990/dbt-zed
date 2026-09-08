@@ -213,13 +213,18 @@ fn build_loader(
     // Instant Client on this machine. Only the password is a secret; it
     // travels in the child's environment.
     if let Some(Connection::Oracle(conn)) = connections.connections.get(target_name) {
-        let creds = crate::connectors::oracle_env::OracleCreds::resolve(conn, env)?;
+        let creds = crate::connectors::oracle_env::OracleCreds::resolve(
+            conn,
+            env,
+            &request.project_root,
+        )?;
         let config = OracleSidecarConfig {
             worker,
             user: creds.user.expose().to_owned(),
             connect: creds.connect.expose().to_owned(),
             password: creds.password,
             tns_admin: creds.tns_admin,
+            client_settings: creds.client_settings,
             dialect: crate::oracle_types::OracleDialect::default(),
         };
         return Ok(Box::new(OracleSidecarLoader::spawn(&config)?));
