@@ -3,10 +3,10 @@
 //! YAML editor undoes it, and a dirty (unsaved) buffer is refused rather
 //! than clobbered.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{AsyncWindowContext, Entity, WeakEntity};
+use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
 use project::Project;
 use workspace::Workspace;
 
@@ -52,6 +52,19 @@ pub async fn check_clean(
         }
     }
     Ok(())
+}
+
+/// Deploy preflight: true when the editor buffer for `path` differs from
+/// the file on disk, i.e. shipping the file would ship a stale spec. Only
+/// an open buffer can be dirty (closing one discards or saves its edits),
+/// so this reads the open buffer synchronously and never opens one.
+pub fn has_unsaved_edits(project: &Entity<Project>, path: &Path, cx: &App) -> bool {
+    let project = project.read(cx);
+    project
+        .project_path_for_absolute_path(path, cx)
+        .and_then(|project_path| project.get_open_buffer(&project_path, cx))
+        .map(|buffer| buffer.read(cx).is_dirty())
+        .unwrap_or(false)
 }
 
 /// Same buffer-routed write for any canonical spec text (connections.yml).

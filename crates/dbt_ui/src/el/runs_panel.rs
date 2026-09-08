@@ -368,6 +368,22 @@ impl ElRunsPanel {
         cx.notify();
     }
 
+    /// After a deploy: Remote tab, that server, opened on that pipeline.
+    /// The first poll (which lists the just-deployed copy) keeps the
+    /// detail open, so the view fills in rather than bouncing to the
+    /// overview.
+    pub fn show_remote_pipeline(
+        &mut self,
+        remote: SharedString,
+        pipeline: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_remote(remote, cx);
+        self.remote_detail = Some(pipeline);
+        self.remote_run_detail = None;
+        cx.notify();
+    }
+
     /// A profile switch changed what every connection name means: drop
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
@@ -1688,7 +1704,7 @@ impl ElRunsPanel {
 }
 
 /// "in 1m 20s" / "3m ago" for a unix instant, relative to now.
-fn relative_time(unix: u64, future: bool) -> String {
+pub(crate) fn relative_time(unix: u64, future: bool) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())

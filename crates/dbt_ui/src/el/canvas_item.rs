@@ -2034,8 +2034,8 @@ impl Render for ElPipelineCanvas {
         let deploy_blocked = self.parse_error.is_some() || self.loaded.is_none();
         let deploy_tooltip: SharedString = match &self.parse_error {
             Some(error) => format!("Can't deploy: {error}").into(),
-            None => "Ship this pipeline to a remote server — nothing runs there until \
-                     deployed"
+            None => "Deploy this pipeline to a server — the popup shows what changes \
+                     there first"
                 .into(),
         };
         let toolbar = h_flex()
@@ -2078,10 +2078,12 @@ impl Render for ElPipelineCanvas {
                         };
                         let name = loaded.pipeline.pipeline.clone();
                         let root = this.project_root.clone();
+                        let spec_path = this.spec_path.clone();
+                        let project = this.project.clone();
                         this.workspace
                             .update(cx, |workspace, cx| {
                                 super::deploy_modal::ElDeployModal::deploy(
-                                    workspace, root, name, window, cx,
+                                    workspace, root, name, spec_path, project, window, cx,
                                 );
                             })
                             .ok();

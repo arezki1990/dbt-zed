@@ -577,7 +577,7 @@ struct PipelineInfo {
 }
 
 /// The schedule's next fire time, panic-guarded like the scheduler.
-fn next_fire_unix(schedule: Option<&str>, timezone: Option<&str>) -> Option<u64> {
+pub fn next_fire_unix(schedule: Option<&str>, timezone: Option<&str>) -> Option<u64> {
     let schedule: cron::Schedule = schedule?.parse().ok()?;
     let timezone: chrono_tz::Tz = timezone
         .and_then(|name| name.parse().ok())
@@ -761,6 +761,9 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("project"),
+                    // Lets the IDE refuse a deploy before the button is
+                    // pressed; older daemons omit it and still 409 on /deploy.
+                    "tracks_checkout": state.config.track_checkout,
                 }),
             )
         }
@@ -1082,6 +1085,9 @@ pub struct EventsPage {
 pub struct RemotePipeline {
     pub name: String,
     pub schedule: Option<String>,
+    /// Older daemons don't send it.
+    #[serde(default)]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub next_run_unix: Option<u64>,
     #[serde(default)]
@@ -1094,6 +1100,57 @@ pub struct RemotePipeline {
     pub last_run_unix: Option<u64>,
     pub streams: usize,
     pub running: bool,
+}
+
+/// What deploying a local spec to a server would do, stated before the
+/// Deploy button: whether it replaces a copy already there (and what that
+/// copy is pinned to), whether a run of it is in flight, and which schedule
+/// starts firing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeployPreflight {
+    /// Some when the server already holds a pipeline of this name.
+    pub replacing: Option<ReplacedDeploy>,
+    /// A run of this pipeline is in progress on the server. It finishes on
+    /// the old spec: `start_run` loads the deployed file when it starts.
+    pub running: bool,
+    /// The local schedule that will fire after the deploy: (cron, timezone),
+    /// timezone defaulting to UTC like the scheduler does.
+    pub schedule: Option<(String, String)>,
+    /// When that schedule first fires; None when it doesn't parse.
+    pub first_fire_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplacedDeploy {
+    pub deployed_unix: Option<u64>,
+    /// The profile the existing copy is pinned to; None = server default.
+    pub previous_profile: Option<String>,
+    /// The chosen profile differs from the pinned one.
+    pub profile_changes: bool,
+    pub previous_schedule: Option<String>,
+}
+
+/// Builds the facts for `local` against what `remote` reports from
+/// `GET /pipelines`, for a deploy pinned to `profile` (None = server
+/// default). Pure: no network, no clock beyond the schedule's next fire.
+pub fn deploy_preflight(
+    local: &Pipeline,
+    remote: &[RemotePipeline],
+    profile: Option<&str>,
+) -> DeployPreflight {
+    let existing = remote.iter().find(|p| p.name == local.pipeline);
+    let replacing = existing.map(|p| ReplacedDeploy {
+        deployed_unix: p.deployed_unix,
+        previous_profile: p.profile.clone(),
+        profile_changes: p.profile.as_deref() != profile,
+        previous_schedule: p.schedule.clone(),
+    });
+    let running = existing.map(|p| p.running).unwrap_or(false);
+    let schedule = local.schedule.clone().map(|cron| {
+        (cron, local.timezone.clone().unwrap_or_else(|| "UTC".to_owned()))
+    });
+    let first_fire_unix = next_fire_unix(local.schedule.as_deref(), local.timezone.as_deref());
+    DeployPreflight { replacing, running, schedule, first_fire_unix }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1325,5 +1382,98 @@ mod tests {
             serde_json::from_str(r#"{"events":[],"next":3,"done":true,"error":"boom"}"#)
                 .unwrap();
         assert_eq!(page.error.as_deref(), Some("boom"));
+    }
+
+    fn local(schedule: Option<&str>, timezone: Option<&str>) -> Pipeline {
+        let mut yaml = String::from(
+            "version: 1\npipeline: orders\nsource: pg\ntarget: {connection: sf, schema: raw}\nstreams: []\n",
+        );
+        if let Some(schedule) = schedule {
+            yaml.push_str(&format!("schedule: \"{schedule}\"\n"));
+        }
+        if let Some(timezone) = timezone {
+            yaml.push_str(&format!("timezone: {timezone}\n"));
+        }
+        serde_yaml_ng::from_str(&yaml).unwrap()
+    }
+
+    fn remote(json: serde_json::Value) -> RemotePipeline {
+        serde_json::from_value(json).unwrap()
+    }
+
+    // An older daemon's /pipelines row has no timezone/deployed_unix/
+    // created_unix; it must still deserialize.
+    #[test]
+    fn remote_pipeline_tolerates_missing_newer_fields() {
+        let p = remote(serde_json::json!({
+            "name": "orders", "schedule": null, "streams": 2, "running": false
+        }));
+        assert_eq!(p.timezone, None);
+        assert_eq!(p.deployed_unix, None);
+        assert_eq!(p.created_unix, None);
+        assert_eq!(p.profile, None);
+        let p = remote(serde_json::json!({
+            "name": "orders", "schedule": "0 0 2 * * *", "timezone": "Europe/Paris",
+            "streams": 2, "running": true, "deployed_unix": 42, "profile": "prod"
+        }));
+        assert_eq!(p.timezone.as_deref(), Some("Europe/Paris"));
+        assert_eq!(p.deployed_unix, Some(42));
+    }
+
+    #[test]
+    fn preflight_is_new_when_the_server_lacks_the_pipeline() {
+        let others = [remote(serde_json::json!({
+            "name": "customers", "schedule": null, "streams": 1, "running": true
+        }))];
+        let pf = deploy_preflight(&local(None, None), &others, Some("prod"));
+        assert_eq!(pf.replacing, None);
+        assert!(!pf.running);
+        assert_eq!(pf.schedule, None);
+        assert_eq!(pf.first_fire_unix, None);
+    }
+
+    #[test]
+    fn preflight_reports_the_replaced_copy_and_a_profile_change() {
+        let existing = [remote(serde_json::json!({
+            "name": "orders", "schedule": "0 0 2 * * *", "streams": 2, "running": true,
+            "deployed_unix": 1000, "profile": "staging"
+        }))];
+        let pf = deploy_preflight(&local(None, None), &existing, Some("prod"));
+        let replaced = pf.replacing.expect("replacing");
+        assert_eq!(replaced.deployed_unix, Some(1000));
+        assert_eq!(replaced.previous_profile.as_deref(), Some("staging"));
+        assert!(replaced.profile_changes);
+        assert_eq!(replaced.previous_schedule.as_deref(), Some("0 0 2 * * *"));
+        assert!(pf.running);
+
+        let same = deploy_preflight(&local(None, None), &existing, Some("staging"));
+        assert!(!same.replacing.unwrap().profile_changes);
+
+        let unpinned = [remote(serde_json::json!({
+            "name": "orders", "schedule": null, "streams": 2, "running": false
+        }))];
+        let pf = deploy_preflight(&local(None, None), &unpinned, None);
+        assert!(!pf.replacing.unwrap().profile_changes);
+        assert!(!pf.running);
+        let pf = deploy_preflight(&local(None, None), &unpinned, Some("prod"));
+        assert!(pf.replacing.unwrap().profile_changes);
+    }
+
+    #[test]
+    fn preflight_states_the_schedule_that_starts_firing() {
+        let pf = deploy_preflight(&local(Some("0 0 2 * * *"), None), &[], None);
+        assert_eq!(
+            pf.schedule,
+            Some(("0 0 2 * * *".to_owned(), "UTC".to_owned()))
+        );
+        assert!(pf.first_fire_unix.is_some());
+
+        let pf = deploy_preflight(&local(Some("0 0 2 * * *"), Some("Europe/Paris")), &[], None);
+        assert_eq!(pf.schedule.unwrap().1, "Europe/Paris");
+        assert!(pf.first_fire_unix.is_some());
+
+        let pf = deploy_preflight(&local(Some("not a cron"), None), &[], None);
+        assert!(pf.schedule.is_some());
+        assert_eq!(pf.first_fire_unix, None);
     }
 }
