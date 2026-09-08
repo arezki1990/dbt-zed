@@ -3,6 +3,7 @@
 //! Client at run time — a missing client is DPI-1047 and becomes the
 //! actionable message in [`INSTANT_CLIENT_HELP`]. Credentials come from
 //! the environment (`ZDBT_EL_SRC_ORACLE_*`, see `oracle_env`), never argv.
+//! Setup, the test container and the live tests: `el_engine/ORACLE.md`.
 //!
 //! Reading is a single server-side cursor with the fetch array size set to
 //! the chunk size, pulled lazily one chunk per `next_chunk` — no OFFSET
