@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{Context, SharedString, Task, WeakEntity, Window};
-use ui::{Tooltip, prelude::*};
+use ui::{CopyButton, Tooltip, prelude::*};
 use workspace::Workspace;
 
 use el_engine::progress::{CancelFlag, Phase, ProgressEvent};
@@ -426,14 +426,33 @@ impl Render for ElRunView {
                     .border_color(colors.border)
                     .child(Label::new(run.pipeline.clone()).size(LabelSize::Small))
                     .child(
-                        Label::new(status)
-                            .size(LabelSize::XSmall)
-                            .color(match (run.finished, &run.fatal) {
-                                (_, Some(_)) | (Some(false), _) => Color::Error,
-                                (Some(true), _) => Color::Success,
-                                _ => Color::Muted,
-                            }),
+                        // A fatal message can outrun the header: it
+                        // truncates, shows whole on hover, and copies.
+                        div()
+                            .id("el-run-status")
+                            .min_w_0()
+                            .overflow_hidden()
+                            .when_some(run.fatal.as_ref(), |cell, fatal| {
+                                cell.tooltip(Tooltip::text(
+                                    super::runs_panel::tooltip_text(fatal),
+                                ))
+                            })
+                            .child(
+                                Label::new(status)
+                                    .size(LabelSize::XSmall)
+                                    .color(match (run.finished, &run.fatal) {
+                                        (_, Some(_)) | (Some(false), _) => Color::Error,
+                                        (Some(true), _) => Color::Success,
+                                        _ => Color::Muted,
+                                    })
+                                    .truncate(),
+                            ),
                     )
+                    .children(run.fatal.clone().map(|fatal| {
+                        CopyButton::new("el-run-copy-fatal", fatal)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip_label("Copy error")
+                    }))
                     .child(div().flex_1())
                     .when(
                         !running && run.streams.iter().any(|row| row.error.is_some()),
@@ -533,14 +552,26 @@ impl Render for ElRunView {
                 }
             }
             if let Some(error) = &row.error {
-                line = line.child(
-                    div().flex_1().min_w_0().child(
-                        Label::new(error.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                            .truncate(),
-                    ),
-                );
+                line = line
+                    .child(
+                        div()
+                            .id(("el-run-stream-error", ix))
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .tooltip(Tooltip::text(super::runs_panel::tooltip_text(error)))
+                            .child(
+                                Label::new(error.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Error)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        CopyButton::new(("el-run-stream-copy", ix), error.clone())
+                            .icon_size(IconSize::XSmall)
+                            .tooltip_label("Copy error"),
+                    );
             }
             body = body.child(line);
         }

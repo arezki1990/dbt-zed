@@ -72,6 +72,9 @@ pub struct ElRunsPanel {
     remote_run_detail: Option<u64>,
     remote_run_events: Vec<el_engine::ProgressEvent>,
     remote_run_cursor: usize,
+    /// The opened run's error as reported by its events page — keeps the
+    /// message on the detail view after the run drops out of `/runs`.
+    remote_run_error: Option<SharedString>,
     /// Height of the SQL editor in the Query tab; its splitter drags it.
     query_split: f32,
     query_split_drag: Option<(f32, f32)>,
@@ -274,6 +277,7 @@ impl ElRunsPanel {
                 remote_run_detail: None,
                 remote_run_events: Vec::new(),
                 remote_run_cursor: 0,
+                remote_run_error: None,
                 query_split: 110.,
                 query_split_drag: None,
                 remote_split: 170.,
@@ -499,6 +503,9 @@ impl ElRunsPanel {
                                     if this.remote_run_detail == Some(run_id) {
                                         this.remote_run_events.extend(page.events);
                                         this.remote_run_cursor = page.next;
+                                        if let Some(error) = page.error {
+                                            this.remote_run_error = Some(error.into());
+                                        }
                                     }
                                 }
                                 this.remote_pipelines = pipelines;
@@ -970,6 +977,9 @@ impl ElRunsPanel {
                 )
             };
             let open_name = name.clone();
+            let cell_id = |col: &str| {
+                SharedString::from(format!("el-remote-pipeline-{col}-{}", pipeline.name))
+            };
             pipelines = pipelines.child(
                 h_flex()
                     .id(("el-remote-pipeline", ix))
@@ -986,9 +996,15 @@ impl ElRunsPanel {
                         this.remote_detail = Some(open_name.clone());
                         cx.notify();
                     }))
-                    .child(cell(140., pipeline.name.clone(), Color::Default))
+                    .child(tip_cell(
+                        cell_id("name"),
+                        140.,
+                        pipeline.name.clone(),
+                        Color::Default,
+                    ))
                     .child(cell(55., pipeline.streams.to_string(), Color::Muted))
-                    .child(cell(
+                    .child(tip_cell(
+                        cell_id("schedule"),
                         110.,
                         pipeline.schedule.clone().unwrap_or_else(|| "manual".into()),
                         Color::Muted,
@@ -1001,7 +1017,8 @@ impl ElRunsPanel {
                             .unwrap_or_else(|| "—".into()),
                         Color::Muted,
                     ))
-                    .child(cell(
+                    .child(tip_cell(
+                        cell_id("profile"),
                         70.,
                         pipeline
                             .profile
@@ -1279,6 +1296,7 @@ impl ElRunsPanel {
                         this.remote_run_detail = None;
                         this.remote_run_events.clear();
                         this.remote_run_cursor = 0;
+                        this.remote_run_error = None;
                         cx.notify();
                     })),
             )
@@ -1299,6 +1317,41 @@ impl ElRunsPanel {
                         this.remote_action(move |client| client.cancel(run_id), cx);
                     }))
             }));
+
+        // The run's own error (a fatal message or the failed-stream
+        // count): the runs table truncates it, so show it whole here,
+        // and keep the events-page copy once the run leaves `/runs`.
+        let run_error: Option<SharedString> = run
+            .and_then(|run| run.error.clone().map(SharedString::from))
+            .or_else(|| self.remote_run_error.clone());
+        let error_block = run_error.map(|error| {
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_start()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(
+                    div()
+                        .id("el-run-detail-error")
+                        .flex_1()
+                        .min_w_0()
+                        .max_h(px(96.))
+                        .overflow_y_scroll()
+                        .child(
+                            Label::new(error.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        ),
+                )
+                .child(
+                    ui::CopyButton::new("el-run-detail-copy-error", error)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip_label("Copy error"),
+                )
+        });
 
         // Fold the event log into per-stream rows.
         let (order, agg) = fold_stream_events(&self.remote_run_events);
@@ -1339,6 +1392,8 @@ impl ElRunsPanel {
             )
         };
         for (ix, stream) in order.iter().enumerate() {
+            let cell_id =
+                |col: &str| SharedString::from(format!("el-run-{run_id}-stream-{ix}-{col}"));
             let entry = agg.get(stream);
             let (phase, read, written, casts, failures, error, done) = entry
                 .map(|entry| {
@@ -1412,7 +1467,7 @@ impl ElRunsPanel {
                     .items_center()
                     .rounded_sm()
                     .when(ix % 2 == 1, |row| row.bg(colors.element_background))
-                    .child(cell(150., stream.clone(), Color::Default))
+                    .child(tip_cell(cell_id("name"), 150., stream.clone(), Color::Default))
                     .child(cell(
                         80.,
                         phase.unwrap_or_else(|| "—".into()),
@@ -1422,10 +1477,21 @@ impl ElRunsPanel {
                     .child(cell(90., written.to_string(), Color::Default))
                     .child(casts_cell)
                     .child(
-                        Label::new(status_text)
-                            .size(LabelSize::XSmall)
-                            .color(status_color)
-                            .truncate(),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                tip_text(cell_id("status"), status_text, status_color)
+                                    .flex_1()
+                                    .min_w_0(),
+                            )
+                            .children(error.map(|error| {
+                                ui::CopyButton::new(cell_id("copy"), error)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip_label("Copy error")
+                            })),
                     ),
             );
         }
@@ -1433,6 +1499,7 @@ impl ElRunsPanel {
             .flex_1()
             .min_h_0()
             .child(header)
+            .children(error_block)
             .child(stream_header)
             .child(rows)
             .into_any_element()
@@ -1522,14 +1589,25 @@ impl ElRunsPanel {
                     this.remote_run_detail = Some(run_id);
                     this.remote_run_events.clear();
                     this.remote_run_cursor = 0;
+                    this.remote_run_error = None;
                     cx.notify();
                 }))
                 .child(cell(44., format!("#{}", run.id), Color::Muted));
             if show_pipeline {
-                row = row.child(cell(130., run.pipeline.clone(), Color::Default));
+                row = row.child(tip_cell(
+                    ("el-run-pipeline", run.id as usize),
+                    130.,
+                    run.pipeline.clone(),
+                    Color::Default,
+                ));
             }
             runs = runs.child(
-                row.child(cell(70., run.status.clone(), status_color))
+                row.child(tip_cell(
+                    ("el-run-status", run.id as usize),
+                    70.,
+                    run.status.clone(),
+                    status_color,
+                ))
                     .child(cell(
                         80.,
                         relative_time(run.started_unix, false),
@@ -1568,12 +1646,19 @@ impl ElRunsPanel {
                         if run.attempt == 0 { Color::Muted } else { Color::Warning },
                     ))
                     .child(
-                        Label::new(run.error.clone().unwrap_or_default())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                            .truncate(),
+                        tip_text(
+                            ("el-run-error", run.id as usize),
+                            run.error.clone().unwrap_or_default(),
+                            Color::Error,
+                        )
+                        .flex_1()
+                        .min_w_0(),
                     )
-                    .child(div().flex_1())
+                    .children(run.error.clone().map(|error| {
+                        ui::CopyButton::new(("el-run-copy-error", run.id as usize), error)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip_label("Copy error")
+                    }))
                     .children(is_running.then(|| {
                         Button::new(("el-remote-cancel", run.id as usize), "Cancel")
                             .label_size(LabelSize::XSmall)
@@ -1635,6 +1720,45 @@ fn duration_text(started: u64, finished: Option<u64>) -> String {
     } else {
         format!("{delta}s")
     }
+}
+
+/// A tooltip wraps but has no height cap, so hover text stops here; the
+/// copy action always takes the whole string.
+const TOOLTIP_CAP: usize = 600;
+
+/// The text a truncated cell shows on hover: the cell's own text, cut
+/// to a readable length.
+pub(super) fn tooltip_text(text: &str) -> SharedString {
+    match text.char_indices().nth(TOOLTIP_CAP) {
+        None => text.to_owned().into(),
+        Some((cut, _)) => format!("{}…", &text[..cut]).into(),
+    }
+}
+
+/// A truncating text cell that shows its full text on hover. Nothing
+/// reports whether the label actually clipped, so every text cell
+/// carries the tooltip; numeric cells keep the plain closure.
+fn tip_text(
+    id: impl Into<gpui::ElementId>,
+    text: String,
+    color: Color,
+) -> gpui::Stateful<gpui::Div> {
+    let tip = tooltip_text(&text);
+    div()
+        .id(id)
+        .overflow_hidden()
+        .when(!text.is_empty(), move |cell| cell.tooltip(ui::Tooltip::text(tip)))
+        .child(Label::new(text).size(LabelSize::XSmall).color(color).truncate())
+}
+
+/// [`tip_text`] at a fixed column width.
+fn tip_cell(
+    id: impl Into<gpui::ElementId>,
+    width: f32,
+    text: String,
+    color: Color,
+) -> gpui::Stateful<gpui::Div> {
+    tip_text(id, text, color).w(px(width)).flex_shrink_0()
 }
 
 /// The shared results grid: fixed-width columns, accent header, uniform
@@ -1828,5 +1952,21 @@ impl Render for ElRunsPanel {
             .key_context("ElRunsPanel")
             .bg(colors.panel_background)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TOOLTIP_CAP, tooltip_text};
+
+    #[test]
+    fn tooltip_text_keeps_short_text_and_caps_long_text() {
+        assert_eq!(tooltip_text("boom").as_ref(), "boom");
+        let long = "é".repeat(TOOLTIP_CAP + 50);
+        let tip = tooltip_text(&long);
+        assert_eq!(tip.chars().count(), TOOLTIP_CAP + 1);
+        assert!(tip.ends_with('…'));
+        let exact = "x".repeat(TOOLTIP_CAP);
+        assert_eq!(tooltip_text(&exact).as_ref(), exact);
     }
 }

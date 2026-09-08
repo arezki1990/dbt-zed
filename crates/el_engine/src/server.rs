@@ -1296,3 +1296,34 @@ impl RemoteClient {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The IDE renders `error` from both `/runs` and `/runs/:id/events`;
+    // an older daemon omits it and must still deserialize.
+    #[test]
+    fn run_and_events_page_tolerate_a_missing_error() {
+        let run: RemoteRun = serde_json::from_str(
+            r#"{"id":1,"pipeline":"p","status":"ok","attempt":0,"started_unix":10,"rows_written":5}"#,
+        )
+        .unwrap();
+        assert_eq!(run.error, None);
+        assert_eq!(run.finished_unix, None);
+
+        let run: RemoteRun = serde_json::from_str(
+            r#"{"id":2,"pipeline":"p","status":"failed","attempt":1,"started_unix":10,"finished_unix":12,"rows_written":0,"error":"boom"}"#,
+        )
+        .unwrap();
+        assert_eq!(run.error.as_deref(), Some("boom"));
+
+        let page: EventsPage =
+            serde_json::from_str(r#"{"events":[],"next":0,"done":true}"#).unwrap();
+        assert_eq!(page.error, None);
+        let page: EventsPage =
+            serde_json::from_str(r#"{"events":[],"next":3,"done":true,"error":"boom"}"#)
+                .unwrap();
+        assert_eq!(page.error.as_deref(), Some("boom"));
+    }
+}
