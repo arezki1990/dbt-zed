@@ -1233,7 +1233,8 @@ Root: HKCU; Subkey: "Software\Classes\{#RegValueName}SourceFile\DefaultIcon"; Va
 Root: HKCU; Subkey: "Software\Classes\{#RegValueName}SourceFile\shell\open"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}.exe"""
 Root: HKCU; Subkey: "Software\Classes\{#RegValueName}SourceFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}.exe"" ""%1"""
 
-Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}.exe"; ValueType: none; ValueName: ""; Flags: uninsdeletekey
+; Shared with every Zed channel (all install a Zed.exe): no uninsdeletekey, see RemoveSharedClassesKeys.
+Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}.exe"; ValueType: none; ValueName: ""
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}.exe\DefaultIcon"; ValueType: none; Flags: deletekey
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}.exe\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExeName}.exe"""
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExeName}.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}.exe"" ""%1"""
@@ -1256,7 +1257,8 @@ Root: HKCU; Subkey: "Software\Classes\Drive\shell\{#RegValueName}\command"; Valu
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{code:AddToPath|{app}\bin}"; Tasks: addtopath; Check: NeedsAddToPath(ExpandConstant('{app}\bin'))
 
 ; URI Scheme
-Root: HKCU; Subkey: "Software\Classes\zed"; ValueType: "string"; ValueData: "URL:zed Protocol"; Flags: uninsdeletekey
+; Shared with every Zed channel: no uninsdeletekey, see RemoveSharedClassesKeys.
+Root: HKCU; Subkey: "Software\Classes\zed"; ValueType: "string"; ValueData: "URL:zed Protocol"
 Root: HKCU; Subkey: "Software\Classes\zed"; ValueType: "string"; ValueName: "URL Protocol"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\zed\DefaultIcon"; ValueType: "string"; ValueData: "{app}\Zed.exe,1"
 Root: HKCU; Subkey: "Software\Classes\zed\shell\open\command"; ValueType: "string"; ValueData: """{app}\Zed.exe"" ""%1"""
@@ -1316,6 +1318,31 @@ begin
     Result := OrigPath + ';' + path
 end;
 
+// The zed:// protocol handler and the Applications\Zed.exe entry are written by
+// every Zed channel and by zdbt (they all install a Zed.exe), so the last
+// installer owns them. They carry no uninsdeletekey flag: remove them only
+// while they still point at this installation, otherwise leave them to the
+// product that wrote them last.
+function SharedKeyPointsAtThisInstall(Key: string): Boolean;
+var
+  Command: string;
+begin
+  Result := False;
+  if RegQueryStringValue(HKCU, Key + '\shell\open\command', '', Command) then begin
+    Result := Pos(Lowercase(ExpandConstant('{app}\{#AppExeName}.exe')), Lowercase(Command)) > 0;
+  end;
+end;
+
+procedure RemoveSharedClassesKeys();
+begin
+  if SharedKeyPointsAtThisInstall('Software\Classes\zed') then begin
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\zed');
+  end;
+  if SharedKeyPointsAtThisInstall('Software\Classes\Applications\{#AppExeName}.exe') then begin
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Applications\{#AppExeName}.exe');
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Path: string;
@@ -1324,6 +1351,9 @@ var
   NewPath: string;
   i: Integer;
 begin
+  if CurUninstallStep = usUninstall then begin
+    RemoveSharedClassesKeys();
+  end;
   if not CurUninstallStep = usUninstall then begin
     exit;
   end;

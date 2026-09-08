@@ -6,8 +6,9 @@ set -eu
 check_remaining_installations() {
     platform="$(uname -s)"
     if [ "$platform" = "Darwin" ]; then
-        # Check for any Zed variants in /Applications
-        remaining=$(ls -d /Applications/Zed*.app 2>/dev/null | wc -l)
+        # Check for any Zed variants (and the zdbt bundle, which shares
+        # ~/Library/Application Support/Zed) in /Applications
+        remaining=$(ls -d /Applications/Zed*.app /Applications/zdbt.app 2>/dev/null | wc -l)
         [ "$remaining" -eq 0 ]
     else
         # Check for any Zed variants in ~/.local
@@ -120,9 +121,12 @@ macos() {
         app_id="dev.zed.Zed-Preview"
         ;;
       dev)
+        # The dev channel is bundled as zdbt (crates/zed/Cargo.toml
+        # [package.metadata.bundle]): identifier dev.zdbt.zdbt keys its
+        # caches, preferences and saved state under ~/Library.
         app="zdbt.app"
         db_suffix="dev"
-        app_id="dev.zed.Zed-Dev"
+        app_id="dev.zdbt.zdbt"
         ;;
     esac
 
