@@ -2,10 +2,10 @@
 AppId={#AppId}
 AppName={#AppName}
 AppVerName={#AppDisplayName}
-AppPublisher=Zed Industries
-AppPublisherURL=https://www.zed.dev/
-AppSupportURL=https://www.zed.dev/
-AppUpdatesURL=https://www.zed.dev/
+AppPublisher=zdbt
+AppPublisherURL=https://arezki1990.github.io/dbt-zed/
+AppSupportURL=https://github.com/arezki1990/dbt-zed/issues
+AppUpdatesURL=https://github.com/arezki1990/dbt-zed/releases
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableReadyPage=yes

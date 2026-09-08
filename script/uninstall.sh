@@ -120,7 +120,7 @@ macos() {
         app_id="dev.zed.Zed-Preview"
         ;;
       dev)
-        app="Zed Dev.app"
+        app="zdbt.app"
         db_suffix="dev"
         app_id="dev.zed.Zed-Dev"
         ;;

@@ -313,17 +313,21 @@ function BuildInstaller {
             $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
-            $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            # zdbt ships on the dev channel. Its own AppId (not Zed Dev's) so it
+            # installs beside an existing "Zed Dev" as a separate product, in a
+            # folder and Start menu entry named zdbt.
+            $appId = "{{6D0B5C6E-4B7B-4F0C-9C5D-2E1B7A3F8D21}"
+            $appIconName = "app-icon-zdbt"
+            $appName = "zdbt"
+            $appDisplayName = "zdbt"
+            $appSetupName = "zdbt-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
+            # (release_channel::app_identifier() + "-Instance-Mutex").
+            $appMutex = "zdbt-Instance-Mutex"
             $appExeName = "Zed"
-            $regValueName = "ZedDev"
-            $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
+            $regValueName = "zdbt"
+            $appUserId = "zdbt.zdbt"
+            $appShellNameShort = "z&dbt"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
