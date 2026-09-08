@@ -207,6 +207,7 @@ pub enum Connection {
     Postgres(DbConn),
     Mysql(DbConn),
     Mssql(MssqlConn),
+    Oracle(OracleConn),
     Snowflake(SnowflakeConn),
     Duckdb(DuckdbConn),
     S3(ObjectStoreConn),
@@ -225,6 +226,7 @@ impl Connection {
             Connection::Postgres(_) => "postgres",
             Connection::Mysql(_) => "mysql",
             Connection::Mssql(_) => "mssql",
+            Connection::Oracle(_) => "oracle",
             Connection::Snowflake(_) => "snowflake",
             Connection::Duckdb(_) => "duckdb",
             Connection::S3(_) => "s3",
@@ -253,6 +255,43 @@ impl Connection {
             .into_iter()
             .filter(|var| !env.contains(var))
             .collect()
+    }
+
+    /// The parameter keys this connection carries (known fields that are
+    /// set, plus any hand-added extras) — for summaries in the UI. Keys
+    /// only: a value is never returned, so a credential typed literally
+    /// into the file still cannot reach a label or a log.
+    pub fn param_keys(&self) -> Vec<String> {
+        let yaml = serde_yaml_ng::to_string(self).unwrap_or_default();
+        let mapping: IndexMap<String, serde_yaml_ng::Value> =
+            serde_yaml_ng::from_str(&yaml).unwrap_or_default();
+        mapping.into_keys().filter(|key| key != "type").collect()
+    }
+
+    /// Shape problems in the connection itself (no pipeline needed).
+    /// Messages name fields and variables only, never values.
+    pub fn shape_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if let Connection::Oracle(conn) = self {
+            if conn.user.trim().is_empty() {
+                issues.push("oracle connections need a user".to_owned());
+            }
+            if conn.connect.trim().is_empty() {
+                issues.push(
+                    "oracle connections need a connect string: host:port/service_name \
+                     or a TNS alias"
+                        .to_owned(),
+                );
+            }
+            if !conn.password.is_empty() && !conn.password.contains("${") {
+                issues.push(
+                    "oracle password is stored literally — reference it as ${VAR} \
+                     and set the variable in your environment or .env"
+                        .to_owned(),
+                );
+            }
+        }
+        issues
     }
 }
 
@@ -296,6 +335,43 @@ pub struct MssqlConn {
     #[serde(flatten)]
     #[schemars(skip)]
     pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+/// An Oracle database. The worker connects through Oracle Instant Client,
+/// which must be installed on the machine running `zdbt-el-worker`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct OracleConn {
+    /// Database user; may be `${VAR}`-templated.
+    pub user: String,
+    /// Password — always a `${VAR}` reference, never a literal.
+    pub password: String,
+    /// Easy Connect string `host:port/service_name` (e.g.
+    /// `db.example.com:1521/ORCLPDB1`) or a TNS alias resolved through
+    /// `tnsnames.ora` in `tns_admin`.
+    pub connect: String,
+    /// Schema (owner) whose tables are listed and read; defaults to the
+    /// user's own schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// Directory holding an Oracle wallet (mTLS / Autonomous Database).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_dir: Option<String>,
+    /// Directory holding `tnsnames.ora` / `sqlnet.ora` (TNS_ADMIN).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tns_admin: Option<String>,
+    /// Unknown keys survive canonical rewrites — hand additions are
+    /// never silently dropped.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: IndexMap<String, serde_yaml_ng::Value>,
+}
+
+impl OracleConn {
+    /// The schema tables are read from: `schema` when set, else the user.
+    /// Both may still carry `${VAR}` placeholders.
+    pub fn effective_schema(&self) -> &str {
+        self.schema.as_deref().unwrap_or(&self.user)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -442,7 +518,7 @@ pub fn load_remotes(path: &Path) -> Result<Remotes, SpecError> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TargetSpec {
-    /// Connection name; must be a snowflake connection.
+    /// Connection name; must be a snowflake, duckdb or oracle connection.
     pub connection: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
@@ -823,10 +899,10 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
                 pipeline.target.connection
             ),
         ),
-        Some(conn) if !matches!(conn.kind(), "snowflake" | "duckdb") => issue(
+        Some(conn) if !matches!(conn.kind(), "snowflake" | "duckdb" | "oracle") => issue(
             None,
             format!(
-                "target connection {:?} is {} — targets must be snowflake or duckdb",
+                "target connection {:?} is {} — targets must be snowflake, duckdb or oracle",
                 pipeline.target.connection,
                 conn.kind()
             ),
@@ -920,7 +996,10 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
         }
         // Stream shape must match the source connection's kind.
         if let Some(conn) = source_conn {
-            let db_kind = matches!(conn.kind(), "duckdb" | "postgres" | "mysql" | "mssql");
+            let db_kind = matches!(
+                conn.kind(),
+                "duckdb" | "postgres" | "mysql" | "mssql" | "oracle"
+            );
             match &stream.source {
                 SourceObject::Table { .. } if !db_kind => issue(
                     Some(&stream.name),
@@ -949,8 +1028,14 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
         }
     }
 
-    // Env references must resolve (names only in the message).
+    // Connection shape, then env references (names only in the messages).
     if let Some(conn) = source_conn {
+        for problem in conn.shape_issues() {
+            issue(
+                None,
+                format!("connection {:?}: {problem}", pipeline.source),
+            );
+        }
         for var in conn.env_refs() {
             if std::env::var_os(&var).is_none() {
                 issue(

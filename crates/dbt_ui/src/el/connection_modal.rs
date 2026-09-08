@@ -21,8 +21,8 @@ use ui::prelude::*;
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, Pipeline, SnowflakeAuth, SnowflakeConn,
-    SpecError,
+    Connection, Connections, DbConn, DuckdbConn, OracleConn, Pipeline, SnowflakeAuth,
+    SnowflakeConn, SpecError,
 };
 
 use super::builder::ConnType;
@@ -70,7 +70,7 @@ pub struct ElConnectionModal {
 fn form_supported(kind: &str) -> bool {
     matches!(
         kind,
-        "postgres" | "mysql" | "duckdb" | "snowflake" | "local"
+        "postgres" | "mysql" | "oracle" | "duckdb" | "snowflake" | "local"
     )
 }
 
@@ -78,6 +78,7 @@ fn conn_type_of(kind: &str) -> ConnType {
     match kind {
         "postgres" => ConnType::Postgres,
         "mysql" => ConnType::Mysql,
+        "oracle" => ConnType::Oracle,
         "snowflake" => ConnType::Snowflake,
         "local" => ConnType::Local,
         _ => ConnType::Duckdb,
@@ -133,6 +134,7 @@ fn carry_extra(new_value: &mut Connection, stored: &Connection) {
         | (Connection::Mysql(new), Connection::Mysql(old)) => {
             new.extra = old.extra.clone();
         }
+        (Connection::Oracle(new), Connection::Oracle(old)) => new.extra = old.extra.clone(),
         (Connection::Duckdb(new), Connection::Duckdb(old)) => new.extra = old.extra.clone(),
         (Connection::Snowflake(new), Connection::Snowflake(old)) => {
             new.extra = old.extra.clone();
@@ -239,11 +241,35 @@ impl ElConnectionModal {
         let mut database = String::new();
         let mut secret = String::new();
         let mut auth_password = false;
+        let mut oracle_user = String::new();
+        let mut oracle_password = String::new();
+        let mut oracle_connect = String::new();
+        let mut oracle_schema = String::new();
+        let mut oracle_wallet = String::new();
+        let mut oracle_tns = String::new();
         match &existing {
             Some(Connection::Postgres(conn)) | Some(Connection::Mysql(conn)) => {
                 url_or_path = conn.url.clone();
             }
             Some(Connection::Duckdb(conn)) => url_or_path = conn.path.clone(),
+            Some(Connection::Oracle(conn)) => {
+                oracle_user = conn.user.clone();
+                // A ${VAR} reference round-trips; a literal credential is
+                // never echoed into the form.
+                if conn.password.is_empty() || conn.password.starts_with("${") {
+                    oracle_password = conn.password.clone();
+                } else {
+                    open_error = Some(
+                        "the YAML holds a literal password — enter a ${VAR} \
+                         reference here and move the value to .env"
+                            .into(),
+                    );
+                }
+                oracle_connect = conn.connect.clone();
+                oracle_schema = conn.schema.clone().unwrap_or_default();
+                oracle_wallet = conn.wallet_dir.clone().unwrap_or_default();
+                oracle_tns = conn.tns_admin.clone().unwrap_or_default();
+            }
             Some(Connection::Snowflake(conn)) => {
                 account = conn.account.clone();
                 user = conn.user.clone();
@@ -281,6 +307,12 @@ impl ElConnectionModal {
             make("warehouse", "LOAD_WH (optional)", &warehouse),
             make("database", "RAW (optional)", &database),
             make("key path / password", "${SNOWFLAKE_PK_PATH}", &secret),
+            make("user", "${ORACLE_USER}", &oracle_user),
+            make("password", "${ORACLE_PASSWORD}", &oracle_password),
+            make("connect", "db.example.com:1521/ORCLPDB1", &oracle_connect),
+            make("schema", "ERP (optional)", &oracle_schema),
+            make("wallet dir", "el/wallet (optional)", &oracle_wallet),
+            make("tns admin", "el/tns (optional)", &oracle_tns),
         ];
         let name = make("name", "pg_prod", editing.as_deref().unwrap_or("")).editor;
 
@@ -354,6 +386,33 @@ impl ElConnectionModal {
                 }
                 Connection::Duckdb(DuckdbConn {
                     path: url_or_path,
+                    extra: Default::default(),
+                })
+            }
+            ConnType::Oracle => {
+                let user = self.text(7, cx);
+                let password = self.text(8, cx);
+                let connect = self.text(9, cx);
+                if user.is_empty() || password.is_empty() || connect.is_empty() {
+                    bail!(
+                        "oracle needs user, password and connect — the connect string \
+                         is host:port/service_name or a TNS alias"
+                    );
+                }
+                if !password.starts_with("${") {
+                    bail!(
+                        "store the password in the environment and reference it like \
+                         ${{ORACLE_PASSWORD}} — never a literal in YAML"
+                    );
+                }
+                let optional = |text: String| (!text.is_empty()).then_some(text);
+                Connection::Oracle(OracleConn {
+                    user,
+                    password,
+                    connect,
+                    schema: optional(self.text(10, cx)),
+                    wallet_dir: optional(self.text(11, cx)),
+                    tns_admin: optional(self.text(12, cx)),
                     extra: Default::default(),
                 })
             }
@@ -950,6 +1009,11 @@ impl Render for ElConnectionModal {
                     fields = fields
                         .child(field_row(self.fields[0].label, self.fields[0].editor.clone()));
                 }
+                ConnType::Oracle => {
+                    for field in &self.fields[7..13] {
+                        fields = fields.child(field_row(field.label, field.editor.clone()));
+                    }
+                }
                 ConnType::Local => {}
                 ConnType::Snowflake => {
                     let auth = h_flex()
@@ -1071,5 +1135,84 @@ impl Render for ElConnectionModal {
                 .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
             );
         card.child(footer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn oracle(user: &str) -> Connection {
+        Connection::Oracle(OracleConn {
+            user: user.to_owned(),
+            password: "${ORACLE_PASSWORD}".to_owned(),
+            connect: "db.example.com:1521/ORCLPDB1".to_owned(),
+            schema: Some("ERP".to_owned()),
+            wallet_dir: None,
+            tns_admin: None,
+            extra: IndexMap::new(),
+        })
+    }
+
+    /// Every kind the form claims to support maps to a ConnType, and back
+    /// to the same kind — a kind that fell through to the default would
+    /// silently rewrite the connection as duckdb on save.
+    #[test]
+    fn supported_kinds_round_trip_through_conn_type() {
+        for kind in ["postgres", "mysql", "oracle", "duckdb", "snowflake"] {
+            assert!(form_supported(kind), "{kind} is not form-supported");
+            assert_eq!(conn_type_of(kind).label(), kind);
+        }
+        assert!(form_supported("local"));
+        assert!(conn_type_of("local") == ConnType::Local);
+        // Kinds without a form still fall back to the YAML rename path.
+        assert!(!form_supported("mssql"));
+    }
+
+    #[test]
+    fn oracle_extras_survive_an_edit() {
+        let mut stored = oracle("ERP_READER");
+        if let Connection::Oracle(conn) = &mut stored {
+            conn.extra.insert(
+                "pool_max".to_owned(),
+                serde_yaml_ng::Value::Number(8.into()),
+            );
+        }
+        let mut rebuilt = oracle("ERP_READER");
+        carry_extra(&mut rebuilt, &stored);
+        let Connection::Oracle(conn) = &rebuilt else {
+            panic!("kind changed");
+        };
+        assert!(conn.extra.contains_key("pool_max"));
+    }
+
+    /// What the form builds is what the file holds: the canonical writer
+    /// keeps every Oracle field, and the password stays a ${VAR}.
+    #[test]
+    fn oracle_round_trips_through_the_canonical_writer() {
+        let mut map = IndexMap::new();
+        map.insert("ora_erp".to_owned(), oracle("ERP_READER"));
+        let connections = Connections {
+            version: 1,
+            connections: map,
+            profiles: IndexMap::new(),
+            default_profile: None,
+            extra: IndexMap::new(),
+        };
+        let yaml = el_engine::spec::to_canonical_connections_yaml(&connections);
+        assert!(yaml.contains("type: oracle"), "{yaml}");
+        assert!(yaml.contains("connect: db.example.com:1521/ORCLPDB1"), "{yaml}");
+        assert!(yaml.contains("${ORACLE_PASSWORD}"), "{yaml}");
+        // Unset optionals are not written back as nulls.
+        assert!(!yaml.contains("wallet_dir"), "{yaml}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.yml");
+        std::fs::write(&path, &yaml).unwrap();
+        let reloaded = el_engine::spec::load_connections(&path).unwrap();
+        let stored = reloaded.connections.get("ora_erp").unwrap();
+        assert_eq!(stored.kind(), "oracle");
+        assert_eq!(el_engine::spec::to_canonical_connections_yaml(&reloaded), yaml);
+        assert!(stored.shape_issues().is_empty(), "{:?}", stored.shape_issues());
     }
 }

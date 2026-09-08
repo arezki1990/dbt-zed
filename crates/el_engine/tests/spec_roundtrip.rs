@@ -1,6 +1,6 @@
 //! Spec parse/serialize round-trips and the validation matrix.
 
-use el_engine::spec::{self, Mode};
+use el_engine::spec::{self, Connection, Mode};
 
 const PIPELINE: &str = r#"version: 1
 pipeline: crm_to_raw
@@ -170,6 +170,135 @@ fn json_schemas_emit() {
     assert!(pipeline_schema["properties"]["streams"].is_object());
     let connections_schema = spec::connections_json_schema();
     assert!(connections_schema["properties"]["connections"].is_object());
+    // Every connection kind is offered for completion, oracle included.
+    let text = serde_json::to_string(&connections_schema).unwrap();
+    for kind in ["postgres", "duckdb", "snowflake", "oracle"] {
+        assert!(text.contains(&format!("\"{kind}\"")), "kind {kind} missing from schema");
+    }
+    assert!(text.contains("tns_admin"), "oracle fields missing from schema");
+}
+
+/// An oracle connection: discrete fields, ${VAR} credentials, optional
+/// schema/wallet/tns_admin, unknown keys kept — and the file writes back
+/// byte-stable through the canonical writer.
+#[test]
+fn oracle_connection_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "version: 1
+connections:
+  ora:
+    type: oracle
+    user: ${ORACLE_USER}
+    password: ${ORACLE_PASSWORD}
+    connect: db.example.com:1521/ORCLPDB1
+    schema: ERP
+    tns_admin: /opt/oracle/network/admin
+    my_note: keep me
+";
+    let loaded = spec::load_connections(&write(dir.path(), "c.yml", yaml)).unwrap();
+    let conn = &loaded.connections["ora"];
+    assert_eq!(conn.kind(), "oracle");
+    assert_eq!(conn.env_refs(), ["ORACLE_PASSWORD", "ORACLE_USER"]);
+    let keys = conn.param_keys();
+    for key in ["user", "password", "connect", "schema", "tns_admin", "my_note"] {
+        assert!(keys.iter().any(|k| k == key), "missing key {key} in {keys:?}");
+    }
+    assert!(!keys.iter().any(|k| k == "wallet_dir"), "unset optional listed: {keys:?}");
+    assert!(conn.shape_issues().is_empty(), "{:?}", conn.shape_issues());
+    let Connection::Oracle(oracle) = conn else {
+        panic!("not oracle");
+    };
+    assert_eq!(oracle.effective_schema(), "ERP");
+    assert_eq!(oracle.wallet_dir, None);
+
+    let rewritten = spec::to_canonical_connections_yaml(&loaded);
+    assert!(rewritten.contains("type: oracle"), "{rewritten}");
+    assert!(rewritten.contains("my_note: keep me"), "lost my_note:\n{rewritten}");
+    assert!(!rewritten.contains("wallet_dir"), "unset optional written:\n{rewritten}");
+    let reloaded = spec::load_connections(&write(dir.path(), "c2.yml", &rewritten)).unwrap();
+    assert_eq!(spec::to_canonical_connections_yaml(&reloaded), rewritten);
+    // Older kinds keep loading alongside it.
+    let mixed = spec::load_connections(&write(dir.path(), "c3.yml", CONNECTIONS)).unwrap();
+    assert_eq!(mixed.connections.len(), 2);
+}
+
+/// Oracle sources validate like the other database kinds; the shape
+/// checks name fields and variables, never the values.
+#[test]
+fn oracle_validation_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let connections_yaml = "version: 1
+connections:
+  ora:
+    type: oracle
+    user: scott
+    password: tiger
+    connect: ''
+  warehouse:
+    type: snowflake
+    account: ${SNOWFLAKE_ACCOUNT}
+    user: loader
+    auth:
+      method: key_pair
+      private_key_path: ${SNOWFLAKE_PK_PATH}
+";
+    let pipeline_yaml = "version: 1
+pipeline: p
+source: ora
+target:
+  connection: warehouse
+  schema: RAW
+streams:
+  - name: emp
+    source:
+      schema: SCOTT
+      table: EMP
+";
+    let connections =
+        spec::load_connections(&write(dir.path(), "c.yml", connections_yaml)).unwrap();
+    let pipeline = spec::load_pipeline(&write(dir.path(), "p.yml", pipeline_yaml)).unwrap();
+    let issues = spec::validate(&pipeline, &connections);
+    let text = issues
+        .iter()
+        .map(|issue| issue.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("table sources need a database connection"), "{text}");
+    assert!(text.contains("need a connect string"), "{text}");
+    assert!(text.contains("password is stored literally"), "{text}");
+    assert!(!text.contains("tiger"), "password leaked: {text}");
+    // Oracle loads as well as it reads: as a target it is accepted, and a
+    // kind with no loader still is not.
+    let reversed = pipeline_yaml
+        .replace("source: ora", "source: warehouse")
+        .replace("connection: warehouse", "connection: ora");
+    let pipeline = spec::load_pipeline(&write(dir.path(), "p2.yml", &reversed)).unwrap();
+    let issues = spec::validate(&pipeline, &connections);
+    assert!(
+        !issues.iter().any(|issue| issue.message.contains("targets must be")),
+        "{issues:?}"
+    );
+    let postgres_target = "version: 1
+connections:
+  ora:
+    type: oracle
+    user: scott
+    password: ${ORACLE_PASSWORD}
+    connect: db.example.com:1521/ORCLPDB1
+  warehouse:
+    type: postgres
+    url: ${PG_URL}
+";
+    let connections =
+        spec::load_connections(&write(dir.path(), "c2.yml", postgres_target)).unwrap();
+    let pipeline = spec::load_pipeline(&write(dir.path(), "p3.yml", pipeline_yaml)).unwrap();
+    let issues = spec::validate(&pipeline, &connections);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.message.contains("targets must be snowflake, duckdb or oracle")),
+        "{issues:?}"
+    );
 }
 
 #[test]

@@ -19,6 +19,12 @@ connections:
   pg_prod:
     type: postgres
     url: "${PG_PROD_URL}"          # postgres://user:pass@host:5432/db
+  # ora_erp:                       # needs Oracle Instant Client where the worker runs
+  #   type: oracle
+  #   user: "${ORACLE_USER}"
+  #   password: "${ORACLE_PASSWORD}"
+  #   connect: db.example.com:1521/ORCLPDB1   # host:port/service_name or a TNS alias
+  #   schema: ERP                  # defaults to the user's own schema
   warehouse:
     type: snowflake
     account: "${SNOWFLAKE_ACCOUNT}"

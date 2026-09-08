@@ -37,7 +37,7 @@ pub struct DraggedTable {
 /// Kinds the explorer can browse — the worker's list/query support. The
 /// panel lists their tables; the canvas invites a drag from them.
 pub(crate) fn browsable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres")
+    matches!(kind, "duckdb" | "postgres" | "oracle")
 }
 
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or

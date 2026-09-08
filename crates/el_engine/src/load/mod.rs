@@ -1,10 +1,14 @@
-//! Loading into Snowflake. The `Loader` trait is transport-independent;
-//! v1's implementation drives the ADBC Snowflake driver inside the
-//! on-demand worker process (`adbc_sidecar`). Tests use `MockLoader`.
+//! Loading into a warehouse. The `Loader` trait is transport-independent;
+//! every implementation drives its driver inside the on-demand worker
+//! process — ADBC for Snowflake (`adbc_sidecar`), DuckDB for the local
+//! warehouse (`duckdb_sidecar`), ODPI-C for Oracle (`oracle_sidecar`).
+//! Tests use `MockLoader`.
 
 pub mod adbc_sidecar;
 pub mod duckdb_sidecar;
 pub mod duckdb_sql;
+pub mod oracle_sidecar;
+pub mod oracle_sql;
 pub mod protocol;
 pub mod snowflake_sql;
 

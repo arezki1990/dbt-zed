@@ -6,9 +6,14 @@
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod files;
+/// Driver-free: how Oracle credentials reach the worker, needed on both
+/// sides of the spawn.
+pub mod oracle_env;
 pub mod remote;
 
 use std::path::{Path, PathBuf};
@@ -85,6 +90,16 @@ pub fn make_extractor(
                     .map_err(|missing| anyhow::anyhow!("{missing}"))?;
                 postgres_extractor(ctx, url, schema.as_deref(), table, chunk_rows, cursor)
             }
+            Some(Connection::Oracle(conn)) => {
+                let creds = oracle_env::OracleCreds::resolve(conn, ctx.env)?;
+                // A stream without a schema reads from the connection's
+                // own schema (its user's, unless it names another).
+                let owner = match schema.as_deref() {
+                    Some(schema) => schema.to_owned(),
+                    None => oracle_env::default_schema(conn, ctx.env)?,
+                };
+                oracle_extractor(ctx, creds, &owner, table, chunk_rows, cursor)
+            }
             Some(other) if matches!(other.kind(), "mysql" | "mssql") => bail!(
                 "stream {:?}: {} sources are not implemented yet — coming in the next phase",
                 stream.name,
@@ -152,6 +167,46 @@ fn postgres_extractor(
         table,
         chunk_rows,
         cursor,
+    )?))
+}
+
+#[cfg(feature = "oracle")]
+fn oracle_extractor(
+    _ctx: &SourceContext,
+    creds: oracle_env::OracleCreds,
+    schema: &str,
+    table: &str,
+    chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
+) -> Result<Box<dyn Extractor>> {
+    Ok(Box::new(oracle::OracleExtractor::new(
+        creds.user.expose(),
+        creds.password.expose(),
+        creds.connect.expose(),
+        schema,
+        table,
+        chunk_rows,
+        cursor,
+    )?))
+}
+
+#[cfg(not(feature = "oracle"))]
+fn oracle_extractor(
+    ctx: &SourceContext,
+    creds: oracle_env::OracleCreds,
+    schema: &str,
+    table: &str,
+    chunk_rows: usize,
+    cursor: Option<(String, crate::state::WatermarkValue)>,
+) -> Result<Box<dyn Extractor>> {
+    let Some(worker) = ctx.worker else {
+        bail!(
+            "database connector support is not installed — install the zdbt connector \
+             worker to extract from Oracle sources"
+        );
+    };
+    Ok(Box::new(remote::RemoteExtractor::spawn_oracle(
+        worker, &creds, schema, table, chunk_rows, cursor,
     )?))
 }
 

@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 use ui::prelude::*;
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, FileFormat, Pipeline, SnowflakeAuth,
-    SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
+    Connection, Connections, DbConn, DuckdbConn, FileFormat, OracleConn, Pipeline,
+    SnowflakeAuth, SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
 };
 
 use super::canvas_item::ElPipelineCanvas;
@@ -26,6 +26,7 @@ pub enum BuilderKind {
 pub enum ConnType {
     Postgres,
     Mysql,
+    Oracle,
     Duckdb,
     Snowflake,
     Local,
@@ -36,6 +37,7 @@ impl ConnType {
         ConnType::Duckdb,
         ConnType::Postgres,
         ConnType::Mysql,
+        ConnType::Oracle,
         ConnType::Snowflake,
         ConnType::Local,
     ];
@@ -44,6 +46,7 @@ impl ConnType {
         match self {
             ConnType::Postgres => "postgres",
             ConnType::Mysql => "mysql",
+            ConnType::Oracle => "oracle",
             ConnType::Duckdb => "duckdb",
             ConnType::Snowflake => "snowflake",
             ConnType::Local => "local files",
@@ -144,6 +147,9 @@ impl BuilderForm {
                 field("account (snowflake)", "${SNOWFLAKE_ACCOUNT}", "", window, cx),
                 field("user (snowflake)", "${SNOWFLAKE_USER}", "", window, cx),
                 field("key path (snowflake)", "${SNOWFLAKE_PK_PATH}", "", window, cx),
+                field("user (oracle)", "${ORACLE_USER}", "", window, cx),
+                field("password (oracle)", "${ORACLE_PASSWORD}", "", window, cx),
+                field("connect (oracle)", "db.example.com:1521/ORCLPDB1", "", window, cx),
             ],
             BuilderKind::Target => {
                 let target = pipeline.map(|pipeline| &pipeline.target);
@@ -329,6 +335,32 @@ impl BuilderForm {
                         }
                         Connection::Duckdb(DuckdbConn { path: url_or_path, extra: Default::default() })
                     }
+                    ConnType::Oracle => {
+                        let user = self.text(5, cx);
+                        let password = self.text(6, cx);
+                        let connect = self.text(7, cx);
+                        if user.is_empty() || password.is_empty() || connect.is_empty() {
+                            bail!(
+                                "oracle needs user, password and connect — the connect \
+                                 string is host:port/service_name or a TNS alias"
+                            );
+                        }
+                        if !password.starts_with("${") {
+                            bail!(
+                                "store the password in the environment and reference it \
+                                 like ${{ORACLE_PASSWORD}} — never a literal in YAML"
+                            );
+                        }
+                        Connection::Oracle(OracleConn {
+                            user,
+                            password,
+                            connect,
+                            schema: None,
+                            wallet_dir: None,
+                            tns_admin: None,
+                            extra: Default::default(),
+                        })
+                    }
                     ConnType::Local => Connection::Local { extra: Default::default() },
                     ConnType::Snowflake => {
                         let account = self.text(2, cx);
@@ -446,7 +478,9 @@ impl BuilderForm {
                 let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
                 let target_kinds = self.kind == BuilderKind::Target;
                 for (name, kind) in &self.connection_names {
-                    if target_kinds && !matches!(kind.as_ref(), "snowflake" | "duckdb") {
+                    if target_kinds
+                        && !matches!(kind.as_ref(), "snowflake" | "duckdb" | "oracle")
+                    {
                         continue;
                     }
                     let name = name.clone();
@@ -608,7 +642,8 @@ impl BuilderForm {
                 let visible = match ix {
                     0 => true,
                     1 => simple,
-                    _ => self.conn_type == ConnType::Snowflake,
+                    2..=4 => self.conn_type == ConnType::Snowflake,
+                    _ => self.conn_type == ConnType::Oracle,
                 };
                 if !visible {
                     continue;

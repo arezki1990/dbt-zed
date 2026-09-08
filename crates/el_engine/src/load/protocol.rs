@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 /// appear in requests, logs, or errors.
 pub const ENV_PASSWORD: &str = "ZDBT_EL_SF_PASSWORD";
 pub const ENV_PRIVATE_KEY_PATH: &str = "ZDBT_EL_SF_PRIVATE_KEY_PATH";
+/// The Oracle target's password. Its user and connect string are
+/// locations, not secrets, and travel in `OpenOracle`.
+pub const ENV_ORACLE_PASSWORD: &str = "ZDBT_EL_ORACLE_PASSWORD";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -33,6 +36,12 @@ pub enum Request {
     OpenDuckdb {
         path: PathBuf,
     },
+    /// Opens an Oracle target. The password comes from
+    /// [`ENV_ORACLE_PASSWORD`] in the sidecar's environment.
+    OpenOracle {
+        user: String,
+        connect_string: String,
+    },
     Exec {
         sql: String,
     },
@@ -43,6 +52,13 @@ pub enum Request {
     /// qualified, already quoted).
     Ingest {
         table: String,
+        ipc_path: PathBuf,
+    },
+    /// Appends the Arrow IPC file at `ipc_path` through `insert_sql` — an
+    /// array-bound `INSERT … VALUES (:1, :2, …)` the parent generated, so
+    /// every statement Oracle runs still comes from `oracle_sql`.
+    IngestOracle {
+        insert_sql: String,
         ipc_path: PathBuf,
     },
     Shutdown,
@@ -110,6 +126,15 @@ mod tests {
             },
             Request::Ingest {
                 table: "\"RAW\".\"CRM\".\"T__ZDBT_STAGING\"".into(),
+                ipc_path: "/tmp/chunk-000000.ipc".into(),
+            },
+            Request::OpenOracle {
+                user: "loader".into(),
+                connect_string: "db.example.com:1521/ORCLPDB1".into(),
+            },
+            Request::IngestOracle {
+                insert_sql: "INSERT INTO \"RAW\".\"T__ZDBT_STAGING\" (\"ID\") VALUES (:1)"
+                    .into(),
                 ipc_path: "/tmp/chunk-000000.ipc".into(),
             },
             Request::Shutdown,

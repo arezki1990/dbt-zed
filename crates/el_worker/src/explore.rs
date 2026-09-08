@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
+use el_engine::connectors::oracle as oracle_connector;
 use el_engine::explore::ExploreEvent;
 
 fn emit(event: &ExploreEvent) {
@@ -69,6 +70,26 @@ pub fn list(args: &[String]) -> Result<()> {
             let mut client = pg_connect(&url)?;
             for row in client.query(LIST_SQL, &[])? {
                 items.push((row.get(0), row.get(1)));
+            }
+        }
+        "oracle" => {
+            // Oracle has no information_schema: the data dictionary lists
+            // tables and views per owner, minus the dictionary schemas.
+            let connection = oracle_connector::connect_from_env()?;
+            let rows = connection
+                .query(&oracle_connector::list_tables_sql(), &[])
+                .map_err(oracle_connector::describe_error)
+                .context("listing oracle tables")?;
+            for row in rows {
+                let row = row
+                    .map_err(oracle_connector::describe_error)
+                    .context("listing oracle tables")?;
+                items.push((
+                    row.get::<usize, String>(0)
+                        .map_err(oracle_connector::describe_error)?,
+                    row.get::<usize, String>(1)
+                        .map_err(oracle_connector::describe_error)?,
+                ));
             }
         }
         other => bail!("unsupported kind {other:?}"),
@@ -173,6 +194,43 @@ pub fn query(args: &[String]) -> Result<()> {
             for row in client.query(&display_sql, &[])? {
                 let cells = (0..names.len())
                     .map(|ix| row.get::<_, Option<String>>(ix))
+                    .collect();
+                emit(&ExploreEvent::Row { cells });
+            }
+        }
+        "oracle" => {
+            let connection = oracle_connector::connect_from_env()?;
+            // Oracle has no LIMIT and takes no AS on a table alias.
+            let capped = oracle_connector::capped_query_sql(&sql, limit);
+            let rows = connection
+                .query(&capped, &[])
+                .map_err(oracle_connector::describe_error)
+                .context("running query")?;
+            // Names come from the cursor, so an empty result still
+            // describes its shape.
+            let names: Vec<String> = rows
+                .column_info()
+                .iter()
+                .map(|info| info.name().to_owned())
+                .collect();
+            emit(&ExploreEvent::Columns {
+                names: names.clone(),
+            });
+            for row in rows {
+                let row = row
+                    .map_err(oracle_connector::describe_error)
+                    .context("reading query row")?;
+                let cells = (0..names.len())
+                    .map(|ix| {
+                        // The driver renders every scalar; LOBs and RAW
+                        // that refuse a string get their size instead.
+                        row.get::<usize, Option<String>>(ix).unwrap_or_else(|_| {
+                            row.get::<usize, Option<Vec<u8>>>(ix)
+                                .ok()
+                                .flatten()
+                                .map(|bytes| format!("<{} bytes>", bytes.len()))
+                        })
+                    })
                     .collect();
                 emit(&ExploreEvent::Row { cells });
             }

@@ -12,6 +12,7 @@ pub mod connectors;
 pub mod env;
 pub mod explore;
 pub mod load;
+pub mod oracle_types;
 pub mod preview;
 pub mod progress;
 pub mod run;

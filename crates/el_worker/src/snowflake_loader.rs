@@ -40,9 +40,12 @@ pub fn serve() -> Result<()> {
             }
         };
         match request {
-            Request::OpenDuckdb { .. } => {
+            Request::OpenDuckdb { .. }
+            | Request::OpenOracle { .. }
+            | Request::IngestOracle { .. } => {
                 respond(&Response::error(
-                    "this is the snowflake loader — duckdb requests go to duckdb-loader",
+                    "this is the snowflake loader — duckdb and oracle requests go to \
+                     duckdb-loader and oracle-loader",
                 ));
             }
             Request::Shutdown => {
