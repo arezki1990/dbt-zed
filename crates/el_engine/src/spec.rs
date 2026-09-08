@@ -244,6 +244,16 @@ impl Connection {
         refs.dedup();
         refs
     }
+
+    /// The `${VAR}` references this connection needs that `env` does not
+    /// provide — names only, so the UI can say "set X in .env" without
+    /// ever touching a value.
+    pub fn missing_env_refs(&self, env: &crate::env::EnvMap) -> Vec<String> {
+        self.env_refs()
+            .into_iter()
+            .filter(|var| !env.contains(var))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -924,4 +934,28 @@ pub fn pipeline_json_schema() -> serde_json::Value {
 
 pub fn connections_json_schema() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(Connections)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::EnvMap;
+
+    #[test]
+    fn missing_env_refs_names_unset_vars_only() {
+        let postgres = Connection::Postgres(DbConn {
+            url: "${ZDBT_TEST_UNSET_ABC}".to_owned(),
+            extra: IndexMap::new(),
+        });
+        assert_eq!(
+            postgres.missing_env_refs(&EnvMap::empty()),
+            vec!["ZDBT_TEST_UNSET_ABC".to_owned()]
+        );
+
+        let duckdb = Connection::Duckdb(DuckdbConn {
+            path: "el/demo.duckdb".to_owned(),
+            extra: IndexMap::new(),
+        });
+        assert!(duckdb.missing_env_refs(&EnvMap::empty()).is_empty());
+    }
 }

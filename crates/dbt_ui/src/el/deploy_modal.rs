@@ -75,12 +75,19 @@ impl ElDeployModal {
         .map(|remotes| remotes.remotes.keys().map(|name| name.clone().into()).collect())
         .unwrap_or_default();
         if remotes.is_empty() {
-            super::toast_error(
-                workspace,
-                "No remotes declared — add one to el/remotes.yml first.",
-                Some(super::el_dir(&root).join("remotes.yml")),
-                cx,
-            );
+            // Same action name as the panel's "+": open the Add server
+            // wizard right away instead of pointing at a file to hand-edit.
+            super::toast(workspace, "No servers yet — add one to deploy to.", cx);
+            if let Some(panel) = workspace.panel::<super::ElPanel>(cx) {
+                super::remote_modal::ElRemoteModal::deploy(
+                    workspace,
+                    panel.downgrade(),
+                    root,
+                    None,
+                    window,
+                    cx,
+                );
+            }
             return;
         }
         let workspace_handle = cx.entity().downgrade();

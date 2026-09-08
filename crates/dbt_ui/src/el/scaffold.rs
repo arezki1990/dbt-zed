@@ -29,6 +29,18 @@ connections:
     auth:
       method: key_pair
       private_key_path: "${SNOWFLAKE_PK_PATH}"
+
+# Profiles: uncomment to give dev / recette / prod their own connections
+# under the same names — pipelines never change, only what the names point
+# to. Pick the active profile in the EL panel; that choice is saved per
+# checkout in el/.zdbt/profile, never in this file.
+# profiles:
+#   dev:
+#     connections:
+#       warehouse:
+#         type: duckdb
+#         path: el/dev.duckdb
+# default_profile: dev
 "#;
 
 const PIPELINE_EXAMPLE: &str = r#"# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json
@@ -96,6 +108,9 @@ pub fn initialize_el_workspace(project_root: &Path) -> Result<Vec<PathBuf>> {
     };
 
     write_new(el.join("connections.yml"), CONNECTIONS_EXAMPLE)?;
+    // The per-developer profile selection stays out of git; the schemas
+    // beside it are committed (the YAML headers point at them).
+    write_new(el.join(".zdbt").join(".gitignore"), "profile\n")?;
     write_new(el.join("pipelines").join("example.yml"), PIPELINE_EXAMPLE)?;
     write_new(el.join("sample.csv"), SAMPLE_CSV)?;
     write_new(

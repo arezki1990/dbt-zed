@@ -39,6 +39,9 @@ struct LoadedSpec {
     missing_env: Vec<String>,
     /// The active profile the canvas validated against.
     profile: Option<String>,
+    /// The source connection's kind, when connections.yml declares it —
+    /// picks the empty canvas's invitation (drag a table vs + Source).
+    source_kind: Option<&'static str>,
 }
 
 pub struct ElPipelineCanvas {
@@ -509,7 +512,55 @@ impl ElPipelineCanvas {
         for (ix, node) in nodes.iter().enumerate() {
             surface = surface.child(self.render_node(ix, node, cx));
         }
+        if let Some(empty) = self.render_empty_canvas() {
+            surface = surface.child(empty);
+        }
         surface.into_any_element()
+    }
+
+    /// A pipeline with no streams renders no nodes at all — say what the
+    /// next move is. The overlay carries no mouse handlers, so drops and
+    /// pans still reach the surface underneath.
+    fn render_empty_canvas(&self) -> Option<gpui::AnyElement> {
+        let loaded = self.loaded.as_ref()?;
+        if !loaded.pipeline.streams.is_empty() {
+            return None;
+        }
+        let source = &loaded.pipeline.source;
+        let (primary, secondary) = match loaded.source_kind {
+            Some(kind) if super::browsable(kind) => (
+                "Drag a table from the EL panel to add a stream.".to_owned(),
+                format!("Expand {source} under Connections and drop a table here, or press + Source."),
+            ),
+            Some(kind) => (
+                "No streams yet — press + Source to add one.".to_owned(),
+                format!("{source} is a {kind} connection: describe the file or object to load."),
+            ),
+            None => (
+                "No streams yet — press + Source to add one.".to_owned(),
+                format!("Add {source} under Connections first so the stream can be previewed."),
+            ),
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(Label::new(primary).size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            Label::new(secondary)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -554,14 +605,18 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
     if let Some(connections) = &connections {
         for name in [&pipeline.source, &pipeline.target.connection] {
             if let Some(connection) = connections.connections.get(name) {
-                for var in connection.env_refs() {
-                    if !env.contains(&var) && !missing_env.contains(&var) {
+                for var in connection.missing_env_refs(&env) {
+                    if !missing_env.contains(&var) {
                         missing_env.push(var);
                     }
                 }
             }
         }
     }
+    let source_kind = connections
+        .as_ref()
+        .and_then(|connections| connections.connections.get(&pipeline.source))
+        .map(el_engine::spec::Connection::kind);
     Ok(LoadedSpec {
         pipeline: Arc::new(pipeline),
         issues: issues
@@ -570,6 +625,7 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
             .collect(),
         missing_env,
         profile,
+        source_kind,
     })
 }
 

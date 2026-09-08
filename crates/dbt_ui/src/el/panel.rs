@@ -31,6 +31,11 @@ pub struct ElPanel {
     profiles: Vec<SharedString>,
     /// Declared remotes: (name, host shown muted — never the token).
     remotes: Vec<(SharedString, SharedString)>,
+    /// Connection name → the `${VAR}` names it references that neither the
+    /// environment nor .env provides. Names only, never values.
+    missing_env: std::collections::HashMap<SharedString, Vec<String>>,
+    /// Remote name → the token variable that is not set locally.
+    remotes_missing_token: std::collections::HashMap<SharedString, String>,
     /// Section keys the user folded ("pipelines", "connections", "remotes").
     collapsed: std::collections::HashSet<&'static str>,
     /// Connections whose table list is unfolded in the explorer.
@@ -51,6 +56,11 @@ pub struct ElPanel {
     split_drag: Option<(usize, f32, f32)>,
     _refresh: Task<()>,
 }
+
+/// What a profile is, told once at the switcher and once on the badge.
+const PROFILE_HINT: &str = "Which environment's connections this checkout uses; pipelines stay \
+the same. Your choice is saved in el/.zdbt/profile for you only — connections.yml does not \
+change.";
 
 enum TablesState {
     Loading,
@@ -73,13 +83,13 @@ enum Row {
         table: String,
     },
     ConnNote(SharedString, Color),
+    /// "Set X in .env to connect" under a connection or server whose
+    /// `${VAR}` references are unset — click opens .env.
+    EnvHint(Vec<String>),
+    /// The Remotes empty state: its tooltip says what a server is.
+    RemotesEmpty,
     Initialize,
     Note(SharedString),
-}
-
-/// Kinds the explorer can browse — the worker's list/query support.
-fn browsable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres")
 }
 
 /// The pill that follows the cursor while a table is dragged.
@@ -128,6 +138,8 @@ impl ElPanel {
             profile: None,
             profiles: Vec::new(),
             remotes: Vec::new(),
+            missing_env: Default::default(),
+            remotes_missing_token: Default::default(),
             collapsed: Default::default(),
             expanded: Default::default(),
             tables: Default::default(),
@@ -160,6 +172,9 @@ impl ElPanel {
             log::warn!("el: could not write schemas: {error:#}");
         }
         self.pipelines = el_engine::spec::list_pipelines(&el);
+        // Real env + project .env: only ever probed for a NAME's presence.
+        let env = el_engine::env::EnvMap::load(&root, None);
+        self.remotes_missing_token.clear();
         self.remotes = el_engine::spec::load_remotes(&el.join("remotes.yml"))
             .map(|remotes| {
                 remotes
@@ -176,11 +191,20 @@ impl ElPanel {
                             .next()
                             .unwrap_or("")
                             .to_owned();
-                        (name.clone().into(), host.into())
+                        let name: SharedString = name.clone().into();
+                        let mut refs = Vec::new();
+                        if let Some(token) = &remote.token {
+                            el_engine::env::collect_var_refs(token, &mut refs);
+                        }
+                        if let Some(var) = refs.into_iter().find(|var| !env.contains(var)) {
+                            self.remotes_missing_token.insert(name.clone(), var);
+                        }
+                        (name, host.into())
                     })
                     .collect()
             })
             .unwrap_or_default();
+        self.missing_env.clear();
         match el_engine::spec::load_active_connections(&root) {
             Ok((connections, profile)) => {
                 self.profile = profile.map(Into::into);
@@ -191,7 +215,12 @@ impl ElPanel {
                     .connections
                     .iter()
                     .map(|(name, connection)| {
-                        (name.clone().into(), connection.kind().to_owned().into())
+                        let name: SharedString = name.clone().into();
+                        let missing = connection.missing_env_refs(&env);
+                        if !missing.is_empty() {
+                            self.missing_env.insert(name.clone(), missing);
+                        }
+                        (name, connection.kind().to_owned().into())
                     })
                     .collect();
                 self.connections_error = None;
@@ -291,6 +320,22 @@ impl ElPanel {
             for path in &self.pipelines {
                 rows.push(Row::Pipeline(path.clone()));
             }
+            if self.pipelines.is_empty() {
+                rows.push(Row::ConnNote(
+                    "No pipelines yet — press + to start one.".into(),
+                    Color::Muted,
+                ));
+                if self
+                    .connections
+                    .iter()
+                    .any(|(_, kind)| super::browsable(kind))
+                {
+                    rows.push(Row::ConnNote(
+                        "Then drag a table from Connections onto it.".into(),
+                        Color::Muted,
+                    ));
+                }
+            }
         }
         rows
     }
@@ -309,6 +354,9 @@ impl ElPanel {
             rows.push(Row::ConnectionsHeader);
             for (name, kind) in &self.connections {
                 rows.push(Row::Connection(name.clone(), kind.clone()));
+                if let Some(missing) = self.missing_env.get(name) {
+                    rows.push(Row::EnvHint(missing.clone()));
+                }
                 if !self.expanded.contains(name) {
                     continue;
                 }
@@ -347,13 +395,17 @@ impl ElPanel {
             return rows;
         }
         if self.remotes.is_empty() {
+            rows.push(Row::RemotesEmpty);
             rows.push(Row::ConnNote(
-                "No servers yet — press + to add one.".into(),
+                "A server runs deployed pipelines on a schedule.".into(),
                 Color::Muted,
             ));
         }
         for (name, host) in &self.remotes {
             rows.push(Row::Remote(name.clone(), host.clone()));
+            if let Some(var) = self.remotes_missing_token.get(name) {
+                rows.push(Row::EnvHint(vec![var.clone()]));
+            }
         }
         rows
     }
@@ -435,6 +487,51 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
                 return;
             }
         }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                    .detach();
+            })
+            .ok();
+    }
+
+    /// Opens the project's .env — where `${VAR}` values live. Creates it
+    /// with comment lines only when absent: .env is not a spec file, and
+    /// no value is ever written here.
+    fn open_env_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let path = root.join(".env");
+        if !path.exists() {
+            let starter = "# Values for the ${VAR} references in el/connections.yml and \
+el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
+            if let Err(error) = std::fs::write(&path, starter) {
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        super::toast_error(
+                            workspace,
+                            &format!("could not create .env: {error}"),
+                            None,
+                            cx,
+                        )
+                    })
+                    .ok();
+                return;
+            }
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                    .detach();
+            })
+            .ok();
+    }
+
+    /// Opens el/connections.yml — the shared file that declares profiles.
+    fn open_connections_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let path = super::el_dir(&root).join("connections.yml");
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace
@@ -798,9 +895,16 @@ impl Render for ElPanel {
                     .child(Label::new("EL").size(LabelSize::Default))
                     .child(div().flex_1())
                     .children(self.profile.clone().map(|profile| {
-                        Label::new(profile)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent)
+                        div()
+                            .id("el-profile-badge")
+                            .tooltip(|_, cx| {
+                                Tooltip::with_meta("Active profile", None, PROFILE_HINT, cx)
+                            })
+                            .child(
+                                Label::new(profile)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            )
                     }))
                     .child(
                         IconButton::new("el-panel-refresh", IconName::RotateCw)
@@ -846,13 +950,17 @@ impl Render for ElPanel {
                                 )
                                 .label_size(LabelSize::XSmall)
                                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                                .tooltip(|_, cx| {
+                                    Tooltip::with_meta("Profile", None, PROFILE_HINT, cx)
+                                }),
                             )
                             .menu(move |window, cx| {
                                 let panel = panel.clone();
                                 let profiles = profiles.clone();
                                 let active = active.clone();
                                 Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    menu = menu.header("Profiles in connections.yml");
                                     for name in profiles {
                                         let panel = panel.clone();
                                         let selected = active.as_ref() == Some(&name);
@@ -871,7 +979,18 @@ impl Render for ElPanel {
                                             },
                                         );
                                     }
-                                    menu
+                                    let panel = panel.clone();
+                                    menu.separator().entry(
+                                        "Edit connections.yml",
+                                        None,
+                                        move |window, cx| {
+                                            panel
+                                                .update(cx, |this, cx| {
+                                                    this.open_connections_yaml(window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    )
                                 }))
                             }),
                     )
@@ -1021,7 +1140,7 @@ impl ElPanel {
                     .into_any_element()
             }
             Row::Connection(name, kind) => {
-                let can_browse = browsable(kind);
+                let can_browse = super::browsable(kind);
                 let expanded = self.expanded.contains(name);
                 let chevron = if expanded {
                     IconName::ChevronDown
@@ -1029,6 +1148,10 @@ impl ElPanel {
                     IconName::ChevronRight
                 };
                 let toggle_name = name.clone();
+                let kind_hint: SharedString = format!(
+                    "{kind} connections can't be browsed yet — describe what to load with + Source on the canvas."
+                )
+                .into();
                 base.when(can_browse, |row| {
                     row.cursor_pointer()
                         .child(Icon::new(chevron).size(IconSize::XSmall).color(Color::Muted))
@@ -1036,6 +1159,7 @@ impl ElPanel {
                             this.toggle_connection(toggle_name.clone(), cx);
                         }))
                 })
+                .when(!can_browse, |row| row.tooltip(Tooltip::text(kind_hint)))
                 .child(
                     Icon::new(IconName::DatabaseZap)
                         .size(IconSize::Small)
@@ -1083,6 +1207,14 @@ impl ElPanel {
                             .color(Color::Muted),
                     )
                     .child(Label::new(label).size(LabelSize::Small).truncate())
+                    .tooltip(|_, cx| {
+                        Tooltip::with_meta(
+                            "Drag onto a pipeline canvas to add it as a stream",
+                            None,
+                            "Click to query it",
+                            cx,
+                        )
+                    })
                     // Drag onto a pipeline canvas to add it as a stream.
                     .on_drag(dragged, move |_, _, _, cx| {
                         let drag_label = drag_label.clone();
@@ -1102,6 +1234,45 @@ impl ElPanel {
             Row::ConnNote(text, color) => base
                 .pl_6()
                 .child(Label::new(text.clone()).size(LabelSize::XSmall).color(*color))
+                .into_any_element(),
+            Row::EnvHint(vars) => base
+                .pl_6()
+                .cursor_pointer()
+                .child(
+                    Label::new(format!("Set {} in .env to connect", vars.join(", ")))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning)
+                        .truncate(),
+                )
+                .tooltip(|_, cx| {
+                    Tooltip::with_meta(
+                        "Credentials stay out of YAML",
+                        None,
+                        "The YAML references ${VAR}; the value lives in .env next to the \
+                         project (or in your shell). Click to open .env.",
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.open_env_file(window, cx)))
+                .into_any_element(),
+            Row::RemotesEmpty => base
+                .pl_6()
+                .child(
+                    Label::new("No servers yet — press + to add one.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(|_, cx| {
+                    Tooltip::with_meta(
+                        "Servers",
+                        None,
+                        "el/remotes.yml lists the el serve daemons the IDE deploys to and \
+                         watches. Add server points at a running daemon or installs one over \
+                         SSH (zdbt el install-remote). Tokens are ${VAR} references resolved \
+                         from .env.",
+                        cx,
+                    )
+                })
                 .into_any_element(),
             Row::Initialize => base
                 .cursor_pointer()
