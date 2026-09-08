@@ -6,6 +6,8 @@
 //! Subcommands:
 //!   extract  --kind duckdb --db <path> [--schema <s>] --table <t>
 //!            --chunk-rows <n> --out-dir <dir>
+//!   extract  --kind postgres|oracle [--schema <s>] --table <t> …
+//!            (credentials arrive as environment variables, never argv)
 //!   seed-demo <path>   create a small demo DuckDB database
 
 mod duckdb_loader;
@@ -39,8 +41,8 @@ fn main() {
         Some("query") => explore::query(&args[1..]),
         _ => {
             eprintln!(
-                "usage: zdbt-el-worker extract --kind duckdb --db <path> [--schema <s>] \
-                 --table <t> --chunk-rows <n> --out-dir <dir>\n       \
+                "usage: zdbt-el-worker extract --kind duckdb|postgres|oracle [--db <path>] \
+                 [--schema <s>] --table <t> --chunk-rows <n> --out-dir <dir>\n       \
                  zdbt-el-worker seed-demo <path>"
             );
             std::process::exit(2);
@@ -100,8 +102,26 @@ fn extract(args: &[String]) -> Result<()> {
                 cursor,
             )?)
         }
+        "oracle" => {
+            // Credentials come from ZDBT_EL_SRC_ORACLE_* in this
+            // process's environment; the schema is a plain locator.
+            let creds = el_engine::connectors::oracle_env::creds_from_env()?;
+            let schema = schema
+                .as_deref()
+                .context("--schema required for oracle sources")?;
+            Box::new(el_engine::connectors::oracle::OracleExtractor::new(
+                &creds.user,
+                &creds.password,
+                &creds.connect,
+                schema,
+                &table,
+                chunk_rows,
+                cursor,
+            )?)
+        }
         other => bail!(
-            "unsupported source kind {other:?} (this worker build supports: duckdb, postgres)"
+            "unsupported source kind {other:?} \
+             (this worker build supports: duckdb, postgres, oracle)"
         ),
     };
     let schema = extractor.schema()?;
@@ -111,7 +131,7 @@ fn extract(args: &[String]) -> Result<()> {
             .map(|(name, dtype)| {
                 (
                     name.to_string(),
-                    RemoteExtractor::dtype_to_wire(dtype).to_owned(),
+                    RemoteExtractor::dtype_to_wire(dtype),
                 )
             })
             .collect(),

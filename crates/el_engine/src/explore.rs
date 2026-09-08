@@ -53,6 +53,11 @@ fn connection_args(
             command.arg("--kind").arg("postgres");
             command.env("ZDBT_EL_SRC_URL", url.expose());
         }
+        Connection::Oracle(conn) => {
+            let creds = crate::connectors::oracle_env::OracleCreds::resolve(conn, env)?;
+            command.arg("--kind").arg("oracle");
+            creds.apply(command);
+        }
         other => bail!("browsing {} connections is not supported yet", other.kind()),
     }
     Ok(())
