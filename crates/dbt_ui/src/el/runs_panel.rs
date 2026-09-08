@@ -425,11 +425,18 @@ impl ElRunsPanel {
             .position(|(name, _)| *name == connection)
             .or(self.selected);
         let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
-        let sql = format!(
-            "SELECT * FROM {}.{} LIMIT 200",
-            quote(schema),
-            quote(table)
-        );
+        // Oracle has no LIMIT: its row-limiting clause is FETCH FIRST.
+        let kind = self
+            .selected
+            .and_then(|ix| self.connections.get(ix))
+            .map(|(_, kind)| kind.as_ref())
+            .unwrap_or("");
+        let cap = if kind == "oracle" {
+            "FETCH FIRST 200 ROWS ONLY"
+        } else {
+            "LIMIT 200"
+        };
+        let sql = format!("SELECT * FROM {}.{} {cap}", quote(schema), quote(table));
         self.sql.update(cx, |editor, cx| {
             editor.set_text(sql, window, cx);
         });
