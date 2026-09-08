@@ -12,6 +12,7 @@ use crate::cast::{CastPlan, ColumnFailures};
 use crate::connectors::SourceContext;
 use crate::env::EnvMap;
 use crate::load::adbc_sidecar::{AdbcSidecarLoader, SidecarConfig};
+use crate::load::oracle_sidecar::{OracleSidecarConfig, OracleSidecarLoader};
 use crate::load::protocol::AuthMethod;
 use crate::load::{Loader, StreamPlan};
 use crate::progress::{CancelFlag, Phase, ProgressEvent};
@@ -205,8 +206,28 @@ fn build_loader(
             crate::load::duckdb_sidecar::DuckdbSidecarLoader::spawn(&worker, &path)?,
         ));
     }
+    let resolve = |value: &str| {
+        crate::env::resolve_templates(value, env).map_err(|missing| anyhow!("{missing}"))
+    };
+    // Oracle warehouse: the loader runs in the worker, which needs Oracle
+    // Instant Client on this machine. Only the password is a secret; it
+    // travels in the child's environment.
+    if let Some(Connection::Oracle(conn)) = connections.connections.get(target_name) {
+        let creds = crate::connectors::oracle_env::OracleCreds::resolve(conn, env)?;
+        let config = OracleSidecarConfig {
+            worker,
+            user: creds.user.expose().to_owned(),
+            connect: creds.connect.expose().to_owned(),
+            password: creds.password,
+            tns_admin: creds.tns_admin,
+            dialect: crate::oracle_types::OracleDialect::default(),
+        };
+        return Ok(Box::new(OracleSidecarLoader::spawn(&config)?));
+    }
     let Some(Connection::Snowflake(conn)) = connections.connections.get(target_name) else {
-        bail!("target connection {target_name:?} is not a snowflake or duckdb connection");
+        bail!(
+            "target connection {target_name:?} is not a snowflake, duckdb or oracle connection"
+        );
     };
     let Some(driver) = crate::load::adbc_sidecar::find_driver(request.driver.as_deref()) else {
         bail!(
@@ -215,9 +236,6 @@ fn build_loader(
         );
     };
 
-    let resolve = |value: &str| {
-        crate::env::resolve_templates(value, env).map_err(|missing| anyhow!("{missing}"))
-    };
     let (auth, secret) = match &conn.auth {
         SnowflakeAuth::KeyPair { private_key_path } => {
             (AuthMethod::KeyPair, resolve(private_key_path)?)

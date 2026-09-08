@@ -508,7 +508,7 @@ pub fn load_remotes(path: &Path) -> Result<Remotes, SpecError> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TargetSpec {
-    /// Connection name; must be a snowflake connection.
+    /// Connection name; must be a snowflake, duckdb or oracle connection.
     pub connection: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
@@ -779,10 +779,10 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
                 pipeline.target.connection
             ),
         ),
-        Some(conn) if !matches!(conn.kind(), "snowflake" | "duckdb") => issue(
+        Some(conn) if !matches!(conn.kind(), "snowflake" | "duckdb" | "oracle") => issue(
             None,
             format!(
-                "target connection {:?} is {} — targets must be snowflake or duckdb",
+                "target connection {:?} is {} — targets must be snowflake, duckdb or oracle",
                 pipeline.target.connection,
                 conn.kind()
             ),

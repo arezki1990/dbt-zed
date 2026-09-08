@@ -23,7 +23,7 @@ use oracle::sql_type::ToSql;
 use oracle::{Connection, ResultSet, Row};
 use polars::prelude::*;
 
-use crate::oracle_types::OracleColumnType;
+use crate::oracle_types::{OracleColumnType, normalize_ident, quote_ident, quote_stored};
 use crate::state::WatermarkValue;
 
 /// What every live path says when ODPI-C cannot find a client library.
@@ -84,47 +84,6 @@ impl Fetch {
             Fetch::Binary => DataType::Binary,
         }
     }
-}
-
-// -- identifiers -----------------------------------------------------------
-
-/// Folds an identifier the way Oracle folds an unquoted one — upper case
-/// — unless the spec quoted it, in which case the case is kept verbatim.
-/// A stray double quote is rejected rather than escaped: an Oracle object
-/// name with an embedded quote is not something a spec should address.
-pub fn normalize_ident(name: &str) -> Result<String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        bail!("empty Oracle identifier");
-    }
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        let inner = rest
-            .strip_suffix('"')
-            .ok_or_else(|| anyhow!("unbalanced quotes in Oracle identifier {name:?}"))?;
-        if inner.is_empty() || inner.contains('"') {
-            bail!("Oracle identifier {name:?} contains a double quote");
-        }
-        return Ok(inner.to_owned());
-    }
-    if trimmed.contains('"') {
-        bail!("Oracle identifier {name:?} contains a double quote");
-    }
-    Ok(trimmed.to_ascii_uppercase())
-}
-
-/// Quotes a name Oracle itself gave us — a dictionary column, or a name
-/// already through [`normalize_ident`] — verbatim. Folding it again would
-/// break a genuinely lower-case column.
-fn quote_stored(name: &str) -> Result<String> {
-    if name.is_empty() || name.contains('"') {
-        bail!("Oracle identifier {name:?} is not addressable");
-    }
-    Ok(format!("\"{name}\""))
-}
-
-/// The normalized identifier, quoted for a statement.
-pub fn quote_ident(name: &str) -> Result<String> {
-    quote_stored(&normalize_ident(name)?)
 }
 
 // -- connecting ------------------------------------------------------------

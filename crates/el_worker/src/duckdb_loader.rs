@@ -66,9 +66,13 @@ pub fn serve() -> Result<()> {
                 })),
                 None => respond(&Response::error("not connected — send open first")),
             },
-            Request::Open { .. } | Request::Ingest { .. } => {
+            Request::Open { .. }
+            | Request::Ingest { .. }
+            | Request::OpenOracle { .. }
+            | Request::IngestOracle { .. } => {
                 respond(&Response::error(
-                    "this is the duckdb loader — snowflake requests go to snowflake-loader",
+                    "this is the duckdb loader — snowflake and oracle requests go to \
+                     snowflake-loader and oracle-loader",
                 ));
             }
         }

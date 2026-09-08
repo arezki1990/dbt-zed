@@ -446,7 +446,9 @@ impl BuilderForm {
                 let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
                 let target_kinds = self.kind == BuilderKind::Target;
                 for (name, kind) in &self.connection_names {
-                    if target_kinds && !matches!(kind.as_ref(), "snowflake" | "duckdb") {
+                    if target_kinds
+                        && !matches!(kind.as_ref(), "snowflake" | "duckdb" | "oracle")
+                    {
                         continue;
                     }
                     let name = name.clone();

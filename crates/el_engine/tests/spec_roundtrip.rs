@@ -267,15 +267,36 @@ streams:
     assert!(text.contains("need a connect string"), "{text}");
     assert!(text.contains("password is stored literally"), "{text}");
     assert!(!text.contains("tiger"), "password leaked: {text}");
-    // Oracle is a source kind only until its loader lands.
-    let reversed = pipeline_yaml.replace("source: ora", "source: warehouse").replace(
-        "connection: warehouse",
-        "connection: ora",
-    );
+    // Oracle loads as well as it reads: as a target it is accepted, and a
+    // kind with no loader still is not.
+    let reversed = pipeline_yaml
+        .replace("source: ora", "source: warehouse")
+        .replace("connection: warehouse", "connection: ora");
     let pipeline = spec::load_pipeline(&write(dir.path(), "p2.yml", &reversed)).unwrap();
     let issues = spec::validate(&pipeline, &connections);
     assert!(
-        issues.iter().any(|issue| issue.message.contains("targets must be snowflake or duckdb")),
+        !issues.iter().any(|issue| issue.message.contains("targets must be")),
+        "{issues:?}"
+    );
+    let postgres_target = "version: 1
+connections:
+  ora:
+    type: oracle
+    user: scott
+    password: ${ORACLE_PASSWORD}
+    connect: db.example.com:1521/ORCLPDB1
+  warehouse:
+    type: postgres
+    url: ${PG_URL}
+";
+    let connections =
+        spec::load_connections(&write(dir.path(), "c2.yml", postgres_target)).unwrap();
+    let pipeline = spec::load_pipeline(&write(dir.path(), "p3.yml", pipeline_yaml)).unwrap();
+    let issues = spec::validate(&pipeline, &connections);
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue.message.contains("targets must be snowflake, duckdb or oracle")),
         "{issues:?}"
     );
 }

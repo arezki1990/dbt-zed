@@ -23,6 +23,10 @@ duckdb.workspace = true
 arrow-cast = "59"
 arrow-ipc = "59"
 el_engine = { workspace = true, features = ["duckdb", "postgres", "oracle"] }
+# The Oracle loader binds chunks through ODPI-C here — the driver never
+# links into the IDE. `chrono` gives the timestamp binds their types.
+chrono.workspace = true
+oracle = { version = "=0.6.3", features = ["chrono"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 serde_json.workspace = true
 
