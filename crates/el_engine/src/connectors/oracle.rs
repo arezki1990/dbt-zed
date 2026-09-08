@@ -86,9 +86,19 @@ impl Fetch {
 // -- connecting ------------------------------------------------------------
 
 /// Turns a driver error into an app error. Oracle's own text names ORA
-/// codes but never our credentials.
+/// codes but never our credentials. The one driver-side refusal worth
+/// translating is the server-version one: the thin protocol needs Oracle
+/// Database 12.1 or later, and "not supported" alone does not say so.
 pub fn describe_error(error: oracledb::Error) -> anyhow::Error {
-    anyhow!("{error}")
+    if matches!(error.kind(), oracledb::ErrorKind::ServerVersionNotSupported) {
+        anyhow!(
+            "this Oracle server is older than 12.1 (10g or 11g): the connector's thin driver \
+             speaks only the protocol of Oracle Database 12.1 and later, so it cannot read \
+             or load this database"
+        )
+    } else {
+        anyhow!("{error}")
+    }
 }
 
 /// Connects with the credentials the parent put in the environment.
