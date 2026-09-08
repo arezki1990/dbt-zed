@@ -19,6 +19,10 @@ default = []
 duckdb = ["dep:duckdb", "dep:chrono"]
 # Postgres source connector (worker-only, same on-demand rule).
 postgres = ["dep:postgres", "dep:chrono"]
+# Oracle source/target connector (worker-only). The `oracle` crate wraps
+# ODPI-C, which compiles without Oracle libraries and dlopens Oracle
+# Instant Client at run time on the machine running the worker.
+oracle = ["dep:oracle", "dep:chrono"]
 # The ADBC driver-manager half of the spike, kept off the default build so
 # the polars cost can be measured in isolation.
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
@@ -66,6 +70,8 @@ adbc_core = { version = "=0.24.0", optional = true }
 chrono = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+# Exact-pinned: the ODPI-C binding's API is still 0.x.
+oracle = { version = "=0.6.3", features = ["chrono"], optional = true }
 adbc_driver_manager = { version = "=0.24.0", optional = true }
 tiny_http = { version = "0.12", features = ["ssl-rustls"], optional = true }
 cron = { version = "0.12", optional = true }
