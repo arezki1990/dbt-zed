@@ -216,5 +216,12 @@ Each test creates and drops its own tables (`ZDBT_EL_SMOKE`,
 - **`ORA-00942` on a table you can see in SQL*Plus** — a folding mismatch:
   the spec's unquoted name was upper-cased. Quote it to keep the case.
 - **Docker images** — `docker/el-serve/Dockerfile*` need nothing extra
-  for Oracle; only a wallet or `tnsnames.ora` directory has to be mounted
-  in when a connection names one.
+  for the thin driver. For a 10g / 11g server the container needs the
+  Instant Client mounted in and named (the image carries `libaio`):
+  `-v /opt/oracle/instantclient_19_26:/opt/oracle/instantclient:ro
+  -e ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient
+  -e LD_LIBRARY_PATH=/opt/oracle/instantclient`, plus a wallet or
+  `tnsnames.ora` directory when a connection names one. With
+  `--network host` the daemon reaches databases on the host's loopback
+  and its port 7431 is reachable through an SSH tunnel without opening a
+  firewall.
