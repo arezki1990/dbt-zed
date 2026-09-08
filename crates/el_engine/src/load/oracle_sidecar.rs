@@ -32,9 +32,6 @@ pub struct OracleSidecarConfig {
     /// Directory holding `tnsnames.ora` / a wallet, when the connection
     /// names one.
     pub tns_admin: Option<Secret>,
-    /// Client-location settings from the project's `.env`
-    /// (`ZDBT_EL_ORACLE_CLIENT_DIR`, …), forwarded to the sidecar.
-    pub client_settings: Vec<(&'static str, String)>,
     /// Target-side DDL choices (23ai native `BOOLEAN`, …).
     pub dialect: OracleDialect,
 }
@@ -58,9 +55,6 @@ impl OracleSidecarLoader {
             .env(ENV_ORACLE_PASSWORD, config.password.expose());
         if let Some(dir) = &config.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
-        }
-        for (name, value) in &config.client_settings {
-            command.env(name, value);
         }
         let mut child = command
             .stdin(Stdio::piped())

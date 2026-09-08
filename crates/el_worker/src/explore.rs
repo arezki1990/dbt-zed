@@ -85,9 +85,9 @@ pub fn list(args: &[String]) -> Result<()> {
                     .map_err(oracle_connector::describe_error)
                     .context("listing oracle tables")?;
                 items.push((
-                    row.get::<usize, String>(0)
+                    row.get::<String>(0)
                         .map_err(oracle_connector::describe_error)?,
-                    row.get::<usize, String>(1)
+                    row.get::<String>(1)
                         .map_err(oracle_connector::describe_error)?,
                 ));
             }
@@ -209,7 +209,7 @@ pub fn query(args: &[String]) -> Result<()> {
             // Names come from the cursor, so an empty result still
             // describes its shape.
             let names: Vec<String> = rows
-                .column_info()
+                .columns()
                 .iter()
                 .map(|info| info.name().to_owned())
                 .collect();
@@ -220,17 +220,9 @@ pub fn query(args: &[String]) -> Result<()> {
                 let row = row
                     .map_err(oracle_connector::describe_error)
                     .context("reading query row")?;
+                // Oracle's own rendering of every scalar; bytes as hex.
                 let cells = (0..names.len())
-                    .map(|ix| {
-                        // The driver renders every scalar; LOBs and RAW
-                        // that refuse a string get their size instead.
-                        row.get::<usize, Option<String>>(ix).unwrap_or_else(|_| {
-                            row.get::<usize, Option<Vec<u8>>>(ix)
-                                .ok()
-                                .flatten()
-                                .map(|bytes| format!("<{} bytes>", bytes.len()))
-                        })
-                    })
+                    .map(|ix| oracle_connector::cell_text(&row, ix).unwrap_or(None))
                     .collect();
                 emit(&ExploreEvent::Row { cells });
             }

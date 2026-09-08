@@ -1,8 +1,7 @@
 //! The Oracle type vocabulary: ONE Oracle → polars mapping shared by the
 //! source connector (column probing) and the table explorer, and ONE
 //! polars / spec-type → Oracle DDL mapping for targets. Driver-free so it
-//! compiles into the IDE and unit-tests without a database; the `oracle`
-//! feature adds the conversion from the driver's own type descriptor.
+//! compiles into the IDE and unit-tests without a database.
 //!
 //! Mapping decisions (source side):
 //! - `NUMBER(p,0)` with `p <= 18` fits an i64 and reads as `Int64`; wider
@@ -330,61 +329,6 @@ impl fmt::Display for OracleColumnType {
 
 /// The driver's column descriptor → our vocabulary. Only the worker
 /// (feature `oracle`) links the driver; the IDE never sees this impl.
-#[cfg(feature = "oracle")]
-impl From<&oracle::sql_type::OracleType> for OracleColumnType {
-    fn from(oracle_type: &oracle::sql_type::OracleType) -> Self {
-        use oracle::sql_type::OracleType;
-        match oracle_type {
-            OracleType::Varchar2(size) => OracleColumnType::Varchar2(Some(*size)),
-            OracleType::NVarchar2(_) => OracleColumnType::NVarchar2,
-            OracleType::Char(_) => OracleColumnType::Char,
-            OracleType::NChar(_) => OracleColumnType::NChar,
-            OracleType::Rowid => OracleColumnType::Rowid,
-            OracleType::Raw(_) => OracleColumnType::Raw,
-            OracleType::BinaryFloat => OracleColumnType::BinaryFloat,
-            OracleType::BinaryDouble => OracleColumnType::BinaryDouble,
-            // ODPI-C reports precision 0 for an unconstrained NUMBER and
-            // scale -127 for a FLOAT (already split off as Float below).
-            OracleType::Number(0, _) => OracleColumnType::Number {
-                precision: None,
-                scale: None,
-            },
-            OracleType::Number(precision, scale) => OracleColumnType::Number {
-                precision: Some(*precision),
-                scale: Some(*scale),
-            },
-            OracleType::Float(_) => OracleColumnType::Float,
-            OracleType::Date => OracleColumnType::Date,
-            OracleType::Timestamp(_) => OracleColumnType::Timestamp,
-            OracleType::TimestampTZ(_) => OracleColumnType::TimestampTz,
-            OracleType::TimestampLTZ(_) => OracleColumnType::TimestampLtz,
-            OracleType::IntervalDS(_, _) => OracleColumnType::IntervalDs,
-            OracleType::IntervalYM(_) => OracleColumnType::IntervalYm,
-            OracleType::CLOB => OracleColumnType::Clob,
-            OracleType::NCLOB => OracleColumnType::NClob,
-            OracleType::BLOB => OracleColumnType::Blob,
-            OracleType::BFILE => OracleColumnType::Bfile,
-            OracleType::Boolean => OracleColumnType::Boolean,
-            OracleType::Long => OracleColumnType::Long,
-            OracleType::LongRaw => OracleColumnType::LongRaw,
-            OracleType::Json => OracleColumnType::Json,
-            OracleType::Xml => OracleColumnType::Xml,
-            // Native define types the driver uses for narrow integers.
-            OracleType::Int64 => OracleColumnType::Number {
-                precision: Some(18),
-                scale: Some(0),
-            },
-            OracleType::UInt64 => OracleColumnType::Number {
-                precision: Some(20),
-                scale: Some(0),
-            },
-            // RefCursor, Object(_) and anything a newer driver adds
-            // (`OracleType` is non_exhaustive): text.
-            other => OracleColumnType::Other(other.to_string()),
-        }
-    }
-}
-
 /// Target-side DDL choices that depend on the server version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OracleDialect {
@@ -619,33 +563,5 @@ mod tests {
             let ddl = dialect.ddl_type(&SnowflakeType::from_polars(&parsed.polars_dtype()));
             assert!(!ddl.is_empty(), "no DDL for {spelling}");
         }
-    }
-
-    #[cfg(feature = "oracle")]
-    #[test]
-    fn driver_types_map_into_the_vocabulary() {
-        use oracle::sql_type::OracleType;
-        for (driver, expected) in [
-            (OracleType::Varchar2(100), OracleColumnType::Varchar2(Some(100))),
-            (OracleType::Number(0, -127), number(None, None)),
-            (OracleType::Number(10, 0), number(Some(10), Some(0))),
-            (OracleType::Number(18, 2), number(Some(18), Some(2))),
-            (OracleType::Float(126), OracleColumnType::Float),
-            (OracleType::Date, OracleColumnType::Date),
-            (OracleType::Timestamp(6), OracleColumnType::Timestamp),
-            (OracleType::TimestampTZ(6), OracleColumnType::TimestampTz),
-            (OracleType::TimestampLTZ(6), OracleColumnType::TimestampLtz),
-            (OracleType::Raw(16), OracleColumnType::Raw),
-            (OracleType::BLOB, OracleColumnType::Blob),
-            (OracleType::CLOB, OracleColumnType::Clob),
-            (OracleType::Boolean, OracleColumnType::Boolean),
-            (OracleType::Int64, number(Some(18), Some(0))),
-        ] {
-            assert_eq!(OracleColumnType::from(&driver), expected, "{driver}");
-        }
-        assert_eq!(
-            OracleColumnType::from(&OracleType::RefCursor),
-            OracleColumnType::Other("REF CURSOR".to_owned())
-        );
     }
 }

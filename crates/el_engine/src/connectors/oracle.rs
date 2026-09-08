@@ -1,60 +1,36 @@
-//! Oracle source connector (worker-side, feature "oracle"). The `oracle`
-//! crate wraps ODPI-C, which compiles anywhere but dlopens Oracle Instant
-//! Client at run time — a missing client is DPI-1047 and becomes the
-//! actionable message in [`INSTANT_CLIENT_HELP`]. When the environment
-//! names the client directory (`ZDBT_EL_ORACLE_CLIENT_DIR`) it is handed
-//! to ODPI-C explicitly, since neither `~/lib` nor a stripped `DYLD_*` /
-//! `LD_*` variable can be relied on. Credentials come from the
-//! environment (`ZDBT_EL_SRC_ORACLE_*`, see `oracle_env`), never argv.
-//! Setup, the test container and the live tests: `el_engine/ORACLE.md`.
+//! Oracle source connector (worker-side, feature "oracle"), on Oracle's
+//! own pure-Rust thin driver (`oracledb`): it speaks the wire protocol
+//! itself, so no Oracle client software is needed on any machine.
+//! Credentials come from the environment (`ZDBT_EL_SRC_ORACLE_*`, see
+//! `oracle_env`), never argv; a `TNS_ADMIN` directory is handed to the
+//! driver as the place to find `tnsnames.ora` and a wallet. Setup, the
+//! test container and the live tests: `el_engine/ORACLE.md`.
 //!
-//! Reading is a single server-side cursor with the fetch array size set to
-//! the chunk size, pulled lazily one chunk per `next_chunk` — no OFFSET
-//! re-scans, no whole result in memory. The incremental cursor is a bind
-//! variable (`WHERE "k" > :1 ORDER BY "k"`), never an interpolated
-//! literal, so a text watermark can never become SQL.
+//! Reading is a single server-side cursor pulled lazily one chunk per
+//! `next_chunk` — no OFFSET re-scans, no whole result in memory. The
+//! incremental cursor is a bind variable (`WHERE "k" > :1 ORDER BY "k"`),
+//! never an interpolated literal, so a text watermark can never become
+//! SQL.
 //!
 //! Identifiers follow Oracle's own folding: written unquoted in the spec
 //! they are upper-cased (`employees` → `EMPLOYEES`, which is what
 //! `CREATE TABLE employees` really made); to address a case-sensitive
 //! table, quote it in the spec (`"MixedCase"`).
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime};
-use oracle::sql_type::ToSql;
-use oracle::{Connection, ResultSet, Row};
+use chrono::{DateTime, Datelike as _, NaiveDate, NaiveDateTime, Timelike as _};
+use oracledb::{Connection, Cursor, OracleNumber, OracleTimestamp, Row, ToDbValue};
 use polars::prelude::*;
 
-use super::oracle_env::{ENV_CLIENT_DIR, ENV_TRY_MACOS_CLIENT, client_dir_from_env};
+use super::oracle_env::ENV_TNS_ADMIN;
 use crate::oracle_types::{OracleColumnType, normalize_ident, quote_ident, quote_stored};
 use crate::state::WatermarkValue;
 
-/// What every live path says when ODPI-C cannot find a client library.
-pub const INSTANT_CLIENT_HELP: &str = concat!(
-    "Oracle Instant Client is not installed on the machine running the connector worker ",
-    "(ODPI-C reported DPI-1047). Install the Basic or Basic Light package and name its ",
-    "directory in ZDBT_EL_ORACLE_CLIENT_DIR (in the project's .env, or on a server in ",
-    "/etc/zdbt-el-serve/env). Linux also needs libaio; Windows also accepts the directory ",
-    "on PATH. Oracle publishes no working client for Apple Silicon: run Oracle pipelines ",
-    "from a Linux remote (crates/el_engine/ORACLE.md)."
-);
-
-/// Why the worker will not connect from an Apple Silicon Mac.
-pub const MACOS_CLIENT_HELP: &str = concat!(
-    "Oracle pipelines cannot run on this Mac: Oracle Instant Client 23.3, the only build ",
-    "for Apple Silicon, crashes inside its own crypto library at connect time (Oracle bug ",
-    "36790189), and the worker would die without an error. Deploy the pipeline to a Linux ",
-    "remote instead, or set ZDBT_EL_ORACLE_TRY_MACOS_CLIENT=1 to try a newer client anyway."
-);
-
-/// Rows fetched per server round trip. ODPI-C allocates every column's
-/// fetch buffer at this size before the first row arrives (a VARCHAR2(4000)
-/// column costs 16 KB per row in AL32UTF8), so the chunk size — 50,000 by
-/// default — must not drive it. The chunk is still assembled lazily, one
-/// fetch at a time.
+/// Rows fetched per server round trip. The driver buffers this many rows
+/// per fetch, so the chunk size — 50,000 by default — must not drive it;
+/// the chunk is still assembled lazily, one fetch at a time.
 const FETCH_ARRAY_ROWS: u32 = 1_000;
 
 /// Whole-handshake budget. Oracle's own connect timeout only covers the
@@ -109,15 +85,10 @@ impl Fetch {
 
 // -- connecting ------------------------------------------------------------
 
-/// Turns a driver error into an app error. DPI-1047 (no client library)
-/// becomes the actionable install message; everything else keeps Oracle's
-/// own text, which names ORA codes but never our credentials.
-pub fn describe_error(error: oracle::Error) -> anyhow::Error {
-    if error.dpi_code() == Some(1047) || error.to_string().contains("DPI-1047") {
-        anyhow!(INSTANT_CLIENT_HELP)
-    } else {
-        anyhow!("{error}")
-    }
+/// Turns a driver error into an app error. Oracle's own text names ORA
+/// codes but never our credentials.
+pub fn describe_error(error: oracledb::Error) -> anyhow::Error {
+    anyhow!("{error}")
 }
 
 /// Connects with the credentials the parent put in the environment.
@@ -126,45 +97,25 @@ pub fn connect_from_env() -> Result<Connection> {
     connect(&creds.user, &creds.password, &creds.connect)
 }
 
-/// Points ODPI-C at the client directory the environment names, once per
-/// process. Without a named directory the driver's own search applies.
-fn init_client() -> Result<()> {
-    static OUTCOME: OnceLock<Result<(), String>> = OnceLock::new();
-    OUTCOME
-        .get_or_init(|| {
-            let Some(dir) = client_dir_from_env() else {
-                return Ok(());
-            };
-            let mut params = oracle::InitParams::new();
-            params
-                .oracle_client_lib_dir(dir.as_str())
-                .and_then(|params| params.init())
-                .map(|_| ())
-                .map_err(|error| format!("loading Oracle Instant Client from {dir}: {error}"))
-        })
-        .clone()
-        .map_err(|message| anyhow!("{message} ({ENV_CLIENT_DIR})"))
-}
-
-/// Connects, bounding the WHOLE handshake: ODPI-C's own timeouts cover
-/// the socket only, so the attempt runs on its own thread and is
+/// Connects, bounding the WHOLE handshake: the driver's own timeouts
+/// cover the socket only, so the attempt runs on its own thread and is
 /// abandoned at the deadline. Errors never echo the user or the connect
 /// string.
 pub fn connect(user: &str, password: &str, connect_string: &str) -> Result<Connection> {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_TRY_MACOS_CLIENT).is_none()
-    {
-        bail!(MACOS_CLIENT_HELP);
+    let mut config = oracledb::Config::default().set_credentials(user, password);
+    // A wallet / tnsnames directory: the driver resolves an alias through
+    // its tnsnames.ora and reads a wallet's ewallet.pem from there.
+    if let Some(dir) = std::env::var_os(ENV_TNS_ADMIN).filter(|dir| !dir.is_empty()) {
+        let dir = dir.to_string_lossy().into_owned();
+        config = config.set_config_dir(&dir).set_wallet_location(dir);
     }
-    init_client()?;
-    let (user, password, connect_string) = (
-        user.to_owned(),
-        password.to_owned(),
-        connect_string.to_owned(),
-    );
+    let config = config
+        .set_connect_string(connect_string)
+        .map_err(describe_error)
+        .context("parsing the oracle connect string")?;
     let (tx, rx) = std::sync::mpsc::channel();
     let attempt = std::thread::spawn(move || {
-        let _ = tx.send(Connection::connect(&user, &password, &connect_string));
+        let _ = tx.send(oracledb::connect(config));
     });
     let conn = match rx.recv_timeout(CONNECT_TIMEOUT) {
         Ok(result) => result.map_err(describe_error).context("connecting to oracle")?,
@@ -187,6 +138,33 @@ pub fn connect(user: &str, password: &str, connect_string: &str) -> Result<Conne
             .with_context(|| format!("running {statement}"))?;
     }
     Ok(conn)
+}
+
+/// A cell as text, whatever its type: the explorer's grid and the text
+/// fetch path both want Oracle's own rendering rather than a conversion
+/// error. Bytes render as hex.
+pub fn cell_text(row: &Row, index: usize) -> Result<Option<String>, oracledb::Error> {
+    if let Ok(value) = row.get::<Option<String>>(index) {
+        return Ok(value);
+    }
+    if let Ok(value) = row.get::<Option<OracleNumber>>(index) {
+        return Ok(value.map(|value| value.to_string()));
+    }
+    if let Ok(value) = row.get::<Option<OracleTimestamp>>(index) {
+        return Ok(value.map(|value| value.to_string()));
+    }
+    if let Ok(value) = row.get::<Option<oracledb::OracleIntervalDS>>(index) {
+        return Ok(value.map(|value| value.to_string()));
+    }
+    if let Ok(value) = row.get::<Option<oracledb::OracleIntervalYM>>(index) {
+        return Ok(value.map(|value| value.to_string()));
+    }
+    if let Ok(value) = row.get::<Option<bool>>(index) {
+        return Ok(value.map(|value| value.to_string()));
+    }
+    row.get::<Option<Vec<u8>>>(index).map(|value| {
+        value.map(|bytes| bytes.iter().map(|byte| format!("{byte:02X}")).collect())
+    })
 }
 
 // -- explorer SQL ----------------------------------------------------------
@@ -252,7 +230,7 @@ fn select_sql(
 pub struct OracleExtractor {
     columns: Vec<(String, Fetch)>,
     /// The open cursor; `None` once the server ran out of rows.
-    rows: Option<ResultSet<'static, Row>>,
+    rows: Option<Cursor>,
     chunk_rows: usize,
     /// Declared after `rows` so the cursor is dropped before the session.
     _conn: Connection,
@@ -293,23 +271,25 @@ impl OracleExtractor {
             cursor.as_ref().map(|(column, _)| column.as_str()),
         )?;
 
-        let bind: Option<Box<dyn ToSql>> = match &cursor {
+        let bind: Option<Box<dyn ToDbValue>> = match &cursor {
             Some((column, value)) => Some(
                 watermark_bind(value)
                     .with_context(|| format!("binding the cursor on {column:?}"))?,
             ),
             None => None,
         };
-        let params: Vec<&dyn ToSql> = bind.iter().map(|value| value.as_ref()).collect();
+        let params: Vec<&dyn ToDbValue> = bind.iter().map(|value| value.as_ref()).collect();
 
-        let statement = conn
+        let mut statement = conn
             .statement(&sql)
-            .fetch_array_size(fetch_array_size(chunk_rows))
-            .build()
             .map_err(describe_error)
             .with_context(|| format!("preparing the read of {owner}.{table_name}"))?;
+        let rows_per_fetch = fetch_array_size(chunk_rows);
+        statement
+            .fetch_array_size(rows_per_fetch)
+            .prefetch_rows(rows_per_fetch);
         let rows = statement
-            .into_result_set::<Row>(&params)
+            .query(&params)
             .map_err(describe_error)
             .with_context(|| format!("reading {owner}.{table_name}"))?;
 
@@ -342,10 +322,16 @@ fn probe_columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<(Str
         let row = row
             .map_err(describe_error)
             .with_context(|| format!("describing {owner}.{table}"))?;
-        let name = row.get::<usize, String>(0).map_err(describe_error)?;
-        let data_type = row.get::<usize, String>(1).map_err(describe_error)?;
-        let precision = row.get::<usize, Option<u8>>(2).unwrap_or(None);
-        let scale = row.get::<usize, Option<i8>>(3).unwrap_or(None);
+        let name = row.get::<String>(0).map_err(describe_error)?;
+        let data_type = row.get::<String>(1).map_err(describe_error)?;
+        let precision = row
+            .get::<Option<i64>>(2)
+            .unwrap_or(None)
+            .and_then(|value| u8::try_from(value).ok());
+        let scale = row
+            .get::<Option<i64>>(3)
+            .unwrap_or(None)
+            .and_then(|value| i8::try_from(value).ok());
         let column_type = OracleColumnType::from_dictionary(&data_type, precision, scale);
         columns.push((name, Fetch::of(&column_type.polars_dtype())));
     }
@@ -358,18 +344,24 @@ fn probe_columns(conn: &Connection, owner: &str, table: &str) -> Result<Vec<(Str
 /// The typed bind for an incremental cursor. Every variant binds as its
 /// own Oracle type: a text watermark never reaches a DATE comparison as
 /// an implicitly converted string.
-fn watermark_bind(value: &WatermarkValue) -> Result<Box<dyn ToSql>> {
+fn watermark_bind(value: &WatermarkValue) -> Result<Box<dyn ToDbValue>> {
     Ok(match value {
         WatermarkValue::Int(value) => Box::new(*value),
         WatermarkValue::Float(value) => Box::new(*value),
         WatermarkValue::Text(value) => Box::new(value.clone()),
-        WatermarkValue::Timestamp(micros) => Box::new(
+        WatermarkValue::Timestamp(micros) => Box::new(oracle_timestamp(
             naive_from_micros(*micros)
                 .ok_or_else(|| anyhow!("cursor timestamp {micros} is out of range"))?,
-        ),
-        WatermarkValue::Date(days) => Box::new(
-            date_from_days(*days).ok_or_else(|| anyhow!("cursor date {days} is out of range"))?,
-        ),
+        )),
+        WatermarkValue::Date(days) => {
+            let date =
+                date_from_days(*days).ok_or_else(|| anyhow!("cursor date {days} is out of range"))?;
+            Box::new(OracleTimestamp::new_date(
+                date.year() as i16,
+                date.month() as u8,
+                date.day() as u8,
+            ))
+        }
     })
 }
 
@@ -379,6 +371,37 @@ fn naive_from_micros(micros: i64) -> Option<NaiveDateTime> {
 
 fn date_from_days(days: i32) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(1970, 1, 1)?.checked_add_signed(chrono::TimeDelta::days(days.into()))
+}
+
+/// A naive wall clock as the driver's timestamp value (no zone).
+pub fn oracle_timestamp(value: NaiveDateTime) -> OracleTimestamp {
+    OracleTimestamp::new_timestamp(
+        value.year() as i16,
+        value.month() as u8,
+        value.day() as u8,
+        value.hour() as u8,
+        value.minute() as u8,
+        value.second() as u8,
+        value.nanosecond(),
+    )
+}
+
+/// Microseconds since the epoch for a fetched timestamp. For a zoned
+/// column the driver hands back the UTC clock with the stored offset
+/// alongside, and the session runs in UTC, so the fields are the instant
+/// in every case and the offset is not applied again.
+fn micros_of(value: &OracleTimestamp) -> Result<i64> {
+    NaiveDate::from_ymd_opt(value.year().into(), value.month().into(), value.day().into())
+        .and_then(|date| {
+            date.and_hms_nano_opt(
+                value.hour().into(),
+                value.minute().into(),
+                value.second().into(),
+                value.nanoseconds(),
+            )
+        })
+        .map(|naive| naive.and_utc().timestamp_micros())
+        .ok_or_else(|| anyhow!("timestamp {value} is out of range"))
 }
 
 /// One column's values for the chunk being built.
@@ -412,27 +435,25 @@ fn make_buffers(columns: &[(String, Fetch)]) -> Vec<Values> {
 fn push_row(row: &Row, columns: &[(String, Fetch)], buffers: &mut [Values]) -> Result<()> {
     for (index, buffer) in buffers.iter_mut().enumerate() {
         let name = columns[index].0.as_str();
-        let fail = |error: oracle::Error| describe_error(error).context(format!("column {name}"));
+        let fail = |error: oracledb::Error| describe_error(error).context(format!("column {name}"));
         match buffer {
             Values::Bool(values) => values.push(row.get(index).map_err(fail)?),
             Values::Int(values) => values.push(row.get(index).map_err(fail)?),
             Values::Float(values) => values.push(row.get(index).map_err(fail)?),
-            // NUMBER arrives as text and stays exact all the way into the
-            // decimal column.
-            Values::Decimal(values) | Values::Text(values) => {
-                values.push(row.get(index).map_err(fail)?)
-            }
-            Values::Timestamp(values) => values.push(
-                row.get::<_, Option<NaiveDateTime>>(index)
+            // NUMBER arrives as the driver's exact decimal and stays exact
+            // as text all the way into the decimal column.
+            Values::Decimal(values) => values.push(
+                row.get::<Option<OracleNumber>>(index)
                     .map_err(fail)?
-                    .map(|value| value.and_utc().timestamp_micros()),
+                    .map(|value| value.to_string()),
             ),
-            // Fetched WITH its stored offset: the driver's `DateTime<Utc>`
-            // conversion copies the wall clock and drops the zone.
-            Values::TimestampTz(values) => values.push(
-                row.get::<_, Option<DateTime<FixedOffset>>>(index)
+            Values::Text(values) => values.push(cell_text(row, index).map_err(fail)?),
+            Values::Timestamp(values) | Values::TimestampTz(values) => values.push(
+                row.get::<Option<OracleTimestamp>>(index)
                     .map_err(fail)?
-                    .map(|value| value.timestamp_micros()),
+                    .map(|value| micros_of(&value))
+                    .transpose()
+                    .with_context(|| format!("column {name}"))?,
             ),
             Values::Binary(values) => values.push(row.get(index).map_err(fail)?),
         }
@@ -676,7 +697,7 @@ mod tests {
     /// Live smoke, gated: `EL_ORACLE_SMOKE_URL=host:1521/service
     /// EL_ORACLE_SMOKE_USER=… EL_ORACLE_SMOKE_PASSWORD=… cargo test -p
     /// el_engine --features oracle -- --ignored oracle_smoke --nocapture`
-    /// (needs Oracle Instant Client on this machine).
+    /// (needs a reachable database; no client software).
     #[test]
     #[ignore]
     fn oracle_smoke() {
@@ -699,10 +720,11 @@ mod tests {
             &[],
         )
         .unwrap();
+        // Row 1 is stamped +02:00: it must read as 08:00 UTC, not 10:00.
         conn.execute(
             "INSERT INTO ZDBT_EL_SMOKE VALUES (1, 'ada', 10.50, 1, 'note', \
              HEXTORAW('DEADBEEF'), DATE '1990-03-01', \
-             TIMESTAMP '2026-01-01 10:00:00 +00:00')",
+             TIMESTAMP '2026-01-01 10:00:00 +02:00')",
             &[],
         )
         .unwrap();
@@ -720,7 +742,9 @@ mod tests {
         .unwrap();
         conn.commit().unwrap();
         let schema_owner: String = conn
-            .query_row_as::<String>("SELECT USER FROM DUAL", &[])
+            .query_row("SELECT USER FROM DUAL", &[])
+            .unwrap()
+            .get(0)
             .unwrap();
 
         let mut extractor = OracleExtractor::new(
@@ -743,11 +767,24 @@ mod tests {
             &DataType::Datetime(TimeUnit::Microseconds, Some(TimeZone::UTC))
         );
         let mut total = 0;
+        let mut first_updated = None;
         while let Some(chunk) = extractor.next_chunk().unwrap() {
             assert!(chunk.height() <= 2);
+            if first_updated.is_none() {
+                first_updated = chunk
+                    .column("UPDATED")
+                    .unwrap()
+                    .as_materialized_series()
+                    .to_physical_repr()
+                    .i64()
+                    .unwrap()
+                    .get(0);
+            }
             total += chunk.height();
         }
         assert_eq!(total, 3);
+        // 2026-01-01 08:00:00 UTC.
+        assert_eq!(first_updated, Some(1_767_254_400_000_000));
 
         // Incremental: only rows past the cursor come back.
         // 2026-01-02 12:00 UTC — after row 2, before row 3.

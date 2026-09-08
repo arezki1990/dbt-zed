@@ -326,8 +326,8 @@ pub struct MssqlConn {
     pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
-/// An Oracle database. The worker connects through Oracle Instant Client,
-/// which must be installed on the machine running `zdbt-el-worker`.
+/// An Oracle database. The worker connects through Oracle's pure-Rust
+/// thin driver: no client software is needed anywhere.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct OracleConn {
     /// Database user; may be `${VAR}`-templated.

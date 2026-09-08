@@ -2,62 +2,25 @@
 
 Oracle is a **source** (full and incremental extraction, table explorer,
 ad-hoc query) and a **target** (full refresh and incremental MERGE). The
-driver is compiled into `zdbt-el-worker` only — the IDE never links it —
-and every credential travels as a `${VAR}` reference in
-`el/connections.yml`, resolved from `.env` and handed to the worker
-through its environment.
+driver — Oracle's pure-Rust `oracledb`, pinned at a beta — is compiled
+into `zdbt-el-worker` only; the IDE never links it. Every credential
+travels as a `${VAR}` reference in `el/connections.yml`, resolved from
+`.env` and handed to the worker through its environment.
 
-## Oracle Instant Client is required at runtime
+## No Oracle client software is needed
 
-The driver (`oracle` → ODPI-C) builds without any Oracle software, but it
-loads `libclntsh` when a connection is opened. **Whichever machine runs
-`zdbt-el-worker` needs Oracle Instant Client** — the IDE host when you
-work locally, or the `zdbt-el-serve` host when the pipeline runs on a
-remote server. A missing client surfaces as `DPI-1047` and the worker
-turns it into install instructions.
+The worker talks to Oracle through Oracle's own pure-Rust thin driver
+(`oracledb`), which speaks the wire protocol itself. Nothing is installed
+on the IDE host, on a `zdbt-el-serve` server or in the Docker image, and
+it works the same on macOS (Apple Silicon included), Linux and Windows.
+It connects to Oracle Database 12 and later.
 
-Tell the worker where the client is with **`ZDBT_EL_ORACLE_CLIENT_DIR`**:
-in the project's `.env` next to the credentials, or in the process
-environment (on a server, `/etc/zdbt-el-serve/env`). The worker hands that
-directory to the driver explicitly, which is the only placement that
-works everywhere: macOS 12+ no longer searches `~/lib`, and a signed app
-strips `DYLD_*` / `LD_*` variables from the processes it starts.
-
-Instant Client **Basic Light** (~35 MB) is enough for everything the
-connector does; Basic adds the character sets Basic Light omits — take it
-if your data is not US7ASCII/WE8*/UTF-8. Downloads are under Oracle's OTN
-licence; using them means accepting it.
-
-**Linux (x86-64 or ARM64)** — the production path, and what
-`deploy/el-serve/install.sh --oracle-client` automates on a server:
-
-```sh
-sudo mkdir -p /opt/oracle && cd /opt/oracle
-sudo curl -fLO https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
-sudo unzip -q instantclient-basiclite-linuxx64.zip      # → /opt/oracle/instantclient_23_x
-sudo apt-get install -y libaio1 || sudo apt-get install -y libaio1t64
-echo ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient_23_x >> ~/my-project/.env
-```
-
-(ARM64: `instantclient-basiclite-linux-arm64.zip`. Ubuntu 24.04 ships
-`libaio1t64` instead of `libaio1`, hence the fallback.) Registering the
-directory with `ldconfig` or `LD_LIBRARY_PATH` works as well; the
-installer writes both variables into `/etc/zdbt-el-serve/env`.
-
-**macOS (Apple Silicon) — not usable.** Instant Client 23.3 is the only
-build Oracle publishes for ARM64 Macs (the "latest" link serves the same
-2024 file) and it crashes inside its own crypto library the moment a
-connection opens (Oracle bug 36790189, reported against
-[node-oracledb](https://github.com/oracle/node-oracledb/issues/1723) and
-[python-oracledb](https://github.com/oracle/python-oracledb/issues/351);
-no published fix). The worker therefore refuses to connect on an Apple
-Silicon Mac and says so, instead of dying without a message. Run Oracle
-pipelines from a Linux remote (**Remotes → deploy**), and run the table
-explorer and ad-hoc queries there too. When Oracle ships a fixed client,
-`ZDBT_EL_ORACLE_TRY_MACOS_CLIENT=1` in `.env` lifts the refusal.
-
-**Windows** — unzip `instantclient-basiclite-windows.x64.zip` and name the
-directory in `ZDBT_EL_ORACLE_CLIENT_DIR` (adding it to `PATH` works too).
+Two things the driver reads from disk when a connection names them: a
+`tnsnames.ora` (for a TNS alias in `connect`) and a wallet's `ewallet.pem`
+(Autonomous Database with mutual TLS), both looked up in the directory
+`tns_admin` / `wallet_dir` points at. A wallet that needs its own
+password is not supported yet; TLS-only Autonomous connections (no
+wallet) need nothing.
 
 ## Connection
 
@@ -75,8 +38,9 @@ connections:
 ```
 
 `connect` is an Easy Connect string or an alias from `tnsnames.ora`. When
-`tns_admin` (or, failing that, `wallet_dir`) is set, the worker receives it
-as `TNS_ADMIN`.
+`tns_admin` (or, failing that, `wallet_dir`) is set — relative to the
+project when not absolute — the worker receives it as `TNS_ADMIN` and
+hands it to the driver as its configuration and wallet directory.
 
 The matching `.env` (next to the project, never committed):
 
@@ -119,8 +83,6 @@ and reads `MAX(update_key)` back as the next watermark.
 | `ZDBT_EL_SRC_ORACLE_USER` / `_PASSWORD` / `_CONNECT` | the app, on the worker it spawns | source credentials |
 | `ZDBT_EL_ORACLE_PASSWORD` | the app, on the loader sidecar | target password |
 | `TNS_ADMIN` | the app, from `tns_admin`/`wallet_dir` (relative to the project) | wallet / `tnsnames.ora` directory |
-| `ZDBT_EL_ORACLE_CLIENT_DIR` | you, in `.env` or the server env | where Instant Client lives; the app forwards it to the worker |
-| `ZDBT_EL_ORACLE_TRY_MACOS_CLIENT` | you | lifts the Apple Silicon refusal once Oracle ships a working client |
 | `EL_ORACLE_SMOKE_URL` / `_USER` / `_PASSWORD` | you | the live tests below |
 
 The first three are the contract between the app and the worker: they are
@@ -146,16 +108,13 @@ it, database files included.
 
 ### The gated tests
 
-Both need Instant Client on this machine and a reachable database; both
-are `#[ignore]` so `cargo test` and CI skip them. On a Mac they cannot
-run (see above): use a Linux box or a container on the same Docker
-network as the database, with `ZDBT_EL_ORACLE_CLIENT_DIR` exported.
+Both need a reachable database; both are `#[ignore]` so `cargo test`
+and CI skip them. They run on any machine, a Mac included.
 
 ```sh
 export EL_ORACLE_SMOKE_URL=127.0.0.1:1521/FREEPDB1
 export EL_ORACLE_SMOKE_USER=zdbt
 export EL_ORACLE_SMOKE_PASSWORD=…zdbt-password…
-export ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient_23_x
 
 # Source: type mapping, chunking, incremental cursor.
 cargo test -p el_engine --features oracle -- --ignored oracle_smoke --nocapture
@@ -176,12 +135,10 @@ Each test creates and drops its own tables (`ZDBT_EL_SMOKE`,
 2. In the EL panel, **Connections +** → **oracle**: user
    `${ORACLE_USER}`, password `${ORACLE_PASSWORD}`, connect
    `127.0.0.1:1521/FREEPDB1`, schema `ZDBT`. Save.
-3. Put the two values and `ZDBT_EL_ORACLE_CLIENT_DIR` in the project's
-   `.env`. (On a Mac, steps 4–7 happen on a Linux remote: deploy there.)
+3. Put the two values in the project's `.env`.
 4. Expand the connection in the sidebar: the table list (every owner
    outside the data dictionary) should include `ZDBT.DEMO_CUSTOMERS`,
-   `ZDBT.DEMO_ORDERS` and `ZDBT.DEMO_ACTIVE_CUSTOMERS`. Without Instant
-   Client this is where the install message appears.
+   `ZDBT.DEMO_ORDERS` and `ZDBT.DEMO_ACTIVE_CUSTOMERS`.
 5. **Query** tab: `SELECT * FROM ZDBT.DEMO_ORDERS` returns rows (the worker
    caps it with `FETCH FIRST n ROWS ONLY`).
 6. New pipeline, source `ZDBT.DEMO_ORDERS`, target a DuckDB connection, run
@@ -192,13 +149,6 @@ Each test creates and drops its own tables (`ZDBT_EL_SMOKE`,
 
 ## When something fails
 
-- **`DPI-1047`** — Instant Client is missing or invisible to the *worker*
-  process. Name its directory in `ZDBT_EL_ORACLE_CLIENT_DIR`: in `.env`
-  for the IDE, in `/etc/zdbt-el-serve/env` for a server (the launcher and
-  the systemd unit both source it), not just in your shell.
-- **"Oracle pipelines cannot run on this Mac"** — that is the Apple
-  Silicon client crash described above, caught before it happens. Deploy
-  to a Linux remote.
 - **"does not fit VARCHAR2(4000 CHAR)"** — a text value is wider than
   Oracle's 4000-byte VARCHAR2 ceiling. Add `cast: VARCHAR(4001)` (or any
   length above 4000) to the stream column so it is created as CLOB. A CLOB
@@ -208,9 +158,6 @@ Each test creates and drops its own tables (`ZDBT_EL_SMOKE`,
   the directory holding `tnsnames.ora`.
 - **`ORA-00942` on a table you can see in SQL*Plus** — a folding mismatch:
   the spec's unquoted name was upper-cased. Quote it to keep the case.
-- **Docker images** — `docker/el-serve/Dockerfile*` build a slim Debian
-  runtime with no Oracle client and no `libaio`. Mount one in and name it:
-  `-v /opt/oracle/instantclient_23_x:/opt/oracle/instantclient
-  -e ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient`, with `libaio`
-  installed in the image. The client is not redistributable, so it is
-  deliberately not baked into the image.
+- **Docker images** — `docker/el-serve/Dockerfile*` need nothing extra
+  for Oracle; only a wallet or `tnsnames.ora` directory has to be mounted
+  in when a connection names one.

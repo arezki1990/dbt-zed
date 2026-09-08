@@ -19,7 +19,7 @@ connections:
   pg_prod:
     type: postgres
     url: "${PG_PROD_URL}"          # postgres://user:pass@host:5432/db
-  # ora_erp:                       # needs Oracle Instant Client where the worker runs
+  # ora_erp:                       # no client software needed
   #   type: oracle
   #   user: "${ORACLE_USER}"
   #   password: "${ORACLE_PASSWORD}"

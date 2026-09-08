@@ -21,17 +21,6 @@ pub const ENV_CONNECT: &str = "ZDBT_EL_SRC_ORACLE_CONNECT";
 /// `sqlnet.ora` and (for Autonomous Database) the wallet. ODPI-C reads it
 /// from the process environment, so we set it on the child directly.
 pub const ENV_TNS_ADMIN: &str = "TNS_ADMIN";
-/// The directory holding Oracle Instant Client. The worker hands it to
-/// ODPI-C explicitly instead of trusting the loader's search path: macOS
-/// 12+ dropped `~/lib` from the fallback path, and a hardened runtime
-/// strips `DYLD_*` / `LD_*` from the children of a signed app. Set it in
-/// the process environment or in the project's `.env`.
-pub const ENV_CLIENT_DIR: &str = "ZDBT_EL_ORACLE_CLIENT_DIR";
-/// Opt-in to connecting through the macOS Instant Client. Oracle's only
-/// Apple Silicon build (23.3) crashes inside its own crypto library at
-/// connect time (Oracle bug 36790189), so the worker refuses on that
-/// platform unless this is set — a clear error beats a silent segfault.
-pub const ENV_TRY_MACOS_CLIENT: &str = "ZDBT_EL_ORACLE_TRY_MACOS_CLIENT";
 
 /// A connection's credentials with every `${VAR}` resolved. Values are
 /// `Secret`s: they print as «redacted» and only reach the child's
@@ -44,9 +33,6 @@ pub struct OracleCreds {
     /// wallet directory is also where its `tnsnames.ora` lives. Relative
     /// paths were resolved against the project root.
     pub tns_admin: Option<Secret>,
-    /// Client settings the project's `.env` (or the real environment)
-    /// carries for the worker: [`ENV_CLIENT_DIR`], [`ENV_TRY_MACOS_CLIENT`].
-    pub client_settings: Vec<(&'static str, String)>,
 }
 
 impl OracleCreds {
@@ -62,16 +48,11 @@ impl OracleCreds {
         let tns_admin = tns_admin
             .map(|dir| resolve(dir).map(|dir| Secret::new(anchor(project_root, dir.expose()))))
             .transpose()?;
-        let client_settings = [ENV_CLIENT_DIR, ENV_TRY_MACOS_CLIENT]
-            .into_iter()
-            .filter_map(|name| env.get(name).map(|value| (name, value)))
-            .collect();
         Ok(Self {
             user: resolve(&conn.user)?,
             password: resolve(&conn.password)?,
             connect: resolve(&conn.connect)?,
             tns_admin,
-            client_settings,
         })
     }
 
@@ -83,15 +64,6 @@ impl OracleCreds {
             .env(ENV_CONNECT, self.connect.expose());
         if let Some(dir) = &self.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
-        }
-        self.apply_client_settings(command);
-    }
-
-    /// Only the client-location settings — what the loader sidecar needs
-    /// besides the password it receives on its own channel.
-    pub fn apply_client_settings(&self, command: &mut Command) {
-        for (name, value) in &self.client_settings {
-            command.env(name, value);
         }
     }
 }
@@ -133,13 +105,6 @@ pub fn creds_from_env() -> Result<WorkerCreds> {
     })
 }
 
-/// Where the worker was told the client library lives, if anywhere.
-pub fn client_dir_from_env() -> Option<String> {
-    std::env::var(ENV_CLIENT_DIR)
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,11 +123,7 @@ mod tests {
 
     fn env() -> EnvMap {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".env"),
-            "U=scott\nP=tiger\nZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/ic\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".env"), "U=scott\nP=tiger\n").unwrap();
         EnvMap::load(dir.path(), None)
     }
 
@@ -185,21 +146,18 @@ mod tests {
     }
 
     #[test]
-    fn client_settings_travel_from_the_env_map() {
+    fn credentials_travel_as_environment_only() {
         let creds = OracleCreds::resolve(&conn(None, None), &env(), Path::new("/proj")).unwrap();
-        assert_eq!(
-            creds.client_settings,
-            vec![(ENV_CLIENT_DIR, "/opt/oracle/ic".to_owned())]
-        );
         let mut command = Command::new("true");
         creds.apply(&mut command);
         let set: Vec<String> = command
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        for name in [ENV_USER, ENV_PASSWORD, ENV_CONNECT, ENV_CLIENT_DIR] {
+        for name in [ENV_USER, ENV_PASSWORD, ENV_CONNECT] {
             assert!(set.iter().any(|n| n == name), "{name} not set: {set:?}");
         }
         assert!(!set.iter().any(|n| n == ENV_TNS_ADMIN), "{set:?}");
+        assert!(command.get_args().count() == 0, "nothing on argv");
     }
 }
