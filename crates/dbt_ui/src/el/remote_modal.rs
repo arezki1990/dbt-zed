@@ -721,7 +721,7 @@ impl Render for ElRemoteModal {
                 .child(field_row("profile", self.ssh_profile.clone()))
                 .child(
                     Label::new(
-                        "Runs deploy/el-serve/install.sh on the server through your own ssh \
+                        "Runs the zdbt-el installer on the server through your own ssh \
                          (sudo needed): builds zdbt-el-serve, creates the service and a \
                          systemd unit. The token is generated here and sent over stdin.",
                     )

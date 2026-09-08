@@ -2,6 +2,11 @@
 # v0 mangling scheme provides more detailed backtraces around closures
 rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
 
+[net]
+# el_engine comes from a private Git repository: use the system git so its
+# SSH agent / credential helper applies instead of libgit2's.
+git-fetch-with-cli = true
+
 [alias]
 xtask = "run --package xtask --"
 perf-test = ["test", "--profile", "release-fast", "--lib", "--bins", "--tests", "--all-features", "--config", "target.'cfg(true)'.runner='cargo run -p perf --release'", "--config", "target.'cfg(true)'.rustflags=[\"--cfg\", \"perf_enabled\"]"]

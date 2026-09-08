@@ -220,7 +220,7 @@ fn install_remote(args: &[String]) -> i32 {
     // The installer travels with the binary and is sent over stdin: no
     // CDN-cached copy, no network fetch of the script, always the version
     // that matches this build.
-    const INSTALLER: &str = include_str!("../../../../deploy/el-serve/install.sh");
+    const INSTALLER: &str = el_engine::INSTALL_SH;
 
     // A fresh token, from the OS CSPRNG.
     let token = {

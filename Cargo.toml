@@ -62,9 +62,6 @@ members = [
     "crates/edit_prediction_types",
     "crates/edit_prediction_ui",
     "crates/editor",
-    "crates/el_engine",
-    "crates/el_serve",
-    "crates/el_worker",
     "crates/editor_benchmarks",
     "crates/encoding_selector",
     "crates/env_var",
@@ -338,7 +335,10 @@ edit_prediction_metrics = { path = "crates/edit_prediction_metrics" }
 edit_prediction_types = { path = "crates/edit_prediction_types" }
 edit_prediction_ui = { path = "crates/edit_prediction_ui" }
 editor = { path = "crates/editor" }
-el_engine = { path = "crates/el_engine" }
+# The extract-load engine lives in its own (private) repository; Cargo
+# fetches it with the system git (see .cargo/config.toml), so the SSH key
+# that reaches GitHub is enough locally and CI maps the URL to a token.
+el_engine = { git = "ssh://git@github.com/arezki1990/zdbt-el.git", branch = "main" }
 duckdb = { version = "=1.10505.0", default-features = false, features = ["bundled", "chrono"] }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
