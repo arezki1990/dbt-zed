@@ -22,8 +22,14 @@ RUN python3 deploy/el-serve/standalone.py /src /el && cd /el \
     && cargo build --release -p el_serve -p el_worker
 
 FROM debian:bookworm-slim
+# libaio: what Oracle Instant Client needs when the thick Oracle driver is
+# used (Oracle 10g / 11g targets). The client itself is not redistributable:
+# mount it in and name it, e.g.
+#   -v /opt/oracle/instantclient_19_26:/opt/oracle/instantclient:ro
+#   -e ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient
+#   -e LD_LIBRARY_PATH=/opt/oracle/instantclient
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libaio1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /el/target/release/zdbt-el-serve /usr/local/bin/
 COPY --from=build /el/target/release/zdbt-el-worker /usr/local/bin/

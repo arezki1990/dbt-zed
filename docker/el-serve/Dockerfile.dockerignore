@@ -1,0 +1,11 @@
+# Build context for docker/el-serve/Dockerfile: only what the carve-out
+# copies. The repo root is a whole IDE; sending it would take minutes.
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE-GPL
+!rust-toolchain.toml
+!crates/el_engine
+!crates/el_worker
+!crates/el_serve
+!deploy/el-serve/standalone.py
