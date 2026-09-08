@@ -115,6 +115,7 @@ fn extract(args: &[String]) -> Result<()> {
                 &creds.user,
                 &creds.password,
                 &creds.connect,
+                el_engine::connectors::oracle_env::driver_from_env(),
                 schema,
                 &table,
                 chunk_rows,

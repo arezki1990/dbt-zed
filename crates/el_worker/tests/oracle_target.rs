@@ -71,18 +71,14 @@ fn oracle_target_swaps_then_merges() {
 
     let conn = el_engine::connectors::oracle::connect(&user, &password, &connect).unwrap();
     let schema: String = conn
-        .query_row("SELECT USER FROM DUAL", &[])
+        .query_scalar_text("SELECT USER FROM DUAL")
         .unwrap()
-        .get(0)
         .unwrap();
     let drop_all = |table: &str| {
-        let _ = conn.execute(
-            &format!(
-                "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table} PURGE'; \
-                 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
-            ),
-            &[],
-        );
+        let _ = conn.execute(&format!(
+            "BEGIN EXECUTE IMMEDIATE 'DROP TABLE {table} PURGE'; \
+             EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;"
+        ));
     };
     drop_all("ZDBT_EL_ORDERS");
     drop_all("ZDBT_EL_ORDERS__ZDBT_STAGING");
@@ -119,12 +115,10 @@ streams:
     let (read, written) = run(project.path(), pipeline);
     assert_eq!((read, written), (4, 4));
     let count: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM \"{schema}\".\"ZDBT_EL_ORDERS\""),
-            &[],
-        )
+        .query_scalar_text(&format!("SELECT COUNT(*) FROM \"{schema}\".\"ZDBT_EL_ORDERS\""))
         .unwrap()
-        .get(0)
+        .unwrap()
+        .parse()
         .unwrap();
     assert_eq!(count, 4);
 
@@ -152,24 +146,18 @@ streams:
     run(project.path(), pipeline);
 
     let count: i64 = conn
-        .query_row(
-            &format!("SELECT COUNT(*) FROM \"{schema}\".\"ZDBT_EL_ORDERS\""),
-            &[],
-        )
+        .query_scalar_text(&format!("SELECT COUNT(*) FROM \"{schema}\".\"ZDBT_EL_ORDERS\""))
         .unwrap()
-        .get(0)
+        .unwrap()
+        .parse()
         .unwrap();
     assert_eq!(count, 6, "MERGE must update, not duplicate");
     let amount: String = conn
-        .query_row(
-            &format!(
-                "SELECT TO_CHAR(\"AMOUNT\", 'FM9999990.00') \
-                 FROM \"{schema}\".\"ZDBT_EL_ORDERS\" WHERE \"ID\" = 1"
-            ),
-            &[],
-        )
+        .query_scalar_text(&format!(
+            "SELECT TO_CHAR(\"AMOUNT\", 'FM9999990.00') \
+             FROM \"{schema}\".\"ZDBT_EL_ORDERS\" WHERE \"ID\" = 1"
+        ))
         .unwrap()
-        .get(0)
         .unwrap();
     assert_eq!(amount, "111.00");
     let store = el_engine::state::StateStore::open(project.path(), None).unwrap();

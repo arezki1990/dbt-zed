@@ -7,13 +7,42 @@ into `zdbt-el-worker` only; the IDE never links it. Every credential
 travels as a `${VAR}` reference in `el/connections.yml`, resolved from
 `.env` and handed to the worker through its environment.
 
-## No Oracle client software is needed
+## Two drivers: thin by default, thick for Oracle 10g and 11g
 
-The worker talks to Oracle through Oracle's own pure-Rust thin driver
+The worker talks to Oracle through Oracle's own pure-Rust **thin driver**
 (`oracledb`), which speaks the wire protocol itself. Nothing is installed
 on the IDE host, on a `zdbt-el-serve` server or in the Docker image, and
 it works the same on macOS (Apple Silicon included), Linux and Windows.
-It connects to Oracle Database 12 and later.
+It connects to **Oracle Database 12.1 and later**.
+
+Servers before 12.1 — **10g and 11g** — speak an older protocol the thin
+driver refuses at the handshake. For those the worker carries a second,
+**thick driver** (ODPI-C over Oracle Instant Client), used when a
+connection says `driver: thick`, or automatically under the default
+`driver: auto` when the thin driver is refused for the server's version.
+A modern database never touches the thick driver. The thick driver has
+two constraints the thin one does not:
+
+- **It needs Oracle Instant Client on the machine running the worker**,
+  of the generation that reaches the server: **19c for 11.2**, **12.1 for
+  10g** (Oracle keeps both on its download pages; the 19c ARM64 build is
+  `instantclient-basiclite-linux.arm64-19.x.0.0.0dbru.zip`, the 12.1 one
+  x86-64 only). Name its directory in `ZDBT_EL_ORACLE_CLIENT_DIR` **and**,
+  on Linux, put it on the loader path too (`LD_LIBRARY_PATH`, or a file in
+  `/etc/ld.so.conf.d` plus `ldconfig`): ODPI-C loads `libclntsh` from the
+  named directory, but that library's own siblings (`libnnz`,
+  `libclntshcore`) load through the system loader. On a server,
+  `deploy/el-serve/install.sh --oracle-client-url <zip>` installs the
+  client and `libaio` and writes both variables into
+  `/etc/zdbt-el-serve/env`.
+- **It cannot run on an Apple Silicon Mac**: Oracle's only ARM64 macOS
+  client (23.3) crashes inside its own crypto library at connect (Oracle
+  bug 36790189), and no older client exists for that platform. So a 10g
+  or 11g pipeline runs on a **Linux remote** (deploy it there); on a Mac
+  the worker refuses with a message saying so rather than dying.
+
+Both drivers share everything else: the extractor, the explorer, the
+loader, the type tables and the SQL they send.
 
 Two things the driver reads from disk when a connection names them: a
 `tnsnames.ora` (for a TNS alias in `connect`) and a wallet's `ewallet.pem`
@@ -35,6 +64,7 @@ connections:
     schema: ERP                             # optional; defaults to the user's schema
     # wallet_dir: /etc/zdbt/wallet          # Autonomous Database wallet
     # tns_admin: /etc/zdbt/network/admin    # dir holding tnsnames.ora / sqlnet.ora
+    # driver: thick                         # auto (default) | thin | thick — 10g/11g
 ```
 
 `connect` is an Easy Connect string or an alias from `tnsnames.ora`. When
@@ -83,6 +113,9 @@ and reads `MAX(update_key)` back as the next watermark.
 | `ZDBT_EL_SRC_ORACLE_USER` / `_PASSWORD` / `_CONNECT` | the app, on the worker it spawns | source credentials |
 | `ZDBT_EL_ORACLE_PASSWORD` | the app, on the loader sidecar | target password |
 | `TNS_ADMIN` | the app, from `tns_admin`/`wallet_dir` (relative to the project) | wallet / `tnsnames.ora` directory |
+| `ZDBT_EL_ORACLE_DRIVER` | the app, from `driver` | which driver the worker connects with |
+| `ZDBT_EL_ORACLE_CLIENT_DIR` | you, in `.env` or the server env | where Instant Client lives (thick driver only); the app forwards it |
+| `ZDBT_EL_ORACLE_TRY_MACOS_CLIENT` | you | lets the thick driver try on an Apple Silicon Mac anyway |
 | `EL_ORACLE_SMOKE_URL` / `_USER` / `_PASSWORD` | you | the live tests below |
 
 The first three are the contract between the app and the worker: they are
@@ -109,7 +142,11 @@ it, database files included.
 ### The gated tests
 
 Both need a reachable database; both are `#[ignore]` so `cargo test`
-and CI skip them. They run on any machine, a Mac included.
+and CI skip them. Against a 12.1+ database they run on any machine, a Mac
+included. To exercise the thick driver, point them at a 10g / 11g
+database from a Linux box (or a container on the database's Docker
+network) with `ZDBT_EL_ORACLE_CLIENT_DIR` exported and the
+`oracle-thick` feature on; `driver: auto` then falls back by itself.
 
 ```sh
 export EL_ORACLE_SMOKE_URL=127.0.0.1:1521/FREEPDB1
@@ -149,6 +186,18 @@ Each test creates and drops its own tables (`ZDBT_EL_SMOKE`,
 
 ## When something fails
 
+- **"this Oracle server is older than 12.1"** — a 10g / 11g server on a
+  worker without the thick driver, or with `driver: thin`. Set
+  `driver: auto` (or `thick`), install the matching Instant Client on a
+  Linux worker and deploy there.
+- **`DPI-1047`** — the thick driver was chosen but Instant Client is
+  missing or invisible to the *worker* process: name its directory in
+  `ZDBT_EL_ORACLE_CLIENT_DIR` and, on Linux, in `LD_LIBRARY_PATH` as well
+  (in `.env` for the IDE, in `/etc/zdbt-el-serve/env` for a server). A
+  message naming `libnnz` or `libclntshcore` means the second half is
+  missing.
+- **"the thick Oracle driver cannot run on this Mac"** — a 10g / 11g
+  server reached from Apple Silicon. Deploy to a Linux remote.
 - **"does not fit VARCHAR2(4000 CHAR)"** — a text value is wider than
   Oracle's 4000-byte VARCHAR2 ceiling. Add `cast: VARCHAR(4001)` (or any
   length above 4000) to the stream column so it is created as CLOB. A CLOB

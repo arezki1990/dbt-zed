@@ -21,7 +21,7 @@ use ui::prelude::*;
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, OracleConn, Pipeline, SnowflakeAuth,
+    Connection, Connections, DbConn, DuckdbConn, OracleConn, OracleDriver, Pipeline, SnowflakeAuth,
     SnowflakeConn, SpecError,
 };
 
@@ -247,6 +247,7 @@ impl ElConnectionModal {
         let mut oracle_schema = String::new();
         let mut oracle_wallet = String::new();
         let mut oracle_tns = String::new();
+        let mut oracle_driver = String::new();
         match &existing {
             Some(Connection::Postgres(conn)) | Some(Connection::Mysql(conn)) => {
                 url_or_path = conn.url.clone();
@@ -269,6 +270,7 @@ impl ElConnectionModal {
                 oracle_schema = conn.schema.clone().unwrap_or_default();
                 oracle_wallet = conn.wallet_dir.clone().unwrap_or_default();
                 oracle_tns = conn.tns_admin.clone().unwrap_or_default();
+                oracle_driver = conn.driver.map(|driver| driver.as_str().to_owned()).unwrap_or_default();
             }
             Some(Connection::Snowflake(conn)) => {
                 account = conn.account.clone();
@@ -313,6 +315,7 @@ impl ElConnectionModal {
             make("schema", "ERP (optional)", &oracle_schema),
             make("wallet dir", "el/wallet (optional)", &oracle_wallet),
             make("tns admin", "el/tns (optional)", &oracle_tns),
+            make("driver", "auto — thick for Oracle 10g/11g (optional)", &oracle_driver),
         ];
         let name = make("name", "pg_prod", editing.as_deref().unwrap_or("")).editor;
 
@@ -406,6 +409,12 @@ impl ElConnectionModal {
                     );
                 }
                 let optional = |text: String| (!text.is_empty()).then_some(text);
+                let driver_text = self.text(13, cx);
+                let driver = match OracleDriver::parse(&driver_text) {
+                    Some(OracleDriver::Auto) => None,
+                    Some(driver) => Some(driver),
+                    None => bail!("driver must be auto, thin or thick"),
+                };
                 Connection::Oracle(OracleConn {
                     user,
                     password,
@@ -413,6 +422,7 @@ impl ElConnectionModal {
                     schema: optional(self.text(10, cx)),
                     wallet_dir: optional(self.text(11, cx)),
                     tns_admin: optional(self.text(12, cx)),
+                    driver,
                     extra: Default::default(),
                 })
             }
@@ -1150,6 +1160,7 @@ mod tests {
             schema: Some("ERP".to_owned()),
             wallet_dir: None,
             tns_admin: None,
+            driver: None,
             extra: IndexMap::new(),
         })
     }

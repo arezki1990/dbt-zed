@@ -358,6 +358,7 @@ impl BuilderForm {
                             schema: None,
                             wallet_dir: None,
                             tns_admin: None,
+                            driver: None,
                             extra: Default::default(),
                         })
                     }

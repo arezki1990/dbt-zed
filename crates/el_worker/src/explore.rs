@@ -75,20 +75,14 @@ pub fn list(args: &[String]) -> Result<()> {
         "oracle" => {
             // Oracle has no information_schema: the data dictionary lists
             // tables and views per owner, minus the dictionary schemas.
-            let connection = oracle_connector::connect_from_env()?;
-            let rows = connection
-                .query(&oracle_connector::list_tables_sql(), &[])
-                .map_err(oracle_connector::describe_error)
+            let session = oracle_connector::connect_from_env()?;
+            let mut rows = session
+                .query(&oracle_connector::list_tables_sql(), &[], 1_000)
                 .context("listing oracle tables")?;
-            for row in rows {
-                let row = row
-                    .map_err(oracle_connector::describe_error)
-                    .context("listing oracle tables")?;
+            while let Some(row) = rows.next_row().context("listing oracle tables")? {
                 items.push((
-                    row.get::<String>(0)
-                        .map_err(oracle_connector::describe_error)?,
-                    row.get::<String>(1)
-                        .map_err(oracle_connector::describe_error)?,
+                    row.get_text(0)?.unwrap_or_default(),
+                    row.get_text(1)?.unwrap_or_default(),
                 ));
             }
         }
@@ -199,30 +193,22 @@ pub fn query(args: &[String]) -> Result<()> {
             }
         }
         "oracle" => {
-            let connection = oracle_connector::connect_from_env()?;
+            let session = oracle_connector::connect_from_env()?;
             // Oracle has no LIMIT and takes no AS on a table alias.
             let capped = oracle_connector::capped_query_sql(&sql, limit);
-            let rows = connection
-                .query(&capped, &[])
-                .map_err(oracle_connector::describe_error)
+            let mut rows = session
+                .query(&capped, &[], 1_000)
                 .context("running query")?;
             // Names come from the cursor, so an empty result still
             // describes its shape.
-            let names: Vec<String> = rows
-                .columns()
-                .iter()
-                .map(|info| info.name().to_owned())
-                .collect();
+            let names = rows.column_names();
             emit(&ExploreEvent::Columns {
                 names: names.clone(),
             });
-            for row in rows {
-                let row = row
-                    .map_err(oracle_connector::describe_error)
-                    .context("reading query row")?;
+            while let Some(row) = rows.next_row().context("reading query row")? {
                 // Oracle's own rendering of every scalar; bytes as hex.
                 let cells = (0..names.len())
-                    .map(|ix| oracle_connector::cell_text(&row, ix).unwrap_or(None))
+                    .map(|ix| row.get_text(ix).unwrap_or(None))
                     .collect();
                 emit(&ExploreEvent::Row { cells });
             }

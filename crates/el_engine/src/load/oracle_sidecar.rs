@@ -32,6 +32,10 @@ pub struct OracleSidecarConfig {
     /// Directory holding `tnsnames.ora` / a wallet, when the connection
     /// names one.
     pub tns_admin: Option<Secret>,
+    pub driver: crate::spec::OracleDriver,
+    /// Thick-driver settings from the project's `.env`, forwarded to the
+    /// sidecar (`ZDBT_EL_ORACLE_CLIENT_DIR`, …).
+    pub worker_settings: Vec<(&'static str, String)>,
     /// Target-side DDL choices (23ai native `BOOLEAN`, …).
     pub dialect: OracleDialect,
 }
@@ -55,6 +59,10 @@ impl OracleSidecarLoader {
             .env(ENV_ORACLE_PASSWORD, config.password.expose());
         if let Some(dir) = &config.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
+        }
+        command.env(crate::connectors::oracle_env::ENV_DRIVER, config.driver.as_str());
+        for (name, value) in &config.worker_settings {
+            command.env(name, value);
         }
         let mut child = command
             .stdin(Stdio::piped())

@@ -12,7 +12,7 @@ use std::process::Command;
 use anyhow::{Context as _, Result};
 
 use crate::env::{EnvMap, Secret};
-use crate::spec::OracleConn;
+use crate::spec::{OracleConn, OracleDriver};
 
 pub const ENV_USER: &str = "ZDBT_EL_SRC_ORACLE_USER";
 pub const ENV_PASSWORD: &str = "ZDBT_EL_SRC_ORACLE_PASSWORD";
@@ -21,6 +21,16 @@ pub const ENV_CONNECT: &str = "ZDBT_EL_SRC_ORACLE_CONNECT";
 /// `sqlnet.ora` and (for Autonomous Database) the wallet. ODPI-C reads it
 /// from the process environment, so we set it on the child directly.
 pub const ENV_TNS_ADMIN: &str = "TNS_ADMIN";
+/// Which driver the worker connects with: `auto`, `thin` or `thick`.
+pub const ENV_DRIVER: &str = "ZDBT_EL_ORACLE_DRIVER";
+/// The directory holding Oracle Instant Client, for the thick driver.
+/// Handed to ODPI-C explicitly rather than trusting the loader's search
+/// path (a hardened runtime strips `LD_*` / `DYLD_*` from a signed app's
+/// children). Set in the process environment or the project's `.env`.
+pub const ENV_CLIENT_DIR: &str = "ZDBT_EL_ORACLE_CLIENT_DIR";
+/// Opt-in to the thick driver on an Apple Silicon Mac, where Oracle's
+/// only Instant Client build crashes at connect (Oracle bug 36790189).
+pub const ENV_TRY_MACOS_CLIENT: &str = "ZDBT_EL_ORACLE_TRY_MACOS_CLIENT";
 
 /// A connection's credentials with every `${VAR}` resolved. Values are
 /// `Secret`s: they print as «redacted» and only reach the child's
@@ -33,6 +43,11 @@ pub struct OracleCreds {
     /// wallet directory is also where its `tnsnames.ora` lives. Relative
     /// paths were resolved against the project root.
     pub tns_admin: Option<Secret>,
+    pub driver: OracleDriver,
+    /// Thick-driver settings the project's `.env` (or the real
+    /// environment) carries for the worker: [`ENV_CLIENT_DIR`],
+    /// [`ENV_TRY_MACOS_CLIENT`]. Locations and flags, never secrets.
+    pub worker_settings: Vec<(&'static str, String)>,
 }
 
 impl OracleCreds {
@@ -48,11 +63,17 @@ impl OracleCreds {
         let tns_admin = tns_admin
             .map(|dir| resolve(dir).map(|dir| Secret::new(anchor(project_root, dir.expose()))))
             .transpose()?;
+        let worker_settings = [ENV_CLIENT_DIR, ENV_TRY_MACOS_CLIENT]
+            .into_iter()
+            .filter_map(|name| env.get(name).map(|value| (name, value)))
+            .collect();
         Ok(Self {
             user: resolve(&conn.user)?,
             password: resolve(&conn.password)?,
             connect: resolve(&conn.connect)?,
             tns_admin,
+            driver: conn.driver(),
+            worker_settings,
         })
     }
 
@@ -64,6 +85,16 @@ impl OracleCreds {
             .env(ENV_CONNECT, self.connect.expose());
         if let Some(dir) = &self.tns_admin {
             command.env(ENV_TNS_ADMIN, dir.expose());
+        }
+        self.apply_driver_settings(command);
+    }
+
+    /// The driver choice and thick-driver settings only — what the loader
+    /// sidecar needs besides the password it receives on its own channel.
+    pub fn apply_driver_settings(&self, command: &mut Command) {
+        command.env(ENV_DRIVER, self.driver.as_str());
+        for (name, value) in &self.worker_settings {
+            command.env(name, value);
         }
     }
 }
@@ -83,6 +114,21 @@ pub fn default_schema(conn: &OracleConn, env: &EnvMap) -> Result<String> {
     let resolved = crate::env::resolve_templates(conn.effective_schema(), env)
         .map_err(|missing| anyhow::anyhow!("{missing}"))?;
     Ok(resolved.expose().to_owned())
+}
+
+/// The driver the worker was told to use; `auto` when nothing said.
+pub fn driver_from_env() -> OracleDriver {
+    std::env::var(ENV_DRIVER)
+        .ok()
+        .and_then(|value| OracleDriver::parse(&value))
+        .unwrap_or_default()
+}
+
+/// Where the worker was told the Instant Client lives, if anywhere.
+pub fn client_dir_from_env() -> Option<String> {
+    std::env::var(ENV_CLIENT_DIR)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
 }
 
 /// The worker side of the same contract. Errors name the variable, never
@@ -117,6 +163,7 @@ mod tests {
             schema: None,
             wallet_dir: wallet_dir.map(str::to_owned),
             tns_admin: tns_admin.map(str::to_owned),
+            driver: None,
             extra: Default::default(),
         }
     }
@@ -154,9 +201,10 @@ mod tests {
             .get_envs()
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
-        for name in [ENV_USER, ENV_PASSWORD, ENV_CONNECT] {
+        for name in [ENV_USER, ENV_PASSWORD, ENV_CONNECT, ENV_DRIVER] {
             assert!(set.iter().any(|n| n == name), "{name} not set: {set:?}");
         }
+        assert!(!set.iter().any(|n| n == ENV_CLIENT_DIR), "unset setting forwarded: {set:?}");
         assert!(!set.iter().any(|n| n == ENV_TNS_ADMIN), "{set:?}");
         assert!(command.get_args().count() == 0, "nothing on argv");
     }

@@ -23,6 +23,10 @@ postgres = ["dep:postgres", "dep:chrono"]
 # pure-Rust thin driver: it speaks the wire protocol itself, so no Oracle
 # client software is needed on the machine running the worker.
 oracle = ["dep:oracledb", "dep:chrono"]
+# The thick fallback for Oracle 10g / 11g: the `oracle` crate wraps
+# ODPI-C, which compiles without Oracle libraries and dlopens Instant
+# Client at run time (Linux workers only; the Apple Silicon client crashes).
+oracle-thick = ["oracle", "dep:oracle"]
 # The ADBC driver-manager half of the spike, kept off the default build so
 # the polars cost can be measured in isolation.
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager"]
@@ -72,6 +76,7 @@ duckdb = { workspace = true, optional = true }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 # Exact-pinned: a beta whose API is still moving.
 oracledb = { version = "=26.0.0-beta.2", optional = true }
+oracle = { version = "=0.6.3", features = ["chrono"], optional = true }
 adbc_driver_manager = { version = "=0.24.0", optional = true }
 tiny_http = { version = "0.12", features = ["ssl-rustls"], optional = true }
 cron = { version = "0.12", optional = true }

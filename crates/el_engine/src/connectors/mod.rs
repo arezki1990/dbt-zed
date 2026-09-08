@@ -183,6 +183,7 @@ fn oracle_extractor(
         creds.user.expose(),
         creds.password.expose(),
         creds.connect.expose(),
+        creds.driver,
         schema,
         table,
         chunk_rows,

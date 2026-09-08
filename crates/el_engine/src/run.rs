@@ -223,6 +223,8 @@ fn build_loader(
             connect: creds.connect.expose().to_owned(),
             password: creds.password,
             tns_admin: creds.tns_admin,
+            driver: creds.driver,
+            worker_settings: creds.worker_settings,
             dialect: crate::oracle_types::OracleDialect::default(),
         };
         return Ok(Box::new(OracleSidecarLoader::spawn(&config)?));

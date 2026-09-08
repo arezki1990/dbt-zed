@@ -326,8 +326,42 @@ pub struct MssqlConn {
     pub extra: IndexMap<String, serde_yaml_ng::Value>,
 }
 
+/// Which Oracle driver the worker connects with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleDriver {
+    /// The thin driver, falling back to the thick one only when the server
+    /// is refused for its version (Oracle 10g / 11g).
+    #[default]
+    Auto,
+    /// Oracle's pure-Rust thin driver: no client software, Oracle 12.1+.
+    Thin,
+    /// ODPI-C over Oracle Instant Client, for servers before 12.1.
+    Thick,
+}
+
+impl OracleDriver {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Some(Self::Auto),
+            "thin" => Some(Self::Thin),
+            "thick" => Some(Self::Thick),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Thin => "thin",
+            Self::Thick => "thick",
+        }
+    }
+}
+
 /// An Oracle database. The worker connects through Oracle's pure-Rust
-/// thin driver: no client software is needed anywhere.
+/// thin driver (no client software) and, for a 10g or 11g server, through
+/// Oracle Instant Client on a Linux worker.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct OracleConn {
     /// Database user; may be `${VAR}`-templated.
@@ -348,6 +382,9 @@ pub struct OracleConn {
     /// Directory holding `tnsnames.ora` / `sqlnet.ora` (TNS_ADMIN).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tns_admin: Option<String>,
+    /// `auto` (default), `thin`, or `thick` for a 10g / 11g server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<OracleDriver>,
     /// Unknown keys survive canonical rewrites — hand additions are
     /// never silently dropped.
     #[serde(flatten)]
@@ -356,6 +393,10 @@ pub struct OracleConn {
 }
 
 impl OracleConn {
+    pub fn driver(&self) -> OracleDriver {
+        self.driver.unwrap_or_default()
+    }
+
     /// The schema tables are read from: `schema` when set, else the user.
     /// Both may still carry `${VAR}` placeholders.
     pub fn effective_schema(&self) -> &str {
