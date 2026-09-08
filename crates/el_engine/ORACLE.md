@@ -23,11 +23,16 @@ connection says `driver: thick`, or automatically under the default
 A modern database never touches the thick driver. The thick driver has
 two constraints the thin one does not:
 
-- **It needs Oracle Instant Client on the machine running the worker**,
-  of the generation that reaches the server: **19c for 11.2**, **12.1 for
-  10g** (Oracle keeps both on its download pages; the 19c ARM64 build is
-  `instantclient-basiclite-linux.arm64-19.x.0.0.0dbru.zip`, the 12.1 one
-  x86-64 only). Name its directory in `ZDBT_EL_ORACLE_CLIENT_DIR` **and**,
+- **It needs Oracle Instant Client on the machine running the worker.**
+  The freely downloadable **19c** client reaches both 11g and 10g:
+  officially 11.2.0.4 and later, and 10g as well once its `sqlnet.ora`
+  allows the old logon protocol — put
+  `SQLNET.ALLOWED_LOGON_VERSION_CLIENT=8` (and `_SERVER=8`) in a file the
+  worker sees through `TNS_ADMIN`. Verified against 10.2.0.1 and 11.2.0.2.
+  Builds: `instantclient-basiclite-linux.x64-19.x.0.0.0dbru.zip` and
+  `…linux.arm64-19.x…` under
+  `download.oracle.com/otn_software/linux/instantclient/<version>/`, no
+  login needed. Name its directory in `ZDBT_EL_ORACLE_CLIENT_DIR` **and**,
   on Linux, put it on the loader path too (`LD_LIBRARY_PATH`, or a file in
   `/etc/ld.so.conf.d` plus `ldconfig`): ODPI-C loads `libclntsh` from the
   named directory, but that library's own siblings (`libnnz`,

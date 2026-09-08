@@ -13,9 +13,10 @@
 #
 # --oracle-client installs Oracle Instant Client for the thick Oracle
 # driver, which only Oracle 10g / 11g servers need (12.1 and later use the
-# built-in thin driver with no client software). Pass --oracle-client-url
-# to pick the client generation that reaches your server: 19c for 11.2,
-# 12.1 for 10g (see crates/el_engine/ORACLE.md).
+# built-in thin driver with no client software). The 19c client it fetches
+# reaches 11g, and 10g too once SQLNET.ALLOWED_LOGON_VERSION_CLIENT=8 is in
+# a sqlnet.ora the worker sees through TNS_ADMIN; --oracle-client-url picks
+# another build (see crates/el_engine/ORACLE.md).
 set -euo pipefail
 
 REPO="https://github.com/arezki1990/dbt-zed"

@@ -811,11 +811,15 @@ const SYSTEM_OWNERS: &str = "'SYS','SYSTEM','XDB','OUTLN','DBSNMP','APPQOSSYS','
 /// Every (owner, name) the account can see — tables and views, minus the
 /// dictionary schemas and the recycle bin.
 pub fn list_tables_sql() -> String {
+    // APEX installs under a versioned owner (FLOWS_020100 on 10g XE,
+    // APEX_050100 later) — patterns, since the name moves with the version.
     format!(
         "SELECT owner, table_name FROM all_tables \
-         WHERE owner NOT IN ({SYSTEM_OWNERS}) AND table_name NOT LIKE 'BIN$%' \
+         WHERE owner NOT IN ({SYSTEM_OWNERS}) AND owner NOT LIKE 'FLOWS\\_%' ESCAPE '\\' \
+         AND owner NOT LIKE 'APEX\\_%' ESCAPE '\\' AND table_name NOT LIKE 'BIN$%' \
          UNION ALL \
          SELECT owner, view_name FROM all_views WHERE owner NOT IN ({SYSTEM_OWNERS}) \
+         AND owner NOT LIKE 'FLOWS\\_%' ESCAPE '\\' AND owner NOT LIKE 'APEX\\_%' ESCAPE '\\' \
          ORDER BY 1, 2"
     )
 }
