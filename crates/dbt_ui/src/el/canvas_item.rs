@@ -1613,7 +1613,7 @@ impl ElPipelineCanvas {
                     .map(el_engine::spec::Connection::kind)
             })
             .unwrap_or("");
-        if !matches!(kind, "duckdb" | "postgres") {
+        if !matches!(kind, "duckdb" | "postgres" | "oracle") {
             if let Some(form) = self.builder_mut() {
                 form.tables = super::builder::TablesPick::Manual;
             }

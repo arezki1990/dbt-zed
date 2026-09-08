@@ -79,7 +79,7 @@ enum Row {
 
 /// Kinds the explorer can browse — the worker's list/query support.
 fn browsable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres")
+    matches!(kind, "duckdb" | "postgres" | "oracle")
 }
 
 /// The pill that follows the cursor while a table is dragged.
@@ -584,7 +584,7 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
         let target = self
             .connections
             .iter()
-            .find(|(_, kind)| matches!(kind.as_ref(), "duckdb" | "snowflake"))
+            .find(|(_, kind)| matches!(kind.as_ref(), "duckdb" | "snowflake" | "oracle"))
             .map(|(name, _)| name.to_string())
             .unwrap_or_else(|| "warehouse".to_owned());
         let starter = format!(
