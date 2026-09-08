@@ -377,8 +377,14 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
+    // zdbt ships on the dev channel, so the shipped release build must take
+    // part in the single-instance handshake (on Windows it owns the
+    // "zdbt-Instance-Mutex" the installer checks and the named pipe the CLI,
+    // the Explorer verb and the file associations hand their paths to). Only
+    // debug builds keep upstream's "dev channel runs multiple instances"
+    // convenience for developers.
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || (cfg!(debug_assertions) && *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev)
     {
         false
     } else {

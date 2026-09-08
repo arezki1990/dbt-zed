@@ -47,7 +47,7 @@ pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
         "stable" => ("app-icon.ico", "Zed"),
         "preview" => ("app-icon-preview.ico", "Zed Preview"),
         "nightly" => ("app-icon-nightly.ico", "Zed Nightly"),
-        _ => ("app-icon-dev.ico", "Zed Dev"),
+        _ => ("app-icon-zdbt.ico", "zdbt"),
     };
     let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
     let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");
