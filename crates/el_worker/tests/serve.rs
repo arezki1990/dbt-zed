@@ -100,6 +100,27 @@ fn serve_runs_pipelines_over_the_api() {
         )])
         .unwrap();
     assert_eq!(deployed, ["orders"]);
+
+    // Database operations through the daemon's worker: the IDE's sidebar,
+    // Query tab and previews when a checkout picks this remote as its
+    // worker. Connections resolve on the server, so an unknown name says so.
+    assert_eq!(
+        good.explore_tables("src").unwrap(),
+        [("main".to_owned(), "orders".to_owned())]
+    );
+    let result = good
+        .explore_query("src", "select id, customer from main.orders order by id", 10)
+        .unwrap();
+    assert_eq!(result.columns, ["id", "customer"]);
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[2], ["3", "initech"]);
+    let preview = good.explore_preview(orders_yaml, "orders", 2).unwrap();
+    assert_eq!(preview.rows.len(), 2);
+    assert_eq!(preview.columns[1].name, "customer");
+    let error = format!("{:#}", good.explore_tables("nope").unwrap_err());
+    assert!(error.contains("not defined on this server"), "got: {error}");
+    let error = format!("{:#}", good.explore_preview(orders_yaml, "ghost", 2).unwrap_err());
+    assert!(error.contains("no stream named"), "got: {error}");
     // Broken names, YAML, or unknown profiles are refused whole.
     assert!(good
         .deploy(&[("evil/../name".to_owned(), orders_yaml.to_owned(), None)])

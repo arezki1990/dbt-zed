@@ -425,14 +425,15 @@ impl ElRunsPanel {
             .position(|(name, _)| *name == connection)
             .or(self.selected);
         let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
-        // Oracle has no LIMIT: its row-limiting clause is FETCH FIRST.
+        // Oracle has no LIMIT; ROWNUM works on every version (FETCH
+        // FIRST only from 12c, and the thick driver reaches 10g / 11g).
         let kind = self
             .selected
             .and_then(|ix| self.connections.get(ix))
             .map(|(_, kind)| kind.as_ref())
             .unwrap_or("");
         let cap = if kind == "oracle" {
-            "FETCH FIRST 200 ROWS ONLY"
+            "WHERE ROWNUM <= 200"
         } else {
             "LIMIT 200"
         };
@@ -661,13 +662,6 @@ impl ElRunsPanel {
             cx.notify();
             return;
         }
-        let Some(worker) = super::find_worker() else {
-            self.query_error = Some(
-                "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER.".into(),
-            );
-            cx.notify();
-            return;
-        };
         let connection_name = name.to_string();
         self.running = true;
         self.result = None;
@@ -675,20 +669,7 @@ impl ElRunsPanel {
         cx.notify();
         let task = cx.background_spawn(async move {
             let started = std::time::Instant::now();
-            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
-            let connection = connections
-                .connections
-                .get(&connection_name)
-                .ok_or_else(|| anyhow::anyhow!("connection {connection_name:?} is gone from connections.yml"))?;
-            let env = el_engine::env::EnvMap::load(&root, None);
-            let result = el_engine::explore::run_query(
-                &worker,
-                &root,
-                connection,
-                &env,
-                &sql,
-                QUERY_ROW_CAP,
-            )?;
+            let result = super::run_query(&root, &connection_name, &sql, QUERY_ROW_CAP)?;
             anyhow::Ok((result, started.elapsed()))
         });
         self._query = cx.spawn(async move |this, cx| {

@@ -332,6 +332,78 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
     Ok(run_id)
 }
 
+/// The JSON body of a request, `{}` when absent or unreadable.
+fn read_body(request: &mut tiny_http::Request, cap: u64) -> serde_json::Value {
+    let mut body = String::new();
+    let _ = request.as_reader().take(cap).read_to_string(&mut body);
+    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)
+}
+
+fn explore_status(error: &anyhow::Error) -> u16 {
+    let message = format!("{error:#}");
+    if message.contains("is not defined on this server") || message.contains("no stream named") {
+        404
+    } else {
+        400
+    }
+}
+
+/// The daemon's worker binary, or why there is none.
+fn daemon_worker(state: &Arc<State>) -> Result<PathBuf> {
+    state
+        .config
+        .worker
+        .clone()
+        .context("this server has no connector worker configured (--worker)")
+}
+
+/// A connection under the daemon's own connections.yml and profile.
+fn daemon_connection(state: &Arc<State>, name: &str) -> Result<(spec::Connection, crate::env::EnvMap)> {
+    let root = &state.config.project_root;
+    let (connections, _) = spec::load_active_connections(root)?;
+    let connection = connections
+        .connections
+        .get(name)
+        .cloned()
+        .with_context(|| format!("connection {name:?} is not defined on this server"))?;
+    Ok((connection, crate::env::EnvMap::load(root, None)))
+}
+
+fn explore_tables(state: &Arc<State>, connection: &str) -> Result<Vec<(String, String)>> {
+    let worker = daemon_worker(state)?;
+    let (connection, env) = daemon_connection(state, connection)?;
+    crate::explore::list_tables(&worker, &state.config.project_root, &connection, &env)
+}
+
+fn explore_query(
+    state: &Arc<State>,
+    connection: &str,
+    sql: &str,
+    limit: usize,
+) -> Result<crate::explore::QueryResult> {
+    let worker = daemon_worker(state)?;
+    let (connection, env) = daemon_connection(state, connection)?;
+    crate::explore::run_query(&worker, &state.config.project_root, &connection, &env, sql, limit)
+}
+
+fn explore_preview(
+    state: &Arc<State>,
+    yaml: &str,
+    stream: &str,
+    limit: usize,
+) -> Result<crate::preview::PreviewResult> {
+    let worker = daemon_worker(state)?;
+    let pipeline = spec::parse_pipeline_yaml(yaml)?;
+    crate::preview::preview_stream(
+        &state.config.project_root,
+        &pipeline,
+        stream,
+        limit,
+        Some(&worker),
+        &CancelFlag::default(),
+    )
+}
+
 /// Fires the pipeline's on_failure webhook/command, after retries are
 /// exhausted. Hook failures are logged, never fatal.
 fn fire_failure_hooks(state: &Arc<State>, pipeline: &Pipeline, error: &str) {
@@ -958,6 +1030,86 @@ fn handle(state: &Arc<State>, mut request: tiny_http::Request) {
                 ),
             }
         }
+        // Database operations on this daemon's worker, so an IDE on a
+        // machine without the right driver (or client library) can list,
+        // query and preview through the server. Connections resolve under
+        // the daemon's own connections.yml and profile; nothing in the
+        // body is a credential.
+        ("POST", ["explore", "tables"]) => {
+            let body = read_body(&mut request, 64 * 1024);
+            let connection = body
+                .get("connection")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned);
+            let Some(connection) = connection else {
+                respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({"error": "body must be {\"connection\": \"name\"}"}),
+                );
+                return;
+            };
+            match explore_tables(state, &connection) {
+                Ok(tables) => respond_json(request, 200, &serde_json::json!({"tables": tables})),
+                Err(error) => respond_json(
+                    request,
+                    explore_status(&error),
+                    &serde_json::json!({"error": format!("{error:#}")}),
+                ),
+            }
+        }
+        ("POST", ["explore", "query"]) => {
+            let body = read_body(&mut request, 256 * 1024);
+            let connection = body.get("connection").and_then(|value| value.as_str());
+            let sql = body.get("sql").and_then(|value| value.as_str());
+            let limit = body
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(500)
+                .clamp(1, 10_000) as usize;
+            let (Some(connection), Some(sql)) = (connection, sql) else {
+                respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({"error": "body must be {\"connection\", \"sql\", \"limit\"}"}),
+                );
+                return;
+            };
+            match explore_query(state, connection, sql, limit) {
+                Ok(result) => respond_json(request, 200, &result),
+                Err(error) => respond_json(
+                    request,
+                    explore_status(&error),
+                    &serde_json::json!({"error": format!("{error:#}")}),
+                ),
+            }
+        }
+        ("POST", ["explore", "preview"]) => {
+            let body = read_body(&mut request, 4 * 1024 * 1024);
+            let yaml = body.get("yaml").and_then(|value| value.as_str());
+            let stream = body.get("stream").and_then(|value| value.as_str());
+            let limit = body
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(30)
+                .clamp(1, 1_000) as usize;
+            let (Some(yaml), Some(stream)) = (yaml, stream) else {
+                respond_json(
+                    request,
+                    400,
+                    &serde_json::json!({"error": "body must be {\"yaml\", \"stream\", \"limit\"}"}),
+                );
+                return;
+            };
+            match explore_preview(state, yaml, stream, limit) {
+                Ok(result) => respond_json(request, 200, &result),
+                Err(error) => respond_json(
+                    request,
+                    explore_status(&error),
+                    &serde_json::json!({"error": format!("{error:#}")}),
+                ),
+            }
+        }
         ("POST", ["runs", id, "cancel"]) => {
             let id: u64 = id.parse().unwrap_or(0);
             let registry = state.registry.lock().unwrap();
@@ -1328,6 +1480,47 @@ impl RemoteClient {
                 .send_json(serde_json::json!({})),
         )?;
         Ok(())
+    }
+
+    /// A request that may wait on a database: longer than the control
+    /// calls' budget.
+    fn slow_request(&self, method: &str, path: &str) -> ureq::Request {
+        self.request(method, path).timeout(Duration::from_secs(180))
+    }
+
+    /// Lists the tables of a connection through the daemon's worker.
+    pub fn explore_tables(&self, connection: &str) -> Result<Vec<(String, String)>> {
+        let value: serde_json::Value = Self::read_json(
+            self.slow_request("POST", "/explore/tables")
+                .send_json(serde_json::json!({"connection": connection})),
+        )?;
+        serde_json::from_value(value.get("tables").cloned().unwrap_or_default())
+            .context("decoding the remote table list")
+    }
+
+    /// Runs an ad-hoc query through the daemon's worker.
+    pub fn explore_query(
+        &self,
+        connection: &str,
+        sql: &str,
+        limit: usize,
+    ) -> Result<crate::explore::QueryResult> {
+        Self::read_json(self.slow_request("POST", "/explore/query").send_json(
+            serde_json::json!({"connection": connection, "sql": sql, "limit": limit}),
+        ))
+    }
+
+    /// Previews a stream of a pipeline (sent as YAML) through the daemon's
+    /// worker.
+    pub fn explore_preview(
+        &self,
+        yaml: &str,
+        stream: &str,
+        limit: usize,
+    ) -> Result<crate::preview::PreviewResult> {
+        Self::read_json(self.slow_request("POST", "/explore/preview").send_json(
+            serde_json::json!({"yaml": yaml, "stream": stream, "limit": limit}),
+        ))
     }
 
     /// Deploys pipeline YAMLs (name, yaml, pinned profile) to the

@@ -832,6 +832,29 @@ pub fn load_pipeline(path: &Path) -> Result<Pipeline, SpecError> {
     read_yaml(path)
 }
 
+/// A pipeline from YAML text — what a daemon receives for a preview.
+pub fn parse_pipeline_yaml(yaml: &str) -> Result<Pipeline, SpecError> {
+    serde_yaml_ng::from_str(yaml).map_err(|error| SpecError::Parse {
+        path: "<pipeline sent for preview>".to_owned(),
+        message: error.to_string(),
+    })
+}
+
+/// Where the checkout's choice of database worker lives — `local`, or the
+/// name of a remote in `remotes.yml` whose daemon runs every table
+/// listing, query and preview. Per-checkout state, never committed.
+pub fn worker_selection_path(project_root: &Path) -> std::path::PathBuf {
+    project_root.join("el").join(".zdbt").join("worker")
+}
+
+/// The remote the checkout sends database operations to; `None` means
+/// the local worker binary.
+pub fn active_remote_worker(project_root: &Path) -> Option<String> {
+    let name = std::fs::read_to_string(worker_selection_path(project_root)).ok()?;
+    let name = name.trim();
+    (!name.is_empty() && name != "local").then(|| name.to_owned())
+}
+
 /// Every pipeline file in `<el_dir>/pipelines`, sorted.
 pub fn list_pipelines(el_dir: &Path) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<_> = std::fs::read_dir(el_dir.join("pipelines"))

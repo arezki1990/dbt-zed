@@ -822,9 +822,11 @@ pub fn list_tables_sql() -> String {
 
 /// Caps a user query by wrapping it. Oracle has no `LIMIT`, takes no `AS`
 /// on a table alias, and rejects a trailing semicolon inside a subquery.
+/// `ROWNUM` rather than `FETCH FIRST`: the latter only exists from 12c,
+/// and the thick driver reaches 10g and 11g.
 pub fn capped_query_sql(sql: &str, limit: usize) -> String {
     let inner = sql.trim().trim_end_matches(';').trim_end();
-    format!("SELECT * FROM ({inner}) zdbt_q FETCH FIRST {limit} ROWS ONLY")
+    format!("SELECT * FROM ({inner}) zdbt_q WHERE ROWNUM <= {limit}")
 }
 
 /// The column dictionary for one (owner, table). `ALL_TAB_COLUMNS` covers
@@ -1172,7 +1174,7 @@ mod tests {
         // No LIMIT, no AS on the alias, no trailing semicolon inside.
         assert_eq!(
             capped_query_sql("SELECT * FROM hr.employees;\n", 100),
-            "SELECT * FROM (SELECT * FROM hr.employees) zdbt_q FETCH FIRST 100 ROWS ONLY"
+            "SELECT * FROM (SELECT * FROM hr.employees) zdbt_q WHERE ROWNUM <= 100"
         );
     }
 

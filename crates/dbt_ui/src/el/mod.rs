@@ -20,6 +20,7 @@ pub use canvas_item::ElPipelineCanvas;
 pub use panel::ElPanel;
 pub use runs_panel::ElRunsPanel;
 
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, SharedString, Window};
@@ -65,6 +66,97 @@ pub fn discover_el_root(
         first.get_or_insert(root);
     }
     first
+}
+
+/// Where the checkout's database operations run: the local worker binary,
+/// or the daemon of a remote named in `remotes.yml`. A remote's worker
+/// carries the drivers and client libraries this machine may lack (the
+/// thick Oracle driver on a Mac, for one), and resolves connections under
+/// the server's own connections.yml and profile.
+pub enum DbWorker {
+    Local(PathBuf),
+    Remote(String),
+}
+
+pub fn db_worker(project_root: &Path) -> anyhow::Result<DbWorker> {
+    if let Some(remote) = el_engine::spec::active_remote_worker(project_root) {
+        return Ok(DbWorker::Remote(remote));
+    }
+    find_worker()
+        .map(DbWorker::Local)
+        .ok_or_else(|| anyhow::anyhow!(WORKER_MISSING))
+}
+
+pub const WORKER_MISSING: &str =
+    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER, or pick a \
+     remote's worker in the EL panel.";
+
+fn local_connection(
+    project_root: &Path,
+    name: &str,
+) -> anyhow::Result<(el_engine::spec::Connection, el_engine::env::EnvMap)> {
+    let (connections, _) = el_engine::spec::load_active_connections(project_root)?;
+    let connection = connections
+        .connections
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("connection {name:?} is gone from connections.yml"))?;
+    Ok((connection, el_engine::env::EnvMap::load(project_root, None)))
+}
+
+/// Lists a connection's tables on the checkout's database worker.
+/// Blocking — call from a background thread.
+pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<(String, String)>> {
+    match db_worker(project_root)? {
+        DbWorker::Local(worker) => {
+            let (connection, env) = local_connection(project_root, connection)?;
+            el_engine::explore::list_tables(&worker, project_root, &connection, &env)
+        }
+        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
+            .explore_tables(connection)
+            .with_context(|| format!("on remote {remote}")),
+    }
+}
+
+/// Runs an ad-hoc query on the checkout's database worker. Blocking.
+pub fn run_query(
+    project_root: &Path,
+    connection: &str,
+    sql: &str,
+    limit: usize,
+) -> anyhow::Result<el_engine::explore::QueryResult> {
+    match db_worker(project_root)? {
+        DbWorker::Local(worker) => {
+            let (connection, env) = local_connection(project_root, connection)?;
+            el_engine::explore::run_query(&worker, project_root, &connection, &env, sql, limit)
+        }
+        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
+            .explore_query(connection, sql, limit)
+            .with_context(|| format!("on remote {remote}")),
+    }
+}
+
+/// Previews a stream on the checkout's database worker. Blocking.
+pub fn preview_stream(
+    project_root: &Path,
+    pipeline: &el_engine::spec::Pipeline,
+    stream: &str,
+    limit: usize,
+    cancel: &el_engine::CancelFlag,
+) -> anyhow::Result<el_engine::preview::PreviewResult> {
+    match db_worker(project_root)? {
+        DbWorker::Local(worker) => el_engine::preview_stream(
+            project_root,
+            pipeline,
+            stream,
+            limit,
+            Some(&worker),
+            cancel,
+        ),
+        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
+            .explore_preview(&el_engine::spec::to_canonical_yaml(pipeline), stream, limit)
+            .with_context(|| format!("on remote {remote}")),
+    }
 }
 
 /// Locates the on-demand connector worker binary: an explicit env

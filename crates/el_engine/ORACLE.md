@@ -44,6 +44,14 @@ two constraints the thin one does not:
 Both drivers share everything else: the extractor, the explorer, the
 loader, the type tables and the SQL they send.
 
+**Browsing a 10g / 11g database from a Mac** is done through a remote's
+worker: pick the remote in the EL panel's **worker** dropdown (next to the
+profile) and every table listing, ad-hoc query and stream preview is sent
+to that daemon, which runs it with its own worker, connections.yml,
+profile and Instant Client. The daemon answers on `/explore/tables`,
+`/explore/query` and `/explore/preview`, token-guarded like the rest of
+its API. Pipeline runs on a remote still need an explicit deploy.
+
 Two things the driver reads from disk when a connection names them: a
 `tnsnames.ora` (for a TNS alias in `connect`) and a wallet's `ewallet.pem`
 (Autonomous Database with mutual TLS), both looked up in the directory

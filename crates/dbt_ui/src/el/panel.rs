@@ -29,6 +29,8 @@ pub struct ElPanel {
     /// The active profile (dev/recette/prod…) and all declared ones.
     profile: Option<SharedString>,
     profiles: Vec<SharedString>,
+    /// The remote whose daemon runs database operations; None = local.
+    worker: Option<SharedString>,
     /// Declared remotes: (name, host shown muted — never the token).
     remotes: Vec<(SharedString, SharedString)>,
     /// Connection name → the `${VAR}` names it references that neither the
@@ -58,6 +60,10 @@ pub struct ElPanel {
 }
 
 /// What a profile is, told once at the switcher and once on the badge.
+const WORKER_HINT: &str = "Which worker answers table listings, queries and previews: the local \
+    zdbt-el-worker, or a remote's daemon (its own connections.yml, profile, drivers and client \
+    libraries). Pipeline runs on a remote still need an explicit deploy.";
+
 const PROFILE_HINT: &str = "Which environment's connections this checkout uses; pipelines stay \
 the same. Your choice is saved in el/.zdbt/profile for you only — connections.yml does not \
 change.";
@@ -137,6 +143,7 @@ impl ElPanel {
             connections_error: None,
             profile: None,
             profiles: Vec::new(),
+            worker: None,
             remotes: Vec::new(),
             missing_env: Default::default(),
             remotes_missing_token: Default::default(),
@@ -172,6 +179,7 @@ impl ElPanel {
             log::warn!("el: could not write schemas: {error:#}");
         }
         self.pipelines = el_engine::spec::list_pipelines(&el);
+        self.worker = el_engine::spec::active_remote_worker(&root).map(Into::into);
         // Real env + project .env: only ever probed for a NAME's presence.
         let env = el_engine::env::EnvMap::load(&root, None);
         self.remotes_missing_token.clear();
@@ -240,6 +248,30 @@ impl ElPanel {
             }
         }
         cx.notify();
+    }
+
+    /// Switches where database operations run — the local worker or a
+    /// remote's daemon — for this checkout: writes the local selection
+    /// file and drops every table cache, since the answers change.
+    fn switch_worker(&mut self, remote: Option<SharedString>, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let path = el_engine::spec::worker_selection_path(&root);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let value = remote.as_deref().unwrap_or("local");
+        if let Err(error) = std::fs::write(&path, value) {
+            self.connections_error =
+                Some(format!("could not save the worker selection: {error}").into());
+            cx.notify();
+            return;
+        }
+        self.tables.clear();
+        self.expanded.clear();
+        self.tables_epoch += 1;
+        // The picker's face shows the new choice; the table caches refill
+        // from it on the next expand.
+        self.refresh(cx);
     }
 
     /// Switches the checkout's active profile: writes the local selection
@@ -562,20 +594,8 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         self.tables.insert(name.clone(), TablesState::Loading);
         let epoch = self.tables_epoch;
         let connection_name = name.to_string();
-        let task = cx.background_spawn(async move {
-            let worker = super::find_worker().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER."
-                )
-            })?;
-            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
-            let connection = connections
-                .connections
-                .get(&connection_name)
-                .ok_or_else(|| anyhow::anyhow!("connection is gone from connections.yml"))?;
-            let env = el_engine::env::EnvMap::load(&root, None);
-            el_engine::explore::list_tables(&worker, &root, connection, &env)
-        });
+        let task =
+            cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
         let key = name.clone();
         self._list_tasks.insert(
             key.clone(),
@@ -991,6 +1011,83 @@ impl Render for ElPanel {
                                                 .ok();
                                         },
                                     )
+                                }))
+                            }),
+                    )
+            }))
+            .children((!self.remotes.is_empty()).then(|| {
+                // Where database operations run: the local worker binary,
+                // or a remote's daemon — whose worker may carry drivers and
+                // client libraries this machine cannot (Oracle 10g/11g
+                // from a Mac, for one).
+                let remotes: Vec<SharedString> =
+                    self.remotes.iter().map(|(name, _)| name.clone()).collect();
+                let active = self.worker.clone();
+                let panel = cx.entity().downgrade();
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Label::new("worker")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        ui::PopoverMenu::new("el-worker-select")
+                            .trigger(
+                                Button::new(
+                                    "el-worker-trigger",
+                                    active.clone().unwrap_or_else(|| "local".into()),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Subtle)
+                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                                .tooltip(|_, cx| {
+                                    Tooltip::with_meta("Database worker", None, WORKER_HINT, cx)
+                                }),
+                            )
+                            .menu(move |window, cx| {
+                                let panel = panel.clone();
+                                let remotes = remotes.clone();
+                                let active = active.clone();
+                                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    menu = menu.header("Run tables, queries and previews on");
+                                    let local_panel = panel.clone();
+                                    menu = menu.toggleable_entry(
+                                        "local worker",
+                                        active.is_none(),
+                                        ui::IconPosition::Start,
+                                        None,
+                                        move |_, cx| {
+                                            local_panel
+                                                .update(cx, |this, cx| this.switch_worker(None, cx))
+                                                .ok();
+                                        },
+                                    );
+                                    for name in remotes {
+                                        let panel = panel.clone();
+                                        let selected = active.as_ref() == Some(&name);
+                                        let label = name.clone();
+                                        menu = menu.toggleable_entry(
+                                            label,
+                                            selected,
+                                            ui::IconPosition::Start,
+                                            None,
+                                            move |_, cx| {
+                                                panel
+                                                    .update(cx, |this, cx| {
+                                                        this.switch_worker(Some(name.clone()), cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        );
+                                    }
+                                    menu
                                 }))
                             }),
                     )

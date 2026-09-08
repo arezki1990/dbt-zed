@@ -13,7 +13,7 @@ use crate::env::EnvMap;
 use crate::progress::CancelFlag;
 use crate::spec::{Pipeline, StreamSpec};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PreviewColumn {
     pub name: SharedStringLike,
     /// The probed source dtype, e.g. "str", "i64".
@@ -25,7 +25,7 @@ pub struct PreviewColumn {
 /// Plain String — the engine never depends on gpui, so the UI converts.
 pub type SharedStringLike = String;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PreviewResult {
     pub columns: Vec<PreviewColumn>,
     pub rows: Vec<Vec<String>>,

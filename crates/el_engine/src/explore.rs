@@ -22,6 +22,7 @@ pub enum ExploreEvent {
     Error { message: String },
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,

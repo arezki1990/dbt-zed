@@ -819,14 +819,12 @@ impl ElPipelineCanvas {
             .as_ref()
             .map(|select| select.exclude.clone())
             .unwrap_or_default();
-        let worker = super::find_worker();
         let task = cx.background_spawn(async move {
-            el_engine::preview_stream(
+            super::preview_stream(
                 &project_root,
                 &pipeline,
                 &stream_name,
                 30,
-                worker.as_deref(),
                 &el_engine::CancelFlag::default(),
             )
         });
@@ -906,19 +904,17 @@ impl ElPipelineCanvas {
         let Some(stream) = pipeline.streams.get(stream_ix) else { return };
         let stream_name = stream.name.clone();
         let project_root = self.project_root.clone();
-        let worker = super::find_worker();
         let title: SharedString = if failures_only {
             format!("{stream_name} · failed casts").into()
         } else {
             format!("{stream_name} · preview").into()
         };
         let task = cx.background_spawn(async move {
-            el_engine::preview_stream(
+            super::preview_stream(
                 &project_root,
                 &pipeline,
                 &stream_name,
                 200,
-                worker.as_deref(),
                 &el_engine::CancelFlag::default(),
             )
         });
@@ -1909,28 +1905,12 @@ impl ElPipelineCanvas {
             }
             return;
         }
-        let Some(worker) = super::find_worker() else {
-            if let Some(form) = self.builder_mut() {
-                form.tables = super::builder::TablesPick::Failed(
-                    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER."
-                        .into(),
-                );
-            }
-            return;
-        };
         if let Some(form) = self.builder_mut() {
             form.tables = super::builder::TablesPick::Loading;
         }
         let root = self.project_root.clone();
-        let task = cx.background_spawn(async move {
-            let (connections, _) = el_engine::spec::load_active_connections(&root)?;
-            let connection = connections
-                .connections
-                .get(&connection_name)
-                .ok_or_else(|| anyhow::anyhow!("connection is gone from connections.yml"))?;
-            let env = el_engine::env::EnvMap::load(&root, None);
-            el_engine::explore::list_tables(&worker, &root, connection, &env)
-        });
+        let task =
+            cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
         self._tables = cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
