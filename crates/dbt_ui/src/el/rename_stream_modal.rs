@@ -88,6 +88,28 @@ impl ElRenameStreamModal {
             cx.notify();
             return;
         }
+        // The derived table follows the name, so a new name can land on a
+        // table another stream already loads — they'd overwrite each other.
+        if let Some(stream) = self.stream() {
+            let mut renamed = stream.clone();
+            renamed.name = to.clone();
+            let table = renamed.target_table(&self.pipeline.target).to_uppercase();
+            let clash = self.pipeline.streams.iter().find(|other| {
+                other.name != self.original
+                    && other.target_table(&self.pipeline.target).to_uppercase() == table
+            });
+            if let Some(other) = clash {
+                self.error = Some(
+                    format!(
+                        "{to} would load the same table as {} — pick another name.",
+                        other.name
+                    )
+                    .into(),
+                );
+                cx.notify();
+                return;
+            }
+        }
         let from = self.original.clone();
         self.canvas
             .update(cx, |canvas, cx| canvas.rename_stream(from, to, window, cx))

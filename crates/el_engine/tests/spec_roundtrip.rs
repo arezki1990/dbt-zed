@@ -300,6 +300,35 @@ fn rename_stream_rekeys_canvas_and_rejects_duplicates() {
     assert_eq!(once, spec::to_canonical_yaml(&reloaded));
 }
 
+/// Two streams loading one table overwrite each other on every run: the
+/// rename refuses up front and validate flags the state however it arose.
+#[test]
+fn colliding_target_tables_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let connections = spec::load_connections(&write(dir.path(), "c.yml", CONNECTIONS)).unwrap();
+    let mut pipeline = spec::load_pipeline(&write(dir.path(), "p.yml", PIPELINE)).unwrap();
+    pipeline.streams[1].target_table = Some("CLIENTS".into());
+    assert!(
+        !spec::validate(&pipeline, &connections)
+            .iter()
+            .any(|issue| issue.message.contains("both load table"))
+    );
+
+    // "clients" derives CLIENTS, which the events stream already pins.
+    let refused = pipeline.rename_stream("customers", "clients").unwrap_err();
+    assert!(refused.contains("same table as events"), "unexpected: {refused}");
+    assert_eq!(pipeline.streams[0].name, "customers");
+
+    // Hand-edited YAML reaches the state anyway — validate says so.
+    pipeline.streams[0].target_table = Some("clients".into());
+    let text = spec::validate(&pipeline, &connections)
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("both load table"), "missing collision in:\n{text}");
+}
+
 #[test]
 fn remove_stream_drops_canvas_keys() {
     let dir = tempfile::tempdir().unwrap();

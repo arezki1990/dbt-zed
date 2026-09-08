@@ -240,7 +240,29 @@ mod tests {
         .unwrap();
 
         let created = initialize_el_workspace(dir.path()).unwrap();
-        assert_eq!(created.len(), 5);
+        // Named, not counted: a new scaffolded file then says which one it is.
+        let names: Vec<String> = created
+            .iter()
+            .map(|path| {
+                path.strip_prefix(dir.path())
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        for expected in [
+            "el/connections.yml",
+            "el/.zdbt/.gitignore",
+            "el/pipelines/example.yml",
+            "el/sample.csv",
+            "el/.zdbt/el-pipeline.schema.json",
+            "el/.zdbt/el-connections.schema.json",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} was not scaffolded — got {names:?}"
+            );
+        }
 
         // Idempotent: nothing new on the second run.
         let again = initialize_el_workspace(dir.path()).unwrap();

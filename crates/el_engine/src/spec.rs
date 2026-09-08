@@ -528,6 +528,23 @@ impl Pipeline {
         if to != from && self.streams.iter().any(|stream| stream.name == to) {
             return Err(format!("{to} already exists in this pipeline"));
         }
+        // The new name may derive a table another stream already loads,
+        // which would make the two overwrite each other on every run.
+        if to != from {
+            if let Some(renamed) = self.streams.iter().find(|stream| stream.name == from) {
+                let mut probe = renamed.clone();
+                probe.name = to.to_owned();
+                let table = probe.target_table(&self.target).to_uppercase();
+                if let Some(other) = self.streams.iter().find(|stream| {
+                    stream.name != from && stream.target_table(&self.target).to_uppercase() == table
+                }) {
+                    return Err(format!(
+                        "{to} would load the same table as {} — pick another name",
+                        other.name
+                    ));
+                }
+            }
+        }
         let Some(stream) = self.streams.iter_mut().find(|stream| stream.name == from) else {
             return Err(format!("stream {from} is gone from the spec"));
         };
@@ -818,12 +835,35 @@ pub fn validate(pipeline: &Pipeline, connections: &Connections) -> Vec<SpecIssue
     }
 
     let mut seen = std::collections::HashSet::new();
+    let mut seen_tables: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for stream in &pipeline.streams {
-        if !seen.insert(stream.name.clone()) {
+        let fresh = seen.insert(stream.name.clone());
+        if !fresh {
             issue(
                 Some(&stream.name),
                 format!("duplicate stream name {:?}", stream.name),
             );
+        }
+        // Two streams resolving to one table overwrite each other on every
+        // run — the load replaces the whole table. Warehouse names are
+        // case-insensitive, so compare them that way.
+        if fresh {
+            let table = stream.target_table(&pipeline.target);
+            match seen_tables.entry(table.to_uppercase()) {
+                std::collections::hash_map::Entry::Occupied(taken) => issue(
+                    Some(&stream.name),
+                    format!(
+                        "streams {:?} and {:?} both load table {table} — \
+                         set target_table on one of them",
+                        taken.get(),
+                        stream.name
+                    ),
+                ),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(stream.name.clone());
+                }
+            }
         }
         let mode = stream.mode(pipeline.defaults.as_ref());
         if mode == Mode::Incremental {

@@ -426,18 +426,42 @@ impl ElDeployModal {
         }
         match &pf.schedule {
             Some((cron, timezone)) => {
-                let first = match pf.first_fire_unix {
+                // What the deploy does to the schedule: arms a new one,
+                // swaps the one already firing, or leaves it running.
+                let previous = pf.replacing.as_ref().and_then(|replaced| {
+                    replaced.previous_schedule.as_ref().map(|previous| {
+                        // An older server doesn't report its timezone, so
+                        // an equal cron alone can't prove nothing changed.
+                        let same = previous == cron
+                            && replaced.previous_timezone.as_deref() == Some(timezone.as_str());
+                        (previous.clone(), same)
+                    })
+                });
+                let unchanged = matches!(&previous, Some((_, true)));
+                let run = match pf.first_fire_unix {
                     Some(unix) => format!(
-                        "first run {}",
+                        "{} run {}",
+                        if unchanged { "next" } else { "first" },
                         super::runs_panel::relative_time(unix, true)
                     ),
                     None => "the server can't parse it and will skip it".to_owned(),
                 };
-                rows = rows.child(line(
-                    format!(
-                        "Schedule {cron} ({timezone}) starts firing on {remote} under \
-                         {profile_text} — {first}."
+                let text = match previous {
+                    Some((_, true)) => format!(
+                        "Schedule {cron} ({timezone}) keeps firing on {remote} under \
+                         {profile_text} — {run}."
                     ),
+                    Some((previous, false)) => format!(
+                        "Schedule changes: {previous} → {cron} ({timezone}) on {remote} under \
+                         {profile_text} — {run}."
+                    ),
+                    None => format!(
+                        "Schedule {cron} ({timezone}) starts firing on {remote} under \
+                         {profile_text} — {run}."
+                    ),
+                };
+                rows = rows.child(line(
+                    text,
                     if pf.first_fire_unix.is_some() { Color::Muted } else { Color::Warning },
                 ));
             }

@@ -1235,26 +1235,35 @@ impl ElPanel {
                 .pl_6()
                 .child(Label::new(text.clone()).size(LabelSize::XSmall).color(*color))
                 .into_any_element(),
-            Row::EnvHint(vars) => base
-                .pl_6()
-                .cursor_pointer()
-                .child(
-                    Label::new(format!("Set {} in .env to connect", vars.join(", ")))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning)
-                        .truncate(),
-                )
-                .tooltip(|_, cx| {
-                    Tooltip::with_meta(
-                        "Credentials stay out of YAML",
-                        None,
-                        "The YAML references ${VAR}; the value lives in .env next to the \
-                         project (or in your shell). Click to open .env.",
-                        cx,
+            Row::EnvHint(vars) => {
+                // The row is narrow and the names are the whole point, so
+                // the tooltip repeats them rather than the explanation alone.
+                let title = super::runs_panel::tooltip_text(&format!(
+                    "Set {} in .env",
+                    vars.join(", ")
+                ));
+                base.pl_6()
+                    .cursor_pointer()
+                    .child(
+                        Label::new(format!("Set {} in .env to connect", vars.join(", ")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning)
+                            .truncate(),
                     )
-                })
-                .on_click(cx.listener(|this, _, window, cx| this.open_env_file(window, cx)))
-                .into_any_element(),
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(
+                            title.clone(),
+                            None,
+                            "The YAML references ${VAR}; the value lives in .env next to \
+                             the project (or in your shell). Click to open .env.",
+                            cx,
+                        )
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.open_env_file(window, cx)),
+                    )
+                    .into_any_element()
+            }
             Row::RemotesEmpty => base
                 .pl_6()
                 .child(

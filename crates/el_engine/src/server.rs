@@ -142,8 +142,15 @@ fn load_pipeline_by_name(config: &ServerConfig, name: &str) -> Result<Pipeline> 
 
 /// Starts a run on background threads; returns its id. Refuses when the
 /// pipeline already has a run in flight (Airbyte's skip-if-running).
+///
+/// The deploy-pinned profile is applied here, so scheduled, manual and
+/// retried runs all resolve connections under the profile the deploy
+/// chose rather than under whatever this checkout happens to select.
 fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u64> {
     let pipeline = load_pipeline_by_name(&state.config, pipeline_name)?;
+    let pinned_profile = read_manifest(&state.config)
+        .get(pipeline_name)
+        .and_then(|meta| meta.profile.clone());
     let cancel = CancelFlag::default();
     let run_id = {
         // Check-and-insert under ONE lock: two racing POSTs can't both
@@ -187,7 +194,13 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
         }
         id
     };
-    state.log(format!("run {run_id} ({pipeline_name}) started (attempt {attempt})"));
+    state.log(format!(
+        "run {run_id} ({pipeline_name}) started (attempt {attempt}){}",
+        match &pinned_profile {
+            Some(profile) => format!(" under profile {profile}"),
+            None => String::new(),
+        }
+    ));
 
     let request = RunRequest {
         project_root: state.config.project_root.clone(),
@@ -195,7 +208,7 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
         worker: state.config.worker.clone(),
         driver: state.config.driver.clone(),
         chunk_rows: state.config.chunk_rows,
-    profile_override: None,
+        profile_override: pinned_profile,
     };
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
 
@@ -203,17 +216,35 @@ fn start_run(state: &Arc<State>, pipeline_name: &str, attempt: u32) -> Result<u6
     let consumer_state = Arc::clone(state);
     let consumer = std::thread::spawn(move || {
         use futures::StreamExt as _;
+        // A stream reports its cast failures only when it finishes, but
+        // every chunk carries the running total — keep the last one so a
+        // stream that fails mid-load still counts what it cast.
+        let mut casts_so_far: HashMap<String, u64> = HashMap::new();
         while let Some(event) = futures::executor::block_on(rx.next()) {
             let mut registry = consumer_state.registry.lock().unwrap();
             if let Some(run) = registry.runs.iter_mut().find(|run| run.id == run_id) {
-                if let ProgressEvent::StreamFinished {
-                    rows_written,
-                    cast_failures,
-                    ..
-                } = &event
-                {
-                    run.rows_written += rows_written;
-                    run.cast_failures += cast_failures;
+                match &event {
+                    ProgressEvent::Chunk {
+                        stream,
+                        cast_failures,
+                        ..
+                    } => {
+                        casts_so_far.insert(stream.clone(), *cast_failures);
+                    }
+                    ProgressEvent::StreamFinished {
+                        stream,
+                        rows_written,
+                        cast_failures,
+                        ..
+                    } => {
+                        casts_so_far.remove(stream);
+                        run.rows_written += rows_written;
+                        run.cast_failures += cast_failures;
+                    }
+                    ProgressEvent::StreamFailed { stream, .. } => {
+                        run.cast_failures += casts_so_far.remove(stream).unwrap_or(0);
+                    }
+                    _ => {}
                 }
                 run.events.push(event);
             }
@@ -1128,6 +1159,9 @@ pub struct ReplacedDeploy {
     /// The chosen profile differs from the pinned one.
     pub profile_changes: bool,
     pub previous_schedule: Option<String>,
+    /// The timezone that schedule runs in; None when the server is too old
+    /// to report it — "unknown", never "same as the local one".
+    pub previous_timezone: Option<String>,
 }
 
 /// Builds the facts for `local` against what `remote` reports from
@@ -1144,6 +1178,7 @@ pub fn deploy_preflight(
         previous_profile: p.profile.clone(),
         profile_changes: p.profile.as_deref() != profile,
         previous_schedule: p.schedule.clone(),
+        previous_timezone: p.timezone.clone(),
     });
     let running = existing.map(|p| p.running).unwrap_or(false);
     let schedule = local.schedule.clone().map(|cron| {
@@ -1163,9 +1198,9 @@ pub struct RemoteRun {
     #[serde(default)]
     pub finished_unix: Option<u64>,
     pub rows_written: u64,
-    /// Older daemons don't report it; 0 then reads as "none".
+    /// None = an older daemon that doesn't report it — never "none".
     #[serde(default)]
-    pub cast_failures: u64,
+    pub cast_failures: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -1444,7 +1479,20 @@ mod tests {
         assert_eq!(replaced.previous_profile.as_deref(), Some("staging"));
         assert!(replaced.profile_changes);
         assert_eq!(replaced.previous_schedule.as_deref(), Some("0 0 2 * * *"));
+        // An older server reports no timezone — unknown, so the popup
+        // can't claim the schedule is unchanged.
+        assert_eq!(replaced.previous_timezone, None);
         assert!(pf.running);
+
+        let dated = [remote(serde_json::json!({
+            "name": "orders", "schedule": "0 0 2 * * *", "timezone": "Europe/Paris",
+            "streams": 2, "running": false
+        }))];
+        let pf = deploy_preflight(&local(None, None), &dated, None);
+        assert_eq!(
+            pf.replacing.unwrap().previous_timezone.as_deref(),
+            Some("Europe/Paris")
+        );
 
         let same = deploy_preflight(&local(None, None), &existing, Some("staging"));
         assert!(!same.replacing.unwrap().profile_changes);

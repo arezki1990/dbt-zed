@@ -68,6 +68,9 @@ pub struct ElRunsPanel {
     remote_show_logs: bool,
     /// A pipeline opened in the detail view; None = overview.
     remote_detail: Option<SharedString>,
+    /// The detail was opened on a pipeline this server has not listed yet
+    /// (a just-deployed one) — "not fetched" must not read as "gone".
+    remote_detail_pending: bool,
     /// A run opened in the run-detail view (its per-stream breakdown).
     remote_run_detail: Option<u64>,
     remote_run_events: Vec<el_engine::ProgressEvent>,
@@ -274,6 +277,7 @@ impl ElRunsPanel {
                 remote_log_next: 0,
                 remote_show_logs: false,
                 remote_detail: None,
+                remote_detail_pending: false,
                 remote_run_detail: None,
                 remote_run_events: Vec::new(),
                 remote_run_cursor: 0,
@@ -363,6 +367,7 @@ impl ElRunsPanel {
             }
         }
         self.remote_detail = None;
+        self.remote_detail_pending = false;
         self.remote_run_detail = None;
         self.start_remote_poll(cx);
         cx.notify();
@@ -371,7 +376,8 @@ impl ElRunsPanel {
     /// After a deploy: Remote tab, that server, opened on that pipeline.
     /// The first poll (which lists the just-deployed copy) keeps the
     /// detail open, so the view fills in rather than bouncing to the
-    /// overview.
+    /// overview. Until it lands the pipeline is simply not listed yet —
+    /// the detail says so instead of claiming it is gone.
     pub fn show_remote_pipeline(
         &mut self,
         remote: SharedString,
@@ -380,6 +386,7 @@ impl ElRunsPanel {
     ) {
         self.show_remote(remote, cx);
         self.remote_detail = Some(pipeline);
+        self.remote_detail_pending = true;
         self.remote_run_detail = None;
         cx.notify();
     }
@@ -527,6 +534,8 @@ impl ElRunsPanel {
                                 this.remote_pipelines = pipelines;
                                 this.remote_runs = runs;
                                 this.remote_error = None;
+                                // The server has now said what it holds.
+                                this.remote_detail_pending = false;
                                 this.remote_health = health.map(|value| {
                                     let uptime = value
                                         .get("uptime_secs")
@@ -877,6 +886,7 @@ impl ElRunsPanel {
                             this.remote_runs.clear();
                             this.remote_action_error = None;
                             this.remote_detail = None;
+                            this.remote_detail_pending = false;
                             this.remote_run_detail = None;
                             this.start_remote_poll(cx);
                             cx.notify();
@@ -1176,6 +1186,7 @@ impl ElRunsPanel {
         let run_name = name.to_string();
         let running = pipeline.map(|pipeline| pipeline.running).unwrap_or(false);
         let meta: SharedString = match pipeline {
+            None if self.remote_detail_pending => "waiting for the server to list it…".into(),
             None => "no longer on the server".into(),
             Some(pipeline) => {
                 let streams = match &pipeline.profile {
@@ -1450,14 +1461,21 @@ impl ElRunsPanel {
                     )
                     .into_any_element()
             } else if casts > 0 {
+                // A count with no columns has three causes, and only the
+                // last one is the daemon's age.
+                let why = if error.is_some() {
+                    "The failing columns aren't reported for a stream that failed"
+                } else if !done {
+                    "The failing columns arrive when the stream finishes"
+                } else {
+                    "This server doesn't report failing columns — update the daemon to see them"
+                };
                 div()
                     .id(("el-remote-casts-count", ix))
                     .w(px(80.))
                     .flex_shrink_0()
                     .overflow_hidden()
-                    .tooltip(ui::Tooltip::text(
-                        "This server doesn't report failing columns — update the daemon to see them",
-                    ))
+                    .tooltip(ui::Tooltip::text(why))
                     .child(
                         Label::new(casts.to_string())
                             .size(LabelSize::XSmall)
@@ -1643,15 +1661,26 @@ impl ElRunsPanel {
                         },
                         Color::Default,
                     ))
-                    .child(cell(
-                        64.,
-                        if run.cast_failures == 0 {
-                            "—".to_owned()
-                        } else {
-                            run.cast_failures.to_string()
-                        },
-                        if run.cast_failures == 0 { Color::Muted } else { Color::Warning },
-                    ))
+                    .child(match run.cast_failures {
+                        // An older daemon reports no count at all — say so
+                        // rather than passing it off as a clean run.
+                        None => col(
+                            64.,
+                            div()
+                                .id(("el-run-casts", run.id as usize))
+                                .tooltip(ui::Tooltip::text(
+                                    "This server doesn't report cast failures — update the daemon to see them",
+                                ))
+                                .child(
+                                    Label::new("?")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .into_any_element(),
+                        ),
+                        Some(0) => cell(64., "—".to_owned(), Color::Muted),
+                        Some(count) => cell(64., count.to_string(), Color::Warning),
+                    })
                     .child(cell(
                         50.,
                         if run.attempt == 0 {

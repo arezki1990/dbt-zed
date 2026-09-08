@@ -50,7 +50,9 @@ fn serve_runs_pipelines_over_the_api() {
     }
     std::fs::write(
         el.join("connections.yml"),
-        "version: 1\nconnections:\n  src: { type: duckdb, path: el/source.duckdb }\n  wh: { type: duckdb, path: el/warehouse.duckdb }\nprofiles:\n  dev:\n    connections: {}\n",
+        // dev points the warehouse elsewhere, so a run under the deploy's
+        // pin is distinguishable from one under the daemon's own (base).
+        "version: 1\nconnections:\n  src: { type: duckdb, path: el/source.duckdb }\n  wh: { type: duckdb, path: el/warehouse.duckdb }\nprofiles:\n  dev:\n    connections:\n      wh: { type: duckdb, path: el/warehouse_dev.duckdb }\n",
     )
     .unwrap();
     let orders_yaml = "version: 1\npipeline: orders\nsource: src\ntarget: { connection: wh, schema: LANDING }\nstreams:\n- name: orders\n  source: { schema: main, table: orders }\n";
@@ -144,12 +146,17 @@ fn serve_runs_pipelines_over_the_api() {
     assert_eq!(runs[0].status, "ok");
     assert_eq!(runs[0].rows_written, 3);
 
-    // The warehouse really holds the rows.
-    let connection = duckdb::Connection::open(el.join("warehouse.duckdb")).unwrap();
+    // The warehouse really holds the rows — the one the DEPLOY pinned,
+    // not the one the daemon's own profile would have picked.
+    let connection = duckdb::Connection::open(el.join("warehouse_dev.duckdb")).unwrap();
     let count: i64 = connection
         .query_row("SELECT COUNT(*) FROM LANDING.ORDERS", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 3);
+    assert!(
+        !el.join("warehouse.duckdb").exists(),
+        "the run must not touch the base profile's warehouse"
+    );
 
     // Unknown pipeline is a clean API error, not a crash.
     assert!(good.start_run("nope").is_err());
