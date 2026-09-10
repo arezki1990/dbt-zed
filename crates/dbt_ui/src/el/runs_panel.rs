@@ -3,8 +3,9 @@
 //! any EL connection, through the on-demand worker). Mapping-editor
 //! previews overlay either view and return with Back.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
@@ -59,7 +60,10 @@ pub struct ElRunsPanel {
     /// A failed Run/Cancel action — kept visible until the next action
     /// or remote switch (the 2s poll must not wipe it).
     remote_action_error: Option<SharedString>,
-    remote_health: Option<SharedString>,
+    /// What the server said about itself, kept as facts rather than a
+    /// sentence so the uptime ticks between pushes instead of ageing.
+    /// None = not connected.
+    remote_status: Option<RemoteStatus>,
     remote_logs: Vec<SharedString>,
     /// Logs live in a read-only editor so they can be selected/copied.
     remote_log_editor: Entity<Editor>,
@@ -73,11 +77,18 @@ pub struct ElRunsPanel {
     remote_detail_pending: bool,
     /// A run opened in the run-detail view (its per-stream breakdown).
     remote_run_detail: Option<u64>,
-    remote_run_events: Vec<el_engine::ProgressEvent>,
-    remote_run_cursor: usize,
+    /// Progress per run. The socket pushes it for every run in flight, so
+    /// this is no longer "the opened run's events" — opening a run that
+    /// finished before we attached fetches its history from the API.
+    remote_run_events: HashMap<u64, Vec<el_engine::ProgressEvent>>,
     /// The opened run's error as reported by its events page — keeps the
     /// message on the detail view after the run drops out of `/runs`.
     remote_run_error: Option<SharedString>,
+    /// The run whose history has been asked for. Holds across the fetch
+    /// so a busy socket cannot restart it on every pushed message, and
+    /// across a failure so it does not retry forever — closing the detail
+    /// clears it, which is how a person asks again.
+    remote_history_for: Option<u64>,
     /// Height of the SQL editor in the Query tab; its splitter drags it.
     query_split: f32,
     query_split_drag: Option<(f32, f32)>,
@@ -86,7 +97,209 @@ pub struct ElRunsPanel {
     /// (pointer y at drag start, split at drag start).
     remote_split_drag: Option<(f32, f32)>,
     remote_epoch: u64,
+    /// The live socket's applying task, and the polling fallback for a
+    /// server too old to have one. Only ever one of them is doing work.
+    _remote_feed: Task<()>,
     _remote_poll: Task<()>,
+    /// A one-shot fetch of a finished run's event history.
+    _remote_history: Task<()>,
+}
+
+/// The remote's self-description, as the socket's snapshot (or `/health`)
+/// reports it.
+struct RemoteStatus {
+    started_unix: u64,
+    profile: Option<SharedString>,
+    /// True while the WebSocket is attached; false while falling back to
+    /// polling, so the difference is visible rather than mysterious.
+    live: bool,
+}
+
+/// What the watch thread hands the panel. The thread is a plain OS thread
+/// because [`el_engine::watch::WatchClient`] blocks; it talks to the
+/// panel over a channel rather than blocking a background executor slot
+/// for the life of the connection.
+enum RemoteFeed {
+    /// The socket is up. A snapshot follows immediately.
+    Attached(SharedString),
+    Message(Box<el_engine::watch::ServerMessage>),
+    /// A reconnect failed — the server is actually unreachable, not just
+    /// cycling a session.
+    Unreachable(SharedString),
+    /// This daemon predates the socket. Poll it instead, quietly.
+    Unsupported,
+}
+
+/// Folds one pushed run into the table, which reads newest first. The
+/// message is absolute, so a run already held is simply replaced — that
+/// is what makes the snapshot/stream overlap harmless.
+fn merge_run(runs: &mut Vec<el_engine::server::RemoteRun>, run: el_engine::server::RemoteRun) {
+    match runs.iter().position(|held| held.id == run.id) {
+        Some(ix) => runs[ix] = run,
+        None => runs.insert(0, run),
+    }
+}
+
+/// Places one pushed progress event by the index the daemon gave it.
+///
+/// Three cases, and only one of them appends. An index already held is a
+/// repeat (the snapshot and the stream overlap by design) and is dropped.
+/// An index beyond the end is a *gap*: the rest of that list can no
+/// longer fold into honest per-stream rows, so it is discarded and the
+/// detail view refetches the run's history. And a list is never started
+/// part-way through, which would render as a run that skipped its own
+/// beginning.
+fn place_run_event(
+    events: &mut HashMap<u64, Vec<el_engine::ProgressEvent>>,
+    run_id: u64,
+    index: usize,
+    event: el_engine::ProgressEvent,
+) {
+    use std::collections::hash_map::Entry;
+    match events.entry(run_id) {
+        Entry::Occupied(mut held) => {
+            let events = held.get_mut();
+            if index == events.len() {
+                events.push(event);
+            } else if index > events.len() {
+                held.remove();
+            }
+        }
+        Entry::Vacant(slot) => {
+            if index == 0 {
+                slot.insert(vec![event]);
+            }
+        }
+    }
+}
+
+/// How many daemon log lines the panel keeps.
+const REMOTE_LOG_CAP: usize = 400;
+
+/// Appends one daemon log line, ignoring anything already held. Returns
+/// whether the buffer changed — the log editor is only rebuilt when it
+/// did.
+fn append_log(
+    logs: &mut Vec<SharedString>,
+    next: &mut u64,
+    seq: u64,
+    line: String,
+) -> bool {
+    if seq < *next {
+        return false;
+    }
+    *next = seq + 1;
+    logs.push(line.into());
+    let overflow = logs.len().saturating_sub(REMOTE_LOG_CAP);
+    if overflow > 0 {
+        logs.drain(..overflow);
+    }
+    true
+}
+
+/// Merges a snapshot's log tail into what the panel already holds.
+///
+/// The lines carry no sequences of their own — the tail simply ends at
+/// `log_next` — so each line's place is arithmetic, and [`append_log`]
+/// then drops the ones already held. Appending rather than replacing is
+/// what keeps a reconnect (the server retires sessions on a timer) from
+/// shortening a log somebody is reading.
+fn merge_log_tail(
+    logs: &mut Vec<SharedString>,
+    next: &mut u64,
+    lines: Vec<String>,
+    log_next: u64,
+) -> bool {
+    let first_seq = log_next.saturating_sub(lines.len() as u64);
+    let mut changed = false;
+    for (offset, line) in lines.into_iter().enumerate() {
+        changed |= append_log(logs, next, first_seq + offset as u64, line);
+    }
+    changed
+}
+
+/// Holds one live connection open, reconnecting for as long as anyone is
+/// listening. Returns when the receiver is dropped — which is what a
+/// closed tab, a switched remote or a dropped panel looks like from here.
+fn watch_remote(
+    root: PathBuf,
+    name: String,
+    sender: futures::channel::mpsc::UnboundedSender<RemoteFeed>,
+) {
+    use el_engine::watch::{ServerMessage, WatchClient, WatchRefused};
+
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if sender.is_closed() {
+            return;
+        }
+        let mut watch = match WatchClient::connect(&root, &name) {
+            Ok(watch) => watch,
+            Err(WatchRefused::Unsupported) => {
+                let _ = sender.unbounded_send(RemoteFeed::Unsupported);
+                return;
+            }
+            Err(WatchRefused::Failed(error)) => {
+                let message = format!("{error:#}");
+                if sender
+                    .unbounded_send(RemoteFeed::Unreachable(message.into()))
+                    .is_err()
+                {
+                    return;
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
+        };
+        let opened = Instant::now();
+        if sender
+            .unbounded_send(RemoteFeed::Attached(name.clone().into()))
+            .is_err()
+        {
+            return;
+        }
+        // The server retires a session on a timer and expects us back; a
+        // reconnect on its say-so is not a fault and must not surface as
+        // one. Any other drop just reconnects too — an error is only
+        // worth reporting once the *reconnect* fails.
+        let mut expected_close = false;
+        loop {
+            if sender.is_closed() {
+                return;
+            }
+            match watch.next() {
+                Ok(Some(message)) => {
+                    expected_close |= matches!(message, ServerMessage::Closing { .. });
+                    if sender
+                        .unbounded_send(RemoteFeed::Message(Box::new(message)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // The poll window passed quietly — the chance to notice
+                // nobody is listening any more.
+                Ok(None) => {}
+                Err(error) => {
+                    if !expected_close {
+                        log::debug!("el: watch socket for {name} dropped: {error:#}");
+                    }
+                    break;
+                }
+            }
+        }
+        // A connection that held is a healthy one, however it ended — the
+        // server retires sessions on a timer and expects us straight back.
+        // One that died on arrival is a server in trouble, and reconnecting
+        // at once would spin a core on it.
+        if opened.elapsed() >= Duration::from_secs(2) {
+            backoff = Duration::from_secs(1);
+        } else {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
 }
 
 pub struct PreviewTable {
@@ -270,7 +483,7 @@ impl ElRunsPanel {
                 remote_runs: Vec::new(),
                 remote_error: None,
                 remote_action_error: None,
-                remote_health: None,
+                remote_status: None,
                 remote_logs: Vec::new(),
                 remote_log_editor,
                 remote_logs_dirty: false,
@@ -279,15 +492,17 @@ impl ElRunsPanel {
                 remote_detail: None,
                 remote_detail_pending: false,
                 remote_run_detail: None,
-                remote_run_events: Vec::new(),
-                remote_run_cursor: 0,
+                remote_run_events: HashMap::new(),
                 remote_run_error: None,
+                remote_history_for: None,
                 query_split: 110.,
                 query_split_drag: None,
                 remote_split: 170.,
                 remote_split_drag: None,
                 remote_epoch: 0,
+                _remote_feed: Task::ready(()),
                 _remote_poll: Task::ready(()),
+                _remote_history: Task::ready(()),
             }
         })
     }
@@ -319,7 +534,7 @@ impl ElRunsPanel {
         if !same_pipeline {
             return Vec::new();
         }
-        let (_, mut agg) = fold_stream_events(&self.remote_run_events);
+        let (_, mut agg) = fold_stream_events(self.run_events(run_id));
         agg.remove(stream)
             .map(|entry| entry.failures)
             .unwrap_or_default()
@@ -369,7 +584,7 @@ impl ElRunsPanel {
         self.remote_detail = None;
         self.remote_detail_pending = false;
         self.remote_run_detail = None;
-        self.start_remote_poll(cx);
+        self.start_remote_feed(cx);
         cx.notify();
     }
 
@@ -401,7 +616,7 @@ impl ElRunsPanel {
         self.elapsed = None;
         self.refresh_connections(cx);
         if self.surface == Surface::Remote {
-            self.start_remote_poll(cx);
+            self.start_remote_feed(cx);
         }
         cx.notify();
     }
@@ -476,22 +691,239 @@ impl ElRunsPanel {
         }
     }
 
-    /// Restarts the remote poll loop: fetch pipelines + runs now, then
-    /// every two seconds while the Remote surface stays visible.
-    fn start_remote_poll(&mut self, cx: &mut Context<Self>) {
+    /// The remote currently selected, as (project root, remote name).
+    fn remote_target(&self) -> Option<(PathBuf, String)> {
+        let root = self.root.clone()?;
+        let name = self
+            .selected_remote
+            .and_then(|ix| self.remotes.get(ix))
+            .map(|name| name.to_string())?;
+        Some((root, name))
+    }
+
+    /// Attaches to the server's live status socket, and falls back to the
+    /// old poll loop when the server is too old to have one. This is the
+    /// entry point for every "show me this remote" path; nothing else
+    /// should reach for the poller directly.
+    fn start_remote_feed(&mut self, cx: &mut Context<Self>) {
         self.remote_epoch += 1;
-        self.remote_health = None;
+        self.remote_status = None;
         self.remote_logs.clear();
         self.remote_log_next = 0;
         let epoch = self.remote_epoch;
-        let Some(root) = self.root.clone() else { return };
-        let Some(name) = self
-            .selected_remote
-            .and_then(|ix| self.remotes.get(ix))
-            .map(|name| name.to_string())
-        else {
+        let Some((root, name)) = self.remote_target() else { return };
+
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded();
+        // A real thread, not a background_spawn: `next` blocks, and this
+        // connection lives for as long as the tab is open. Dropping the
+        // task below drops the receiver, which is how the thread is told
+        // to stop — it notices within one poll window.
+        if let Err(error) = std::thread::Builder::new()
+            .name("el-watch".to_owned())
+            .spawn(move || watch_remote(root, name, sender))
+        {
+            log::warn!("el: no thread for the watch socket ({error}) — polling instead");
+            self.start_remote_poll(cx);
             return;
+        }
+
+        self._remote_feed = cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some(update) = receiver.next().await {
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.remote_epoch != epoch {
+                            return false;
+                        }
+                        match update {
+                            RemoteFeed::Attached(profile) => {
+                                this.remote_error = None;
+                                log::debug!("el: watching {profile} live");
+                            }
+                            RemoteFeed::Message(message) => {
+                                this.apply_watch(*message);
+                                // A gap discards the opened run's events
+                                // (see `place_run_event`); fetch them
+                                // rather than draw an empty breakdown.
+                                if let Some(run_id) = this.remote_run_detail {
+                                    this.ensure_run_events(run_id, cx);
+                                }
+                            }
+                            RemoteFeed::Unreachable(error) => {
+                                if let Some(status) = &mut this.remote_status {
+                                    status.live = false;
+                                }
+                                this.remote_error = Some(error);
+                            }
+                            RemoteFeed::Unsupported => {
+                                // Not worth a word to the operator: the
+                                // server simply predates the socket.
+                                this.start_remote_poll(cx);
+                                return false;
+                            }
+                        }
+                        cx.notify();
+                        this.surface == Surface::Remote
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Folds one pushed message into the panel. Every message is either
+    /// absolute or indexed, so applying one twice is harmless — which is
+    /// what makes the snapshot/stream overlap safe.
+    fn apply_watch(&mut self, message: el_engine::watch::ServerMessage) {
+        use el_engine::watch::ServerMessage as Message;
+        match message {
+            Message::Snapshot(snapshot) => {
+                self.remote_status = Some(RemoteStatus {
+                    started_unix: snapshot.started_unix,
+                    profile: snapshot.profile.map(SharedString::from),
+                    live: true,
+                });
+                self.remote_pipelines = snapshot.pipelines;
+                self.remote_runs = snapshot.runs;
+                self.remote_error = None;
+                // The server has now said what it holds.
+                self.remote_detail_pending = false;
+                // Keep the opened run's history (the socket does not
+                // carry it) and take the server's word for everything in
+                // flight. Anything else is dropped: this is what bounds
+                // the map across a long-lived session.
+                let opened = self.remote_run_detail;
+                self.remote_run_events
+                    .retain(|run_id, _| Some(*run_id) == opened);
+                for run in snapshot.live_events {
+                    self.remote_run_events.insert(run.run_id, run.events);
+                }
+                self.remote_logs_dirty |= merge_log_tail(
+                    &mut self.remote_logs,
+                    &mut self.remote_log_next,
+                    snapshot.logs,
+                    snapshot.log_next,
+                );
+            }
+            Message::Run { run } => merge_run(&mut self.remote_runs, run),
+            Message::RunEvent {
+                run_id,
+                index,
+                event,
+            } => place_run_event(&mut self.remote_run_events, run_id, index, event),
+            Message::Pipelines { pipelines } => {
+                self.remote_pipelines = pipelines;
+                self.remote_detail_pending = false;
+            }
+            Message::Log { seq, line } => {
+                self.remote_logs_dirty |= append_log(
+                    &mut self.remote_logs,
+                    &mut self.remote_log_next,
+                    seq,
+                    line,
+                );
+            }
+            // Proof of life, the opening handshake, and the two frames
+            // that only tell the client what is about to arrive anyway.
+            Message::Hello { .. }
+            | Message::Heartbeat { .. }
+            | Message::Resync
+            | Message::Closing { .. }
+            | Message::Unknown => {}
+        }
+    }
+
+    /// The opened run's events. A run in flight arrives on the socket; one
+    /// that finished before we attached is history the socket does not
+    /// carry, so fetch it once from the JSON API.
+    fn ensure_run_events(&mut self, run_id: u64, cx: &mut Context<Self>) {
+        if self.remote_run_events.contains_key(&run_id)
+            || self.remote_history_for == Some(run_id)
+        {
+            return;
+        }
+        let Some((root, name)) = self.remote_target() else { return };
+        self.remote_history_for = Some(run_id);
+        self._remote_history = cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_spawn(async move {
+                    let client = el_engine::server::RemoteClient::connect(&root, &name)?;
+                    client.events(run_id, 0)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match page {
+                    Ok(page) => {
+                        if let Some(error) = page.error {
+                            this.remote_run_error = Some(error.into());
+                        }
+                        this.remote_run_events.insert(run_id, page.events);
+                    }
+                    Err(error) => this.remote_run_error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Whether the status socket is attached, as opposed to falling back
+    /// to polling or not being connected at all.
+    fn remote_is_live(&self) -> bool {
+        self.remote_status.as_ref().is_some_and(|status| status.live)
+    }
+
+    /// One run's progress, empty when neither the socket nor a history
+    /// fetch has produced it yet.
+    fn run_events(&self, run_id: u64) -> &[el_engine::ProgressEvent] {
+        self.remote_run_events
+            .get(&run_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The connected line in the toolbar, built at render time so the
+    /// uptime is the real one rather than the one the last push carried.
+    fn remote_status_label(&self) -> Option<SharedString> {
+        let status = self.remote_status.as_ref()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or(0);
+        let uptime = now.saturating_sub(status.started_unix);
+        let uptime = if uptime >= 3600 {
+            format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
+        } else if uptime >= 60 {
+            format!("{}m", uptime / 60)
+        } else {
+            format!("{uptime}s")
         };
+        let running = self
+            .remote_runs
+            .iter()
+            .filter(|run| run.status == "running")
+            .count();
+        let profile = status
+            .profile
+            .as_ref()
+            .map(|name| format!(", profile {name}"))
+            .unwrap_or_default();
+        let how = if status.live { "live" } else { "polling" };
+        Some(format!("connected ({how}) — up {uptime}, {running} running{profile}").into())
+    }
+
+    /// The polling fallback, for a server that predates the live socket:
+    /// fetch pipelines + runs now, then every two seconds while the
+    /// Remote surface stays visible.
+    fn start_remote_poll(&mut self, cx: &mut Context<Self>) {
+        self.remote_epoch += 1;
+        self.remote_status = None;
+        self.remote_logs.clear();
+        self.remote_log_next = 0;
+        let epoch = self.remote_epoch;
+        let Some((root, name)) = self.remote_target() else { return };
         self._remote_poll = cx.spawn(async move |this, cx| {
             let mut log_cursor = 0u64;
             loop {
@@ -500,7 +932,14 @@ impl ElRunsPanel {
                 let since = log_cursor;
                 let watched_run = this
                     .read_with(cx, |this, _| {
-                        this.remote_run_detail.map(|id| (id, this.remote_run_cursor))
+                        this.remote_run_detail.map(|id| {
+                            let held = this
+                                .remote_run_events
+                                .get(&id)
+                                .map(Vec::len)
+                                .unwrap_or(0);
+                            (id, held)
+                        })
                     })
                     .ok()
                     .flatten();
@@ -532,8 +971,10 @@ impl ElRunsPanel {
                             Ok((pipelines, runs, health, logs, run_events)) => {
                                 if let Some((run_id, page)) = run_events {
                                     if this.remote_run_detail == Some(run_id) {
-                                        this.remote_run_events.extend(page.events);
-                                        this.remote_run_cursor = page.next;
+                                        this.remote_run_events
+                                            .entry(run_id)
+                                            .or_default()
+                                            .extend(page.events);
                                         if let Some(error) = page.error {
                                             this.remote_run_error = Some(error.into());
                                         }
@@ -544,31 +985,23 @@ impl ElRunsPanel {
                                 this.remote_error = None;
                                 // The server has now said what it holds.
                                 this.remote_detail_pending = false;
-                                this.remote_health = health.map(|value| {
+                                this.remote_status = health.map(|value| {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|since| since.as_secs())
+                                        .unwrap_or(0);
                                     let uptime = value
                                         .get("uptime_secs")
                                         .and_then(|secs| secs.as_u64())
                                         .unwrap_or(0);
-                                    let running = value
-                                        .get("running")
-                                        .and_then(|count| count.as_u64())
-                                        .unwrap_or(0);
-                                    let uptime = if uptime >= 3600 {
-                                        format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
-                                    } else if uptime >= 60 {
-                                        format!("{}m", uptime / 60)
-                                    } else {
-                                        format!("{uptime}s")
-                                    };
-                                    let profile = value
-                                        .get("profile")
-                                        .and_then(|name| name.as_str())
-                                        .map(|name| format!(", profile {name}"))
-                                        .unwrap_or_default();
-                                    format!(
-                                        "connected — up {uptime}, {running} running{profile}"
-                                    )
-                                    .into()
+                                    RemoteStatus {
+                                        started_unix: now.saturating_sub(uptime),
+                                        profile: value
+                                            .get("profile")
+                                            .and_then(|name| name.as_str())
+                                            .map(SharedString::from),
+                                        live: false,
+                                    }
                                 });
                                 if let Some((lines, next)) = logs {
                                     this.remote_log_next = next;
@@ -577,15 +1010,17 @@ impl ElRunsPanel {
                                     }
                                     this.remote_logs
                                         .extend(lines.into_iter().map(SharedString::from));
-                                    let overflow =
-                                        this.remote_logs.len().saturating_sub(400);
+                                    let overflow = this
+                                        .remote_logs
+                                        .len()
+                                        .saturating_sub(REMOTE_LOG_CAP);
                                     if overflow > 0 {
                                         this.remote_logs.drain(..overflow);
                                     }
                                 }
                             }
                             Err(error) => {
-                                this.remote_health = None;
+                                this.remote_status = None;
                                 this.remote_error = Some(format!("{error:#}").into());
                             }
                         }
@@ -628,7 +1063,12 @@ impl ElRunsPanel {
             let result = task.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.start_remote_poll(cx),
+                    // A live socket has already been told what happened;
+                    // tearing it down to reconnect would only lose the
+                    // feed for a moment. A poller has to be kicked, or the
+                    // result waits for its next tick.
+                    Ok(()) if this.remote_is_live() => {}
+                    Ok(()) => this.start_remote_feed(cx),
                     Err(error) => {
                         this.remote_action_error = Some(format!("{error:#}").into());
                     }
@@ -876,7 +1316,7 @@ impl ElRunsPanel {
                             this.remote_detail = None;
                             this.remote_detail_pending = false;
                             this.remote_run_detail = None;
-                            this.start_remote_poll(cx);
+                            this.start_remote_feed(cx);
                             cx.notify();
                         }))
                 })
@@ -889,8 +1329,8 @@ impl ElRunsPanel {
             .items_center()
             .child(chips)
             .child(div().flex_1())
-            .children(self.remote_health.clone().map(|health| {
-                Label::new(health).size(LabelSize::XSmall).color(Color::Success)
+            .children(self.remote_status_label().map(|status| {
+                Label::new(status).size(LabelSize::XSmall).color(Color::Success)
             }))
             .children(self.remote_error.clone().map(|error| {
                 Label::new(error).size(LabelSize::XSmall).color(Color::Error)
@@ -1309,9 +1749,8 @@ impl ElRunsPanel {
                     .tooltip(ui::Tooltip::text("Back"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remote_run_detail = None;
-                        this.remote_run_events.clear();
-                        this.remote_run_cursor = 0;
                         this.remote_run_error = None;
+                        this.remote_history_for = None;
                         cx.notify();
                     })),
             )
@@ -1369,7 +1808,7 @@ impl ElRunsPanel {
         });
 
         // Fold the event log into per-stream rows.
-        let (order, agg) = fold_stream_events(&self.remote_run_events);
+        let (order, agg) = fold_stream_events(self.run_events(run_id));
 
         let head = |width: f32, text: &'static str| {
             div().w(px(width)).flex_shrink_0().child(
@@ -1609,9 +2048,10 @@ impl ElRunsPanel {
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.remote_run_detail = Some(run_id);
-                    this.remote_run_events.clear();
-                    this.remote_run_cursor = 0;
                     this.remote_run_error = None;
+                    // Live runs are already streaming in; an older one is
+                    // history the socket does not carry.
+                    this.ensure_run_events(run_id, cx);
                     cx.notify();
                 }))
                 .child(cell(44., format!("#{}", run.id), Color::Muted));
@@ -1948,7 +2388,7 @@ impl Render for ElRunsPanel {
                                 Surface::Query => this.refresh_connections(cx),
                                 Surface::Remote => {
                                     this.refresh_connections(cx);
-                                    this.start_remote_poll(cx);
+                                    this.start_remote_feed(cx);
                                 }
                                 Surface::Runs => {}
                             }
@@ -1990,7 +2430,138 @@ impl Render for ElRunsPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::{TOOLTIP_CAP, tooltip_text};
+    use std::collections::HashMap;
+
+    use super::{
+        REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, merge_log_tail, merge_run, place_run_event,
+        tooltip_text,
+    };
+
+    fn run(id: u64, status: &str) -> el_engine::server::RemoteRun {
+        el_engine::server::RemoteRun {
+            id,
+            pipeline: "orders".to_owned(),
+            status: status.to_owned(),
+            attempt: 0,
+            started_unix: 10,
+            finished_unix: None,
+            rows_written: 0,
+            cast_failures: None,
+            error: None,
+        }
+    }
+
+    fn started(pipeline: &str) -> el_engine::ProgressEvent {
+        el_engine::ProgressEvent::RunStarted {
+            pipeline: pipeline.to_owned(),
+            streams: Vec::new(),
+        }
+    }
+
+    fn stream(name: &str) -> el_engine::ProgressEvent {
+        el_engine::ProgressEvent::StreamStarted {
+            stream: name.to_owned(),
+        }
+    }
+
+    /// A run pushed twice is the same run, not two rows: the snapshot and
+    /// the stream that follows it overlap by design.
+    #[test]
+    fn a_pushed_run_replaces_its_own_row_and_new_ones_land_on_top() {
+        let mut runs = vec![run(2, "ok"), run(1, "ok")];
+        merge_run(&mut runs, run(2, "failed"));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, "failed");
+        merge_run(&mut runs, run(3, "running"));
+        assert_eq!(runs.iter().map(|run| run.id).collect::<Vec<_>>(), [3, 2, 1]);
+    }
+
+    #[test]
+    fn progress_events_dedupe_and_a_gap_drops_the_list() {
+        let mut events: HashMap<u64, Vec<el_engine::ProgressEvent>> = HashMap::new();
+
+        // A list never starts part-way through.
+        place_run_event(&mut events, 1, 3, stream("orders"));
+        assert!(!events.contains_key(&1));
+
+        place_run_event(&mut events, 1, 0, started("orders"));
+        place_run_event(&mut events, 1, 1, stream("orders"));
+        assert_eq!(events[&1].len(), 2);
+
+        // The snapshot/stream overlap: an index already held is dropped.
+        place_run_event(&mut events, 1, 1, stream("again"));
+        assert_eq!(events[&1].len(), 2);
+        assert!(matches!(
+            events[&1][1],
+            el_engine::ProgressEvent::StreamStarted { ref stream } if stream == "orders"
+        ));
+
+        // A gap cannot be folded into honest rows, so the list goes and
+        // the detail view refetches the history.
+        place_run_event(&mut events, 1, 5, stream("skipped"));
+        assert!(!events.contains_key(&1), "a gap discards the partial list");
+    }
+
+    #[test]
+    fn log_lines_dedupe_by_sequence_and_the_buffer_stays_capped() {
+        let mut logs = Vec::new();
+        let mut next = 0;
+        assert!(append_log(&mut logs, &mut next, 0, "first".to_owned()));
+        assert_eq!(next, 1);
+        // Already held: no change, and the editor is not rebuilt.
+        assert!(!append_log(&mut logs, &mut next, 0, "first".to_owned()));
+        assert_eq!(logs.len(), 1);
+
+        for seq in 1..=REMOTE_LOG_CAP as u64 + 10 {
+            assert!(append_log(&mut logs, &mut next, seq, format!("line {seq}")));
+        }
+        assert_eq!(logs.len(), REMOTE_LOG_CAP);
+        assert_eq!(
+            logs.last().unwrap().as_ref(),
+            format!("line {}", REMOTE_LOG_CAP + 10)
+        );
+    }
+
+    /// The server retires a session every half hour and the client comes
+    /// straight back with a fresh snapshot. That must extend the log the
+    /// operator is reading, not cut it back to the tail the server sends.
+    #[test]
+    fn a_reconnect_extends_the_log_instead_of_truncating_it() {
+        let mut logs = Vec::new();
+        let mut next = 0;
+
+        // First attach: the server's whole tail is new.
+        assert!(merge_log_tail(
+            &mut logs,
+            &mut next,
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            3,
+        ));
+        assert_eq!(logs.len(), 3);
+        assert_eq!(next, 3);
+
+        // Reconnect: the same tail, plus a line that happened meanwhile.
+        assert!(merge_log_tail(
+            &mut logs,
+            &mut next,
+            vec!["two".to_owned(), "three".to_owned(), "four".to_owned()],
+            4,
+        ));
+        assert_eq!(
+            logs.iter().map(|line| line.as_ref()).collect::<Vec<_>>(),
+            ["one", "two", "three", "four"],
+            "the overlap is dropped and nothing already read is lost"
+        );
+
+        // And a snapshot with nothing new changes nothing at all.
+        assert!(!merge_log_tail(
+            &mut logs,
+            &mut next,
+            vec!["three".to_owned(), "four".to_owned()],
+            4,
+        ));
+        assert_eq!(logs.len(), 4);
+    }
 
     #[test]
     fn tooltip_text_keeps_short_text_and_caps_long_text() {
