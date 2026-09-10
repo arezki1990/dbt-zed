@@ -621,13 +621,6 @@
     },
   },
   {
-    "context": "Editor && dbt_model",
-    "use_key_equivalents": true,
-    "bindings": {
-      "ctrl-enter": "dbt::ShowModelData",
-    },
-  },
-  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
@@ -1654,6 +1647,17 @@
       "ctrl-enter": "skill_creator::SaveSkill",
       "tab": "skill_creator::FocusNextField",
       "shift-tab": "skill_creator::FocusPreviousField",
+    },
+  },
+  // dbt models: run the model under the cursor. This block is defined last
+  // on purpose - `assistant::InlineAssist` also binds ctrl-enter for every
+  // full editor, and gpui breaks same-depth ties by definition order, so an
+  // earlier block here would be shadowed (see crates/gpui/src/keymap.rs).
+  {
+    "context": "Editor && dbt_model",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "dbt::ShowModelData",
     },
   },
 ]
