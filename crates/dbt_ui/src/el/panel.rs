@@ -22,15 +22,15 @@ pub struct ElPanel {
     workspace: WeakEntity<Workspace>,
     root: Option<PathBuf>,
     pipelines: Vec<PathBuf>,
-    /// (name, kind) — the credential posture: never values.
-    connections: Vec<(SharedString, SharedString)>,
+    /// (name, kind, workspace) — the credential posture: never values.
+    /// The workspace is where this connection's worker runs: a remote's
+    /// name, or "local" when connections.yml declares none.
+    connections: Vec<(SharedString, SharedString, SharedString)>,
     /// connections.yml failed to load (parse error — not absence).
     connections_error: Option<SharedString>,
     /// The active profile (dev/recette/prod…) and all declared ones.
     profile: Option<SharedString>,
     profiles: Vec<SharedString>,
-    /// The remote whose daemon runs database operations; None = local.
-    worker: Option<SharedString>,
     /// Declared remotes: (name, host shown muted — never the token).
     remotes: Vec<(SharedString, SharedString)>,
     /// Connection name → the `${VAR}` names it references that neither the
@@ -59,11 +59,6 @@ pub struct ElPanel {
     _refresh: Task<()>,
 }
 
-/// What a profile is, told once at the switcher and once on the badge.
-const WORKER_HINT: &str = "Which worker answers table listings, queries and previews: the local \
-    zdbt-el-worker, or a remote's daemon (its own connections.yml, profile, drivers and client \
-    libraries). Pipeline runs on a remote still need an explicit deploy.";
-
 const PROFILE_HINT: &str = "Which environment's connections this checkout uses; pipelines stay \
 the same. Your choice is saved in el/.zdbt/profile for you only — connections.yml does not \
 change.";
@@ -82,7 +77,7 @@ enum Row {
     RemotesHeader,
     Remote(SharedString, SharedString),
     Pipeline(PathBuf),
-    Connection(SharedString, SharedString),
+    Connection(SharedString, SharedString, SharedString),
     Table {
         connection: SharedString,
         schema: String,
@@ -143,7 +138,6 @@ impl ElPanel {
             connections_error: None,
             profile: None,
             profiles: Vec::new(),
-            worker: None,
             remotes: Vec::new(),
             missing_env: Default::default(),
             remotes_missing_token: Default::default(),
@@ -179,7 +173,6 @@ impl ElPanel {
             log::warn!("el: could not write schemas: {error:#}");
         }
         self.pipelines = el_engine::spec::list_pipelines(&el);
-        self.worker = el_engine::spec::active_remote_worker(&root).map(Into::into);
         // Real env + project .env: only ever probed for a NAME's presence.
         let env = el_engine::env::EnvMap::load(&root, None);
         self.remotes_missing_token.clear();
@@ -228,7 +221,9 @@ impl ElPanel {
                         if !missing.is_empty() {
                             self.missing_env.insert(name.clone(), missing);
                         }
-                        (name, connection.kind().to_owned().into())
+                        let workspace: SharedString =
+                            connection.workspace().unwrap_or("local").to_owned().into();
+                        (name, connection.kind().to_owned().into(), workspace)
                     })
                     .collect();
                 self.connections_error = None;
@@ -248,30 +243,6 @@ impl ElPanel {
             }
         }
         cx.notify();
-    }
-
-    /// Switches where database operations run — the local worker or a
-    /// remote's daemon — for this checkout: writes the local selection
-    /// file and drops every table cache, since the answers change.
-    fn switch_worker(&mut self, remote: Option<SharedString>, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
-        let path = el_engine::spec::worker_selection_path(&root);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let value = remote.as_deref().unwrap_or("local");
-        if let Err(error) = std::fs::write(&path, value) {
-            self.connections_error =
-                Some(format!("could not save the worker selection: {error}").into());
-            cx.notify();
-            return;
-        }
-        self.tables.clear();
-        self.expanded.clear();
-        self.tables_epoch += 1;
-        // The picker's face shows the new choice; the table caches refill
-        // from it on the next expand.
-        self.refresh(cx);
     }
 
     /// Switches the checkout's active profile: writes the local selection
@@ -360,7 +331,7 @@ impl ElPanel {
                 if self
                     .connections
                     .iter()
-                    .any(|(_, kind)| super::browsable(kind))
+                    .any(|(_, kind, _)| super::browsable(kind))
                 {
                     rows.push(Row::ConnNote(
                         "Then drag a table from Connections onto it.".into(),
@@ -384,8 +355,12 @@ impl ElPanel {
         }
         if !self.collapsed.contains("connections") {
             rows.push(Row::ConnectionsHeader);
-            for (name, kind) in &self.connections {
-                rows.push(Row::Connection(name.clone(), kind.clone()));
+            for (name, kind, workspace) in &self.connections {
+                rows.push(Row::Connection(
+                    name.clone(),
+                    kind.clone(),
+                    workspace.clone(),
+                ));
                 if let Some(missing) = self.missing_env.get(name) {
                     rows.push(Row::EnvHint(missing.clone()));
                 }
@@ -694,15 +669,15 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         let source = self
             .connections
             .iter()
-            .find(|(_, kind)| !matches!(kind.as_ref(), "snowflake"))
+            .find(|(_, kind, _)| !matches!(kind.as_ref(), "snowflake"))
             .or(self.connections.first())
-            .map(|(name, _)| name.to_string())
+            .map(|(name, _, _)| name.to_string())
             .unwrap_or_else(|| "files".to_owned());
         let target = self
             .connections
             .iter()
-            .find(|(_, kind)| matches!(kind.as_ref(), "duckdb" | "snowflake" | "oracle"))
-            .map(|(name, _)| name.to_string())
+            .find(|(_, kind, _)| matches!(kind.as_ref(), "duckdb" | "snowflake" | "oracle"))
+            .map(|(name, _, _)| name.to_string())
             .unwrap_or_else(|| "warehouse".to_owned());
         let starter = format!(
             "# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json\n\
@@ -1015,83 +990,6 @@ impl Render for ElPanel {
                             }),
                     )
             }))
-            .children((!self.remotes.is_empty()).then(|| {
-                // Where database operations run: the local worker binary,
-                // or a remote's daemon — whose worker may carry drivers and
-                // client libraries this machine cannot (Oracle 10g/11g
-                // from a Mac, for one).
-                let remotes: Vec<SharedString> =
-                    self.remotes.iter().map(|(name, _)| name.clone()).collect();
-                let active = self.worker.clone();
-                let panel = cx.entity().downgrade();
-                h_flex()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new("worker")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        ui::PopoverMenu::new("el-worker-select")
-                            .trigger(
-                                Button::new(
-                                    "el-worker-trigger",
-                                    active.clone().unwrap_or_else(|| "local".into()),
-                                )
-                                .label_size(LabelSize::XSmall)
-                                .style(ButtonStyle::Subtle)
-                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                                .tooltip(|_, cx| {
-                                    Tooltip::with_meta("Database worker", None, WORKER_HINT, cx)
-                                }),
-                            )
-                            .menu(move |window, cx| {
-                                let panel = panel.clone();
-                                let remotes = remotes.clone();
-                                let active = active.clone();
-                                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    menu = menu.header("Run tables, queries and previews on");
-                                    let local_panel = panel.clone();
-                                    menu = menu.toggleable_entry(
-                                        "local worker",
-                                        active.is_none(),
-                                        ui::IconPosition::Start,
-                                        None,
-                                        move |_, cx| {
-                                            local_panel
-                                                .update(cx, |this, cx| this.switch_worker(None, cx))
-                                                .ok();
-                                        },
-                                    );
-                                    for name in remotes {
-                                        let panel = panel.clone();
-                                        let selected = active.as_ref() == Some(&name);
-                                        let label = name.clone();
-                                        menu = menu.toggleable_entry(
-                                            label,
-                                            selected,
-                                            ui::IconPosition::Start,
-                                            None,
-                                            move |_, cx| {
-                                                panel
-                                                    .update(cx, |this, cx| {
-                                                        this.switch_worker(Some(name.clone()), cx)
-                                                    })
-                                                    .ok();
-                                            },
-                                        );
-                                    }
-                                    menu
-                                }))
-                            }),
-                    )
-            }))
             .child(list)
     }
 }
@@ -1236,7 +1134,7 @@ impl ElPanel {
                     }))
                     .into_any_element()
             }
-            Row::Connection(name, kind) => {
+            Row::Connection(name, kind, workspace) => {
                 let can_browse = super::browsable(kind);
                 let expanded = self.expanded.contains(name);
                 let chevron = if expanded {
@@ -1264,6 +1162,18 @@ impl ElPanel {
                 )
                 .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
                 .child(div().flex_1())
+                // Where this one runs. Shown even when it is "local", so
+                // the answer is never something you have to open a modal
+                // to learn.
+                .child(
+                    Label::new(workspace.clone())
+                        .size(LabelSize::XSmall)
+                        .color(if workspace.as_ref() == "local" {
+                            Color::Muted
+                        } else {
+                            Color::Accent
+                        }),
+                )
                 .child(
                     Label::new(kind.clone())
                         .size(LabelSize::XSmall)

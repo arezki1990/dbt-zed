@@ -321,19 +321,19 @@ impl BuilderForm {
                         if url_or_path.is_empty() {
                             bail!("postgres needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Postgres(DbConn { url: url_or_path, extra: Default::default() })
+                        Connection::Postgres(DbConn { url: url_or_path, workspace: None, extra: Default::default() })
                     }
                     ConnType::Mysql => {
                         if url_or_path.is_empty() {
                             bail!("mysql needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Mysql(DbConn { url: url_or_path, extra: Default::default() })
+                        Connection::Mysql(DbConn { url: url_or_path, workspace: None, extra: Default::default() })
                     }
                     ConnType::Duckdb => {
                         if url_or_path.is_empty() {
                             bail!("duckdb needs a file path");
                         }
-                        Connection::Duckdb(DuckdbConn { path: url_or_path, extra: Default::default() })
+                        Connection::Duckdb(DuckdbConn { path: url_or_path, workspace: None, extra: Default::default() })
                     }
                     ConnType::Oracle => {
                         let user = self.text(5, cx);
@@ -358,6 +358,7 @@ impl BuilderForm {
                             schema: None,
                             wallet_dir: None,
                             tns_admin: None,
+                            workspace: None,
                             driver: None,
                             extra: Default::default(),
                         })
@@ -379,6 +380,7 @@ impl BuilderForm {
                             role: None,
                             warehouse: None,
                             database: None,
+                            workspace: None,
                             auth: SnowflakeAuth::KeyPair {
                                 private_key_path: key_path,
                             },

@@ -73,18 +73,31 @@ pub fn discover_el_root(
 /// carries the drivers and client libraries this machine may lack (the
 /// thick Oracle driver on a Mac, for one), and resolves connections under
 /// the server's own connections.yml and profile.
+#[derive(Debug)]
 pub enum DbWorker {
     Local(PathBuf),
     Remote(String),
 }
 
-pub fn db_worker(project_root: &Path) -> anyhow::Result<DbWorker> {
-    if let Some(remote) = el_engine::spec::active_remote_worker(project_root) {
-        return Ok(DbWorker::Remote(remote));
+/// Where one connection's database operations run. A connection names its
+/// workspace in connections.yml; absent, it belongs to this machine — the
+/// local worker is the default nothing has to declare. Resolution goes
+/// through the active profile, so a profile that repoints a name also
+/// carries that connection's workspace.
+pub fn db_worker(project_root: &Path, connection: &str) -> anyhow::Result<DbWorker> {
+    let (connections, _) = el_engine::spec::load_active_connections(project_root)?;
+    let workspace = connections
+        .connections
+        .get(connection)
+        .ok_or_else(|| anyhow::anyhow!("connection {connection:?} is gone from connections.yml"))?
+        .workspace()
+        .map(str::to_owned);
+    match workspace {
+        Some(remote) => Ok(DbWorker::Remote(remote)),
+        None => find_worker()
+            .map(DbWorker::Local)
+            .ok_or_else(|| anyhow::anyhow!(WORKER_MISSING)),
     }
-    find_worker()
-        .map(DbWorker::Local)
-        .ok_or_else(|| anyhow::anyhow!(WORKER_MISSING))
 }
 
 pub const WORKER_MISSING: &str =
@@ -107,7 +120,7 @@ fn local_connection(
 /// Lists a connection's tables on the checkout's database worker.
 /// Blocking — call from a background thread.
 pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<(String, String)>> {
-    match db_worker(project_root)? {
+    match db_worker(project_root, connection)? {
         DbWorker::Local(worker) => {
             let (connection, env) = local_connection(project_root, connection)?;
             el_engine::explore::list_tables(&worker, project_root, &connection, &env)
@@ -125,7 +138,7 @@ pub fn run_query(
     sql: &str,
     limit: usize,
 ) -> anyhow::Result<el_engine::explore::QueryResult> {
-    match db_worker(project_root)? {
+    match db_worker(project_root, connection)? {
         DbWorker::Local(worker) => {
             let (connection, env) = local_connection(project_root, connection)?;
             el_engine::explore::run_query(&worker, project_root, &connection, &env, sql, limit)
@@ -144,7 +157,9 @@ pub fn preview_stream(
     limit: usize,
     cancel: &el_engine::CancelFlag,
 ) -> anyhow::Result<el_engine::preview::PreviewResult> {
-    match db_worker(project_root)? {
+    // A preview reads through the pipeline's source, so it belongs to that
+    // connection's workspace — not to whichever one the tree last touched.
+    match db_worker(project_root, &pipeline.source)? {
         DbWorker::Local(worker) => el_engine::preview_stream(
             project_root,
             pipeline,
@@ -274,4 +289,58 @@ pub(crate) fn toast_error(
         });
     }
     workspace.show_toast(toast, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes a project whose two connections sit on different workspaces.
+    fn project(yaml: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(el_dir(dir.path())).unwrap();
+        std::fs::write(el_dir(dir.path()).join("connections.yml"), yaml).unwrap();
+        dir
+    }
+
+    /// The whole point of the per-connection binding: one connection can
+    /// name a remote while its neighbour stays on this machine. Resolving
+    /// one worker for the checkout meant a dead remote took every
+    /// connection down with it, browsable local files included.
+    #[test]
+    fn each_connection_resolves_its_own_workspace() {
+        let dir = project(
+            r#"
+version: 1
+connections:
+  pg:
+    type: postgres
+    url: postgres://localhost/db
+    workspace: vm
+  wh:
+    type: duckdb
+    path: el/demo.duckdb
+"#,
+        );
+
+        assert!(
+            matches!(db_worker(dir.path(), "pg"), Ok(DbWorker::Remote(name)) if name == "vm"),
+            "a declared workspace sends the connection to that remote"
+        );
+        // `wh` declares none, so it belongs to the local worker. Whether a
+        // worker binary is present here decides between Ok(Local) and the
+        // WORKER_MISSING error — either way it never reaches the remote.
+        match db_worker(dir.path(), "wh") {
+            Ok(DbWorker::Local(_)) => {}
+            Err(error) => assert!(format!("{error:#}").contains("Connector worker not found")),
+            Ok(DbWorker::Remote(name)) => panic!("an undeclared workspace went to {name:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_connection_says_so_instead_of_guessing() {
+        let dir = project("version: 1\nconnections: {}\n");
+        let error = db_worker(dir.path(), "ghost").unwrap_err();
+        assert!(format!("{error:#}").contains("ghost"), "{error:#}");
+    }
 }

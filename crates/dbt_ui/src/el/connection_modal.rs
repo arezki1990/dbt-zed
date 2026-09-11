@@ -47,6 +47,13 @@ pub struct ElConnectionModal {
     scope: Option<String>,
     /// Profiles declared in the file (for the add-mode scope chips).
     declared_profiles: Vec<String>,
+    /// The workspace whose worker answers this connection — the YAML
+    /// `workspace:` key. None is the local worker: the default, and what
+    /// an absent key means. Named `runs_on` here because `workspace` is
+    /// already Zed's Workspace above.
+    runs_on: Option<String>,
+    /// Remotes from remotes.yml, offered beside the local worker.
+    declared_remotes: Vec<String>,
     /// The original kind string — drives the unsupported-kind fallback.
     original_kind: Option<&'static str>,
     /// Set when the open-time load failed or the connection is missing —
@@ -319,6 +326,13 @@ impl ElConnectionModal {
         ];
         let name = make("name", "pg_prod", editing.as_deref().unwrap_or("")).editor;
 
+        // The workspaces this connection can name: every declared
+        // remote, plus the local worker, which needs no remotes.yml entry.
+        let declared_remotes: Vec<String> =
+            el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
+                .map(|remotes| remotes.remotes.keys().cloned().collect())
+                .unwrap_or_default();
+
         let referencing = editing
             .as_ref()
             .and_then(|name| referencing_pipelines(&root, name).ok())
@@ -333,6 +347,10 @@ impl ElConnectionModal {
             original_kind: existing.as_ref().map(Connection::kind),
             scope,
             declared_profiles,
+            runs_on: existing
+                .as_ref()
+                .and_then(|connection| connection.workspace().map(str::to_owned)),
+            declared_remotes,
             broken,
             conn_type: existing
                 .as_ref()
@@ -371,6 +389,7 @@ impl ElConnectionModal {
                 }
                 Connection::Postgres(DbConn {
                     url: url_or_path,
+                    workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
             }
@@ -380,6 +399,7 @@ impl ElConnectionModal {
                 }
                 Connection::Mysql(DbConn {
                     url: url_or_path,
+                    workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
             }
@@ -389,6 +409,7 @@ impl ElConnectionModal {
                 }
                 Connection::Duckdb(DuckdbConn {
                     path: url_or_path,
+                    workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
             }
@@ -423,11 +444,23 @@ impl ElConnectionModal {
                     wallet_dir: optional(self.text(11, cx)),
                     tns_admin: optional(self.text(12, cx)),
                     driver,
+                    workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
             }
             ConnType::Local => Connection::Local {
-                extra: Default::default(),
+                // `local` keeps every key in `extra`, so its workspace goes
+                // there too — Connection::workspace() reads it back out.
+                extra: self
+                    .runs_on
+                    .iter()
+                    .map(|workspace| {
+                        (
+                            "workspace".to_owned(),
+                            serde_yaml_ng::Value::String(workspace.clone()),
+                        )
+                    })
+                    .collect(),
             },
             ConnType::Snowflake => {
                 let account = self.text(1, cx);
@@ -465,6 +498,7 @@ impl ElConnectionModal {
                     warehouse: optional(self.text(4, cx)),
                     database: optional(self.text(5, cx)),
                     auth,
+                    workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
             }
@@ -980,6 +1014,40 @@ impl Render for ElConnectionModal {
             }
             card = card.child(scope_row);
         }
+
+        {
+            // Which workspace answers this connection's tables, queries and
+            // previews. `local` is the default: it writes no key at all, so
+            // a connection belongs to this machine until it says otherwise.
+            let mut row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
+                Label::new("workspace")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+            row = row.child(
+                Button::new("el-conn-workspace-local", "local")
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(self.runs_on.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.runs_on = None;
+                        cx.notify();
+                    })),
+            );
+            for (ix, remote) in self.declared_remotes.iter().enumerate() {
+                let selected = self.runs_on.as_deref() == Some(remote);
+                let remote = remote.clone();
+                row = row.child(
+                    Button::new(("el-conn-workspace", ix), SharedString::from(remote.clone()))
+                        .label_size(LabelSize::XSmall)
+                        .toggle_state(selected)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.runs_on = Some(remote.clone());
+                            cx.notify();
+                        })),
+                );
+            }
+            card = card.child(row);
+        }
         if supported {
             let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
             for conn_type in ConnType::ALL {
@@ -1161,6 +1229,7 @@ mod tests {
             wallet_dir: None,
             tns_admin: None,
             driver: None,
+            workspace: None,
             extra: IndexMap::new(),
         })
     }
