@@ -6204,7 +6204,7 @@ dependencies = [
 [[package]]
 name = "el_engine"
 version = "0.1.0"
-source = "git+ssh://git@github.com/arezki1990/zdbt-el.git?branch=main#50cfc3b8958f1af6c2d64582cac18e61b2a9170a"
+source = "git+ssh://git@github.com/arezki1990/zdbt-el.git?branch=main#ad588c13528a5142bba5300cff11ed8d52aee8ec"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6224,6 +6224,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tiny_http",
+ "tungstenite 0.28.0",
  "ureq",
  "url",
 ]
@@ -9494,7 +9495,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -9512,7 +9513,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.56.0",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -16423,7 +16424,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.44",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -16460,7 +16461,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -21566,7 +21567,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fb391ac70462b3097a755618fbf9c8f95ecc1eb379a414f7b46f202ed10db1f"
 dependencies = [
  "cc",
- "windows-targets 0.48.5",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -21934,6 +21935,7 @@ dependencies = [
  "sha1",
  "thiserror 2.0.17",
  "utf-8",
+ "webpki-roots 0.26.8",
 ]
 
 [[package]]
@@ -23762,7 +23764,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
