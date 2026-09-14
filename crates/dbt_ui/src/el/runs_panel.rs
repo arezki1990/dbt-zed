@@ -1283,8 +1283,32 @@ impl ElRunsPanel {
 
         v_flex()
             .size_full()
+            .when(dragging, |flex| {
+                flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start_y, start_split)) = this.query_split_drag {
+                        this.query_split =
+                            (start_split + f32::from(event.position.y) - start_y).clamp(56., 480.);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.query_split_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.query_split_drag = None;
+                        cx.notify();
+                    }),
+                )
+            })
             .child(toolbar)
             .child(editor)
+            .child(splitter)
             .child(body)
             .into_any_element()
     }

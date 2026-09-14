@@ -23,7 +23,7 @@ pub use runs_panel::ElRunsPanel;
 use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, SharedString, Window};
+use gpui::{AppContext as _, Context, SharedString, Window};
 use workspace::Workspace;
 
 /// A table dragged out of the EL panel's explorer — dropped on a pipeline
@@ -225,23 +225,37 @@ pub fn initialize_workspace(
         toast(workspace, "No project folder open in this workspace.", cx);
         return;
     };
-    match scaffold::initialize_el_workspace(&root) {
-        Ok(created) => {
-            toast(
-                workspace,
-                &format!(
-                    "EL workspace ready — {} file(s) created under el/.",
-                    created.len()
-                ),
-                cx,
-            );
-            let example = el_dir(&root).join("pipelines").join("example.yml");
-            if example.is_file() {
-                canvas_item::ElPipelineCanvas::deploy(workspace, root, example, window, cx);
-            }
-        }
-        Err(error) => toast_error(workspace, &format!("EL init failed: {error:#}"), None, cx),
-    }
+    // Scaffolding writes files and may run the worker to seed a demo
+    // database, so it stays off the UI thread.
+    let scaffold = cx.background_spawn({
+        let root = root.clone();
+        async move { scaffold::initialize_el_workspace(&root) }
+    });
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = scaffold.await;
+        workspace
+            .update_in(cx, |workspace, window, cx| match result {
+                Ok(created) => {
+                    toast(
+                        workspace,
+                        &format!(
+                            "EL workspace ready — {} file(s) created under el/.",
+                            created.len()
+                        ),
+                        cx,
+                    );
+                    let example = el_dir(&root).join("pipelines").join("example.yml");
+                    if example.is_file() {
+                        canvas_item::ElPipelineCanvas::deploy(workspace, root, example, window, cx);
+                    }
+                }
+                Err(error) => {
+                    toast_error(workspace, &format!("EL init failed: {error:#}"), None, cx)
+                }
+            })
+            .ok();
+    })
+    .detach();
 }
 
 /// A success/info toast: auto-hides, and never dismisses a standing error

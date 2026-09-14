@@ -133,6 +133,10 @@ pub fn initialize_el_workspace(project_root: &Path) -> Result<Vec<PathBuf>> {
     // a pipeline that reads from it — a real database stream, zero setup.
     if let Some(worker) = super::find_worker() {
         let demo_db = el.join("demo.duckdb");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "callers run this scaffold on a background thread; the seed is short and its result gates the next file"
+        )]
         let seeded = std::process::Command::new(&worker)
             .arg("seed-demo")
             .arg(&demo_db)
