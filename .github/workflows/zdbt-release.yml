@@ -21,6 +21,9 @@ permissions:
 env:
   CARGO_INCREMENTAL: 0
   RUST_BACKTRACE: 1
+  # el_engine comes from the private zdbt-el repository over ssh; the key in
+  # secrets.ZDBT_EL_SSH_KEY only reaches cargo when git itself does the fetch.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   ZDBT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
@@ -53,12 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Reach the private zdbt-el repository (el_engine dependency)
-        shell: bash
-        env:
-          ZDBT_EL_TOKEN: ${{ secrets.ZDBT_EL_TOKEN }}
-        run: |
-          test -n "$ZDBT_EL_TOKEN" || { echo "secret ZDBT_EL_TOKEN (read access to arezki1990/zdbt-el) is not set"; exit 1; }
-          git config --global url."https://x-access-token:${ZDBT_EL_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ZDBT_EL_SSH_KEY }}
       - name: Bundle
         run: ./script/bundle-mac aarch64-apple-darwin
       - name: Upload to release
@@ -86,12 +86,9 @@ jobs:
           df -h /
       - uses: actions/checkout@v4
       - name: Reach the private zdbt-el repository (el_engine dependency)
-        shell: bash
-        env:
-          ZDBT_EL_TOKEN: ${{ secrets.ZDBT_EL_TOKEN }}
-        run: |
-          test -n "$ZDBT_EL_TOKEN" || { echo "secret ZDBT_EL_TOKEN (read access to arezki1990/zdbt-el) is not set"; exit 1; }
-          git config --global url."https://x-access-token:${ZDBT_EL_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ZDBT_EL_SSH_KEY }}
       - name: Install clang 18
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
@@ -124,12 +121,9 @@ jobs:
         run: git config --system core.longpaths true
       - uses: actions/checkout@v4
       - name: Reach the private zdbt-el repository (el_engine dependency)
-        shell: bash
-        env:
-          ZDBT_EL_TOKEN: ${{ secrets.ZDBT_EL_TOKEN }}
-        run: |
-          test -n "$ZDBT_EL_TOKEN" || { echo "secret ZDBT_EL_TOKEN (read access to arezki1990/zdbt-el) is not set"; exit 1; }
-          git config --global url."https://x-access-token:${ZDBT_EL_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ZDBT_EL_SSH_KEY }}
       - name: Bundle
         shell: pwsh
         run: script/bundle-windows.ps1 -Architecture x86_64

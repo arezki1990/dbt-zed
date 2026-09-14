@@ -337,7 +337,8 @@ edit_prediction_ui = { path = "crates/edit_prediction_ui" }
 editor = { path = "crates/editor" }
 # The extract-load engine lives in its own (private) repository; Cargo
 # fetches it with the system git (see .cargo/config.toml), so the SSH key
-# that reaches GitHub is enough locally and CI maps the URL to a token.
+# that reaches GitHub is enough locally; CI loads a read-only key from
+# secrets.ZDBT_EL_SSH_KEY into ssh-agent (see zdbt-release.yml).
 el_engine = { git = "ssh://git@github.com/arezki1990/zdbt-el.git", branch = "main" }
 duckdb = { version = "=1.10505.0", default-features = false, features = ["bundled", "chrono"] }
 encoding_selector = { path = "crates/encoding_selector" }
