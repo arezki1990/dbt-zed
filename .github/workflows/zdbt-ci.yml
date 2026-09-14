@@ -1,0 +1,70 @@
+name: zdbt-ci
+
+# Continuous integration for the zdbt crates. The release half lives in
+# zdbt-release.yml (zdbt-v* tags). Both need to read the private zdbt-el
+# repository, which holds the el_engine dependency: an SSH key with read
+# access to it must be stored as secrets.ZDBT_EL_SSH_KEY.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zdbt-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The ssh-agent key only reaches cargo when git itself does the fetch.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      # webrtc-sys needs clang 17+; the 22.04 image only ships clang 14.
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Reach the private zdbt-el repository (el_engine dependency)
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.ZDBT_EL_SSH_KEY }}
+      - name: Install clang 18
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18
+      - name: Install dependencies
+        run: ./script/linux
+      - name: Download WASI SDK
+        run: ./script/download-wasi-sdk
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt -p dbt_ui -p languages -- --check
+      - name: Clippy
+        # --no-deps: the vendored sqlitegraph crate is a workspace member and
+        # would otherwise be linted (and fail) along with our own crates.
+        run: cargo clippy --no-deps -p dbt_ui -p languages --all-targets -- -D warnings
+      - name: Tests
+        run: |
+          cargo test -p dbt_ui
+          cargo test -p languages -- dbt

@@ -108,7 +108,11 @@ impl gpui::Render for DraggedTablePreview {
             .border_color(colors.border_focused)
             .bg(colors.elevated_surface_background)
             .shadow_md()
-            .child(Icon::new(IconName::Table).size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                Icon::new(IconName::Table)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
             .child(Label::new(self.0.clone()).size(LabelSize::Small))
     }
 }
@@ -210,7 +214,12 @@ impl ElPanel {
             Ok((connections, profile)) => {
                 self.profile = profile.map(Into::into);
                 self.profiles = el_engine::spec::load_connections(&el.join("connections.yml"))
-                    .map(|raw| raw.profiles.keys().map(|name| name.clone().into()).collect())
+                    .map(|raw| {
+                        raw.profiles
+                            .keys()
+                            .map(|name| name.clone().into())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 self.connections = connections
                     .connections
@@ -249,7 +258,9 @@ impl ElPanel {
     /// file (never the shared YAML), drops caches, and reloads every open
     /// canvas so validation and labels track the new environment.
     fn switch_profile(&mut self, name: SharedString, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let path = el_engine::spec::profile_selection_path(&root);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -283,8 +294,9 @@ impl ElPanel {
         let console = self.console(cx);
         self.workspace
             .update(cx, |workspace, cx| {
-                let canvases: Vec<_> =
-                    workspace.items_of_type::<super::ElPipelineCanvas>(cx).collect();
+                let canvases: Vec<_> = workspace
+                    .items_of_type::<super::ElPipelineCanvas>(cx)
+                    .collect();
                 for canvas in canvases {
                     canvas.update(cx, |canvas, cx| canvas.reload(cx));
                 }
@@ -428,7 +440,9 @@ impl ElPanel {
     fn show_remote(&mut self, name: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         // Two separate leases: the console may read the workspace while it
         // refreshes, so it must not be updated inside workspace.update.
-        let Some(console) = self.console(cx) else { return };
+        let Some(console) = self.console(cx) else {
+            return;
+        };
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
@@ -454,7 +468,9 @@ impl ElPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let panel = cx.entity().downgrade();
         self.workspace
             .update(cx, |workspace, cx| {
@@ -473,7 +489,9 @@ impl ElPanel {
     /// Kept for the YAML route: open (or scaffold) remotes.yml.
     #[allow(dead_code)]
     fn add_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let path = super::el_dir(&root).join("remotes.yml");
         if !path.exists() {
             let starter = "# el/remotes.yml — el serve daemons the IDE can drive from the \
@@ -507,7 +525,9 @@ token: \"${ZDBT_EL_TOKEN}\"\n";
     /// with comment lines only when absent: .env is not a spec file, and
     /// no value is ever written here.
     fn open_env_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let path = root.join(".env");
         if !path.exists() {
             let starter = "# Values for the ${VAR} references in el/connections.yml and \
@@ -537,7 +557,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
 
     /// Opens el/connections.yml — the shared file that declares profiles.
     fn open_connections_yaml(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let path = super::el_dir(&root).join("connections.yml");
         self.workspace
             .update(cx, |workspace, cx| {
@@ -565,12 +587,13 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
     }
 
     fn load_tables(&mut self, name: SharedString, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         self.tables.insert(name.clone(), TablesState::Loading);
         let epoch = self.tables_epoch;
         let connection_name = name.to_string();
-        let task =
-            cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
+        let task = cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
         let key = name.clone();
         self._list_tasks.insert(
             key.clone(),
@@ -607,7 +630,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let panel = cx.entity().downgrade();
         self.workspace
             .update(cx, |workspace, cx| {
@@ -631,7 +656,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(console) = self.console(cx) else { return };
+        let Some(console) = self.console(cx) else {
+            return;
+        };
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.focus_panel::<super::ElRunsPanel>(window, cx);
@@ -643,7 +670,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
     }
 
     fn open_pipeline(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         self.workspace
             .update(cx, |workspace, cx| {
                 super::ElPipelineCanvas::deploy(workspace, root, path, window, cx);
@@ -652,7 +681,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
     }
 
     fn new_pipeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let dir = super::el_dir(&root).join("pipelines");
         let _ = std::fs::create_dir_all(&dir);
         // First free pipeline_<n> name.
@@ -768,9 +799,7 @@ impl Render for ElPanel {
                 move |range, _window, cx| {
                     entity.update(cx, |this, cx| {
                         range
-                            .filter_map(|ix| {
-                                rows.get(ix).map(|row| this.render_row(row, ix, cx))
-                            })
+                            .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, ix, cx)))
                             .collect::<Vec<_>>()
                     })
                 }
@@ -779,8 +808,18 @@ impl Render for ElPanel {
         };
         let empty = self.is_empty_project();
         let upper = make_list("el-panel-upper", self.upper_rows(), &self.scroll, cx);
-        let middle = make_list("el-panel-connections", self.connection_rows(), &self.scroll_lower, cx);
-        let bottom = make_list("el-panel-remotes", self.remote_rows(), &self.scroll_remotes, cx);
+        let middle = make_list(
+            "el-panel-connections",
+            self.connection_rows(),
+            &self.scroll_lower,
+            cx,
+        );
+        let bottom = make_list(
+            "el-panel-remotes",
+            self.remote_rows(),
+            &self.scroll_remotes,
+            cx,
+        );
         let dragging = self.split_drag.is_some();
         const HEADER_ONLY: f32 = 26.;
         // A 1px line with a 5px grab area — drag to trade space.
@@ -802,13 +841,21 @@ impl Render for ElPanel {
                     gpui::MouseButton::Left,
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        let start = if which == 0 { this.split } else { this.split_connections };
+                        let start = if which == 0 {
+                            this.split
+                        } else {
+                            this.split_connections
+                        };
                         this.split_drag = Some((which, f32::from(event.position.y), start));
                         cx.notify();
                     }),
                 )
         };
-        let pipelines_h = if self.collapsed.contains("pipelines") { HEADER_ONLY } else { self.split };
+        let pipelines_h = if self.collapsed.contains("pipelines") {
+            HEADER_ONLY
+        } else {
+            self.split
+        };
         let connections_h = if self.collapsed.contains("connections") {
             HEADER_ONLY
         } else {
@@ -1019,7 +1066,11 @@ impl ElPanel {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
             )
-            .child(Label::new(label).size(LabelSize::Default).color(Color::Default))
+            .child(
+                Label::new(label)
+                    .size(LabelSize::Default)
+                    .color(Color::Default),
+            )
             .child(div().flex_1())
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(key, cx)))
     }
@@ -1113,7 +1164,11 @@ impl ElPanel {
                     .into_any_element()
             }
             Row::Note(text) => base
-                .child(Label::new(text.clone()).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
                 .into_any_element(),
             Row::Pipeline(path) => {
                 let name = path
@@ -1149,7 +1204,11 @@ impl ElPanel {
                 .into();
                 base.when(can_browse, |row| {
                     row.cursor_pointer()
-                        .child(Icon::new(chevron).size(IconSize::XSmall).color(Color::Muted))
+                        .child(
+                            Icon::new(chevron)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_connection(toggle_name.clone(), cx);
                         }))
@@ -1165,15 +1224,13 @@ impl ElPanel {
                 // Where this one runs. Shown even when it is "local", so
                 // the answer is never something you have to open a modal
                 // to learn.
-                .child(
-                    Label::new(workspace.clone())
-                        .size(LabelSize::XSmall)
-                        .color(if workspace.as_ref() == "local" {
-                            Color::Muted
-                        } else {
-                            Color::Accent
-                        }),
-                )
+                .child(Label::new(workspace.clone()).size(LabelSize::XSmall).color(
+                    if workspace.as_ref() == "local" {
+                        Color::Muted
+                    } else {
+                        Color::Accent
+                    },
+                ))
                 .child(
                     Label::new(kind.clone())
                         .size(LabelSize::XSmall)
@@ -1240,15 +1297,17 @@ impl ElPanel {
             }
             Row::ConnNote(text, color) => base
                 .pl_6()
-                .child(Label::new(text.clone()).size(LabelSize::XSmall).color(*color))
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color),
+                )
                 .into_any_element(),
             Row::EnvHint(vars) => {
                 // The row is narrow and the names are the whole point, so
                 // the tooltip repeats them rather than the explanation alone.
-                let title = super::runs_panel::tooltip_text(&format!(
-                    "Set {} in .env",
-                    vars.join(", ")
-                ));
+                let title =
+                    super::runs_panel::tooltip_text(&format!("Set {} in .env", vars.join(", ")));
                 base.pl_6()
                     .cursor_pointer()
                     .child(
@@ -1266,9 +1325,7 @@ impl ElPanel {
                             cx,
                         )
                     })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_env_file(window, cx)),
-                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_env_file(window, cx)))
                     .into_any_element()
             }
             Row::RemotesEmpty => base
@@ -1292,7 +1349,11 @@ impl ElPanel {
                 .into_any_element(),
             Row::Initialize => base
                 .cursor_pointer()
-                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    Icon::new(IconName::Plus)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
                 .child(
                     Label::new("Initialize EL workspace…")
                         .size(LabelSize::Small)

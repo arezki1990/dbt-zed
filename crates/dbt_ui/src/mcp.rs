@@ -15,9 +15,7 @@ use serde_json::{Value, json};
 
 use crate::dbt_settings::DbtSettings;
 use crate::lineage::LineageStore;
-use crate::results_panel::{
-    DbtResultsPanel, apply_common_args, parse_show_output,
-};
+use crate::results_panel::{DbtResultsPanel, apply_common_args, parse_show_output};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -191,7 +189,12 @@ fn call_tool(store: &LineageStore, name: &str, arguments: &Value) -> Result<Stri
                 .and_then(|limit| limit.as_u64())
                 .unwrap_or(50)
                 .clamp(1, 500);
-            show(&root, arg_str(arguments, "model"), arg_str(arguments, "sql"), limit)
+            show(
+                &root,
+                arg_str(arguments, "model"),
+                arg_str(arguments, "sql"),
+                limit,
+            )
         }
         "dbt_compile" => {
             let root = project_root(arguments)?;
@@ -304,7 +307,9 @@ fn lineage(store: &LineageStore, root: &Path, model: &str, depth: i32) -> Result
             ]))
         })
         .collect();
-    Ok(serde_json::to_string_pretty(&json!({ "nodes": nodes, "edges": edges }))?)
+    Ok(serde_json::to_string_pretty(
+        &json!({ "nodes": nodes, "edges": edges }),
+    )?)
 }
 
 fn column_lineage(store: &LineageStore, root: &Path, model: &str, column: &str) -> Result<String> {
@@ -330,8 +335,13 @@ fn column_lineage(store: &LineageStore, root: &Path, model: &str, column: &str) 
     }
     indexed.sort_by_key(|(level, _)| *level);
     steps.extend(indexed.into_iter().map(|(_, step)| step));
-    anyhow::ensure!(!steps.is_empty(), "column {column} not found on {model}'s lineage");
-    Ok(serde_json::to_string_pretty(&json!({ "column": column, "path": steps }))?)
+    anyhow::ensure!(
+        !steps.is_empty(),
+        "column {column} not found on {model}'s lineage"
+    );
+    Ok(serde_json::to_string_pretty(
+        &json!({ "column": column, "path": steps }),
+    )?)
 }
 
 fn show(root: &Path, model: Option<&str>, sql: Option<&str>, limit: u64) -> Result<String> {
@@ -385,7 +395,9 @@ fn compile(root: &Path, model: &str) -> Result<String> {
         let compiled_dir = root.join("target").join("compiled");
         let mut stack = vec![compiled_dir];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {

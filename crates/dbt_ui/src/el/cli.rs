@@ -94,7 +94,10 @@ fn resolve_pipeline(root: &Path, spec: &str) -> Option<PathBuf> {
     if relative.is_file() {
         return Some(relative);
     }
-    let named = root.join("el").join("pipelines").join(format!("{spec}.yml"));
+    let named = root
+        .join("el")
+        .join("pipelines")
+        .join(format!("{spec}.yml"));
     named.is_file().then_some(named)
 }
 
@@ -181,7 +184,6 @@ fn run(args: &[String]) -> i32 {
     }
 }
 
-
 /// `zdbt el install-remote user@host`: installs the daemon on a server
 /// over the user's own ssh, with the token generated HERE and shipped on
 /// stdin (never argv), then declares the server locally — remotes.yml
@@ -207,7 +209,11 @@ fn install_remote(args: &[String]) -> i32 {
         .as_ref()
         .map(|port| vec!["-p".to_owned(), port.clone()])
         .unwrap_or_default();
-    let host = host_spec.rsplit('@').next().unwrap_or(&host_spec).to_owned();
+    let host = host_spec
+        .rsplit('@')
+        .next()
+        .unwrap_or(&host_spec)
+        .to_owned();
     let name = flag(args, "--name").unwrap_or_else(|| {
         host.chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -228,7 +234,10 @@ fn install_remote(args: &[String]) -> i32 {
         match std::fs::File::open("/dev/urandom")
             .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
         {
-            Ok(()) => bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            Ok(()) => bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             Err(error) => {
                 eprintln!("could not generate a token: {error}");
                 return 1;

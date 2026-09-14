@@ -156,7 +156,7 @@ impl ElRunView {
             worker: super::find_worker(),
             driver: None,
             chunk_rows: 50_000,
-        profile_override: None,
+            profile_override: None,
         };
         let engine_cancel = cancel.clone();
         // The engine run is blocking: one background thread for its
@@ -321,7 +321,10 @@ impl ElRunView {
         match event {
             ProgressEvent::RunStarted { .. } => {}
             ProgressEvent::StreamStarted { stream } => {
-                if let Some(row) = run.streams.iter_mut().find(|row| row.stream.as_ref() == stream)
+                if let Some(row) = run
+                    .streams
+                    .iter_mut()
+                    .find(|row| row.stream.as_ref() == stream)
                 {
                     row.phase = Some(Phase::Connect);
                 }
@@ -333,7 +336,10 @@ impl ElRunView {
                 rows_written,
                 cast_failures,
             } => {
-                if let Some(row) = run.streams.iter_mut().find(|row| row.stream.as_ref() == stream)
+                if let Some(row) = run
+                    .streams
+                    .iter_mut()
+                    .find(|row| row.stream.as_ref() == stream)
                 {
                     row.phase = Some(phase);
                     row.rows_read = rows_read;
@@ -348,7 +354,10 @@ impl ElRunView {
                 cast_failures,
                 column_failures,
             } => {
-                if let Some(row) = run.streams.iter_mut().find(|row| row.stream.as_ref() == stream)
+                if let Some(row) = run
+                    .streams
+                    .iter_mut()
+                    .find(|row| row.stream.as_ref() == stream)
                 {
                     row.phase = None;
                     row.rows_read = rows_read;
@@ -359,7 +368,10 @@ impl ElRunView {
                 }
             }
             ProgressEvent::StreamFailed { stream, error } => {
-                if let Some(row) = run.streams.iter_mut().find(|row| row.stream.as_ref() == stream)
+                if let Some(row) = run
+                    .streams
+                    .iter_mut()
+                    .find(|row| row.stream.as_ref() == stream)
                 {
                     row.phase = None;
                     row.error = Some(error.into());
@@ -413,71 +425,62 @@ impl Render for ElRunView {
         };
         let running = run.finished.is_none() && run.fatal.is_none();
 
-        let mut body = v_flex()
-            .size_full()
-            .bg(colors.panel_background)
-            .child(
-                h_flex()
-                    .w_full()
-                    .p_1()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new(run.pipeline.clone()).size(LabelSize::Small))
-                    .child(
-                        // A fatal message can outrun the header: it
-                        // truncates, shows whole on hover, and copies.
-                        div()
-                            .id("el-run-status")
-                            .min_w_0()
-                            .overflow_hidden()
-                            .when_some(run.fatal.as_ref(), |cell, fatal| {
-                                cell.tooltip(Tooltip::text(
-                                    super::runs_panel::tooltip_text(fatal),
-                                ))
-                            })
-                            .child(
-                                Label::new(status)
-                                    .size(LabelSize::XSmall)
-                                    .color(match (run.finished, &run.fatal) {
-                                        (_, Some(_)) | (Some(false), _) => Color::Error,
-                                        (Some(true), _) => Color::Success,
-                                        _ => Color::Muted,
-                                    })
-                                    .truncate(),
-                            ),
-                    )
-                    .children(run.fatal.clone().map(|fatal| {
-                        CopyButton::new("el-run-copy-fatal", fatal)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip_label("Copy error")
-                    }))
-                    .child(div().flex_1())
-                    .when(
-                        !running && run.streams.iter().any(|row| row.error.is_some()),
-                        |header| {
-                            header.child(
-                                Button::new("el-run-rerun-failed", "Re-run failed")
-                                    .label_size(LabelSize::XSmall)
-                                    .tooltip(Tooltip::text(
-                                        "Run only the streams that failed",
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.rerun_failed(cx)
-                                    })),
-                            )
-                        },
-                    )
-                    .when(running, |header| {
+        let mut body = v_flex().size_full().bg(colors.panel_background).child(
+            h_flex()
+                .w_full()
+                .p_1()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(colors.border)
+                .child(Label::new(run.pipeline.clone()).size(LabelSize::Small))
+                .child(
+                    // A fatal message can outrun the header: it
+                    // truncates, shows whole on hover, and copies.
+                    div()
+                        .id("el-run-status")
+                        .min_w_0()
+                        .overflow_hidden()
+                        .when_some(run.fatal.as_ref(), |cell, fatal| {
+                            cell.tooltip(Tooltip::text(super::runs_panel::tooltip_text(fatal)))
+                        })
+                        .child(
+                            Label::new(status)
+                                .size(LabelSize::XSmall)
+                                .color(match (run.finished, &run.fatal) {
+                                    (_, Some(_)) | (Some(false), _) => Color::Error,
+                                    (Some(true), _) => Color::Success,
+                                    _ => Color::Muted,
+                                })
+                                .truncate(),
+                        ),
+                )
+                .children(run.fatal.clone().map(|fatal| {
+                    CopyButton::new("el-run-copy-fatal", fatal)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip_label("Copy error")
+                }))
+                .child(div().flex_1())
+                .when(
+                    !running && run.streams.iter().any(|row| row.error.is_some()),
+                    |header| {
                         header.child(
-                            IconButton::new("el-run-cancel", IconName::Close)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Cancel the run"))
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                            Button::new("el-run-rerun-failed", "Re-run failed")
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(Tooltip::text("Run only the streams that failed"))
+                                .on_click(cx.listener(|this, _, _, cx| this.rerun_failed(cx))),
                         )
-                    }),
-            );
+                    },
+                )
+                .when(running, |header| {
+                    header.child(
+                        IconButton::new("el-run-cancel", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Cancel the run"))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    )
+                }),
+        );
 
         for (ix, row) in run.streams.iter().enumerate() {
             let phase_chip: Option<SharedString> = row
@@ -509,7 +512,9 @@ impl Render for ElRunView {
                 .border_color(colors.border_variant)
                 .child(
                     div().w(px(160.)).flex_shrink_0().child(
-                        Label::new(row.stream.clone()).size(LabelSize::Small).truncate(),
+                        Label::new(row.stream.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
                     ),
                 )
                 .child(
@@ -542,12 +547,10 @@ impl Render for ElRunView {
                         Button::new(("el-run-casts", ix), badge)
                             .label_size(LabelSize::XSmall)
                             .color(Color::Warning)
-                            .tooltip(Tooltip::text(
-                                "Show the failing columns and sample values",
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.show_cast_failures(ix, cx)
-                            })),
+                            .tooltip(Tooltip::text("Show the failing columns and sample values"))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.show_cast_failures(ix, cx)),
+                            ),
                     );
                 }
             }

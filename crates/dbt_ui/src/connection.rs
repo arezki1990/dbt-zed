@@ -131,9 +131,8 @@ pub fn collect(
 ) -> ConnectionInfo {
     let mut notes = Vec::new();
     let project = read_yaml(&root.join("dbt_project.yml"));
-    let project_string = |key: &str| -> Option<String> {
-        project.as_ref()?.get(key)?.as_str().map(str::to_owned)
-    };
+    let project_string =
+        |key: &str| -> Option<String> { project.as_ref()?.get(key)?.as_str().map(str::to_owned) };
 
     let (profiles_path, profiles_source) = profiles_file(settings, resolved_profiles_dir);
     let profiles = profiles_path.as_deref().and_then(read_yaml);

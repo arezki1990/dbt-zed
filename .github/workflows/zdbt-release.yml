@@ -27,18 +27,22 @@ env:
   ZDBT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
-  # The uploads need a release to attach to; create it once, here.
+  # The uploads need a release to attach to; create it once, here. It is
+  # created as a DRAFT: a published release with no assets becomes `latest`
+  # and breaks every /releases/latest/download/ link on the landing page
+  # until the builds finish (~2.5 h). Publish it by hand once SHA256SUMS.txt
+  # is up — ideally after replacing the generated notes with real ones.
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure the GitHub release exists
+      - name: Ensure the GitHub release exists (as a draft)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$ZDBT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$ZDBT_TAG" --repo "$GITHUB_REPOSITORY" \
-                 --title "zdbt $ZDBT_TAG" \
-                 --notes "zdbt — the dbt IDE. macOS dmg, Linux tar.gz, Windows installer."
+                 --draft --generate-notes \
+                 --title "zdbt ${ZDBT_TAG#zdbt-v}"
 
   macos-aarch64:
     needs: release

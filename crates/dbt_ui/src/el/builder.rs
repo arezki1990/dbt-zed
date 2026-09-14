@@ -9,8 +9,8 @@ use indexmap::IndexMap;
 use ui::prelude::*;
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, FileFormat, OracleConn, Pipeline,
-    SnowflakeAuth, SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
+    Connection, Connections, DbConn, DuckdbConn, FileFormat, OracleConn, Pipeline, SnowflakeAuth,
+    SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
 };
 
 use super::canvas_item::ElPipelineCanvas;
@@ -139,17 +139,47 @@ impl BuilderForm {
             BuilderKind::Source => vec![
                 field("stream name", "orders", "", window, cx),
                 field("schema (db sources)", "public", "", window, cx),
-                field("table / path", "orders  ·  or  exports/*.parquet", "", window, cx),
+                field(
+                    "table / path",
+                    "orders  ·  or  exports/*.parquet",
+                    "",
+                    window,
+                    cx,
+                ),
             ],
             BuilderKind::Connection => vec![
                 field("name", "pg_prod", "", window, cx),
-                field("url / path", "${PG_PROD_URL}  ·  or  el/data.duckdb", "", window, cx),
-                field("account (snowflake)", "${SNOWFLAKE_ACCOUNT}", "", window, cx),
+                field(
+                    "url / path",
+                    "${PG_PROD_URL}  ·  or  el/data.duckdb",
+                    "",
+                    window,
+                    cx,
+                ),
+                field(
+                    "account (snowflake)",
+                    "${SNOWFLAKE_ACCOUNT}",
+                    "",
+                    window,
+                    cx,
+                ),
                 field("user (snowflake)", "${SNOWFLAKE_USER}", "", window, cx),
-                field("key path (snowflake)", "${SNOWFLAKE_PK_PATH}", "", window, cx),
+                field(
+                    "key path (snowflake)",
+                    "${SNOWFLAKE_PK_PATH}",
+                    "",
+                    window,
+                    cx,
+                ),
                 field("user (oracle)", "${ORACLE_USER}", "", window, cx),
                 field("password (oracle)", "${ORACLE_PASSWORD}", "", window, cx),
-                field("connect (oracle)", "db.example.com:1521/ORCLPDB1", "", window, cx),
+                field(
+                    "connect (oracle)",
+                    "db.example.com:1521/ORCLPDB1",
+                    "",
+                    window,
+                    cx,
+                ),
             ],
             BuilderKind::Target => {
                 let target = pipeline.map(|pipeline| &pipeline.target);
@@ -321,19 +351,31 @@ impl BuilderForm {
                         if url_or_path.is_empty() {
                             bail!("postgres needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Postgres(DbConn { url: url_or_path, workspace: None, extra: Default::default() })
+                        Connection::Postgres(DbConn {
+                            url: url_or_path,
+                            workspace: None,
+                            extra: Default::default(),
+                        })
                     }
                     ConnType::Mysql => {
                         if url_or_path.is_empty() {
                             bail!("mysql needs a url (use ${{VAR}} for credentials)");
                         }
-                        Connection::Mysql(DbConn { url: url_or_path, workspace: None, extra: Default::default() })
+                        Connection::Mysql(DbConn {
+                            url: url_or_path,
+                            workspace: None,
+                            extra: Default::default(),
+                        })
                     }
                     ConnType::Duckdb => {
                         if url_or_path.is_empty() {
                             bail!("duckdb needs a file path");
                         }
-                        Connection::Duckdb(DuckdbConn { path: url_or_path, workspace: None, extra: Default::default() })
+                        Connection::Duckdb(DuckdbConn {
+                            path: url_or_path,
+                            workspace: None,
+                            extra: Default::default(),
+                        })
                     }
                     ConnType::Oracle => {
                         let user = self.text(5, cx);
@@ -363,7 +405,9 @@ impl BuilderForm {
                             extra: Default::default(),
                         })
                     }
-                    ConnType::Local => Connection::Local { extra: Default::default() },
+                    ConnType::Local => Connection::Local {
+                        extra: Default::default(),
+                    },
                     ConnType::Snowflake => {
                         let account = self.text(2, cx);
                         let user = self.text(3, cx);
@@ -481,9 +525,7 @@ impl BuilderForm {
                 let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
                 let target_kinds = self.kind == BuilderKind::Target;
                 for (name, kind) in &self.connection_names {
-                    if target_kinds
-                        && !matches!(kind.as_ref(), "snowflake" | "duckdb" | "oracle")
-                    {
+                    if target_kinds && !matches!(kind.as_ref(), "snowflake" | "duckdb" | "oracle") {
                         continue;
                     }
                     let name = name.clone();
@@ -515,7 +557,10 @@ impl BuilderForm {
         // Format picker for file sources.
         let list_driven = matches!(
             (&self.kind, &self.tables),
-            (BuilderKind::Source, TablesPick::Loading | TablesPick::Loaded { .. })
+            (
+                BuilderKind::Source,
+                TablesPick::Loading | TablesPick::Loaded { .. }
+            )
         );
         if self.kind == BuilderKind::Source && !list_driven {
             let mut formats = h_flex().w_full().px_2().pt_1().gap_1();
@@ -544,18 +589,22 @@ impl BuilderForm {
             match &self.tables {
                 TablesPick::Manual => {}
                 TablesPick::Loading => {
-                    card = card.child(div().px_2().pt_2().child(
-                        Label::new("Loading tables…")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ));
+                    card = card.child(
+                        div().px_2().pt_2().child(
+                            Label::new("Loading tables…")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    );
                 }
                 TablesPick::Failed(message) => {
-                    card = card.child(div().px_2().pt_2().child(
-                        Label::new(message.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error),
-                    ));
+                    card = card.child(
+                        div().px_2().pt_2().child(
+                            Label::new(message.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        ),
+                    );
                 }
                 TablesPick::Loaded { items, selected } => {
                     let mut list = v_flex()
@@ -570,58 +619,63 @@ impl BuilderForm {
                         .border_color(colors.border);
                     for (ix, (schema, table)) in items.iter().enumerate() {
                         let checked = selected.contains(&ix);
-                        list = list.child(
-                            h_flex()
-                                .id(("el-builder-table", ix))
-                                .w_full()
-                                .px_2()
-                                .py_0p5()
-                                .gap_1()
-                                .items_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(colors.element_hover))
-                                .child(
-                                    Icon::new(if checked {
-                                        IconName::Check
-                                    } else {
-                                        IconName::Circle
-                                    })
-                                    .size(IconSize::XSmall)
-                                    .color(if checked { Color::Accent } else { Color::Muted }),
-                                )
-                                .child(
-                                    Label::new(format!("{schema}.{table}"))
-                                        .size(LabelSize::Small)
-                                        .truncate(),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(form) = this.builder_mut() {
-                                        if let TablesPick::Loaded { selected, .. } =
-                                            &mut form.tables
-                                        {
-                                            if !selected.remove(&ix) {
-                                                selected.insert(ix);
+                        list =
+                            list.child(
+                                h_flex()
+                                    .id(("el-builder-table", ix))
+                                    .w_full()
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_1()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(colors.element_hover))
+                                    .child(
+                                        Icon::new(if checked {
+                                            IconName::Check
+                                        } else {
+                                            IconName::Circle
+                                        })
+                                        .size(IconSize::XSmall)
+                                        .color(if checked { Color::Accent } else { Color::Muted }),
+                                    )
+                                    .child(
+                                        Label::new(format!("{schema}.{table}"))
+                                            .size(LabelSize::Small)
+                                            .truncate(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(form) = this.builder_mut() {
+                                            if let TablesPick::Loaded { selected, .. } =
+                                                &mut form.tables
+                                            {
+                                                if !selected.remove(&ix) {
+                                                    selected.insert(ix);
+                                                }
                                             }
                                         }
-                                    }
-                                    cx.notify();
-                                })),
-                        );
+                                        cx.notify();
+                                    })),
+                            );
                     }
                     let count = selected.len();
                     card = card
-                        .child(div().px_2().pt_2().child(
-                            Label::new("Check tables — each becomes a stream.")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ))
-                        .child(list)
-                        .when(count > 0, |card| {
-                            card.child(div().px_2().pt_1().child(
-                                Label::new(format!("{count} selected"))
+                        .child(
+                            div().px_2().pt_2().child(
+                                Label::new("Check tables — each becomes a stream.")
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
-                            ))
+                            ),
+                        )
+                        .child(list)
+                        .when(count > 0, |card| {
+                            card.child(
+                                div().px_2().pt_1().child(
+                                    Label::new(format!("{count} selected"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            )
                         });
                 }
             }
@@ -704,10 +758,8 @@ impl BuilderForm {
                             _ => "Add".into(),
                         },
                     )
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.apply_builder(window, cx)
-                        })),
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| this.apply_builder(window, cx))),
                 ),
         )
         .into_any_element()

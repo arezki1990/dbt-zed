@@ -114,11 +114,7 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             id: map_id,
             kind: ElNodeKind::Map { stream_ix },
             label: "Cast & Map".into(),
-            sublabel: format!(
-                "{rules} rule{} · {mode}",
-                if rules == 1 { "" } else { "s" },
-            )
-            .into(),
+            sublabel: format!("{rules} rule{} · {mode}", if rules == 1 { "" } else { "s" },).into(),
             x: map_x,
             y: map_y,
             width: NODE_WIDTH,

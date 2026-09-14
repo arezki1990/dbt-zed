@@ -93,9 +93,7 @@ impl ElPipelineCanvas {
         }
         let workspace_handle = cx.entity().downgrade();
         let project = workspace.project().clone();
-        let canvas = cx.new(|cx| {
-            Self::new(workspace_handle, project, project_root, spec_path, cx)
-        });
+        let canvas = cx.new(|cx| Self::new(workspace_handle, project, project_root, spec_path, cx));
         workspace.add_item_to_active_pane(Box::new(canvas), None, true, window, cx);
     }
 
@@ -164,7 +162,11 @@ impl ElPipelineCanvas {
             el_engine::spec::profile_selection_path(&self.project_root),
         ]
         .iter()
-        .filter_map(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+        .filter_map(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
         .max()
     }
 
@@ -357,8 +359,7 @@ impl ElPipelineCanvas {
                                 .size(LabelSize::Small)
                                 .truncate(),
                         ),
-                    )
-                    ,
+                    ),
             )
             .child(
                 div()
@@ -394,8 +395,7 @@ impl ElPipelineCanvas {
                     (left, right)
                 };
                 for edge in &edges {
-                    let (Some(from), Some(to)) = (nodes.get(edge.from), nodes.get(edge.to))
-                    else {
+                    let (Some(from), Some(to)) = (nodes.get(edge.from), nodes.get(edge.to)) else {
                         continue;
                     };
                     let (_, start) = place(from);
@@ -427,11 +427,11 @@ impl ElPipelineCanvas {
             .min_h_0()
             .overflow_hidden()
             .bg(colors.editor_background)
-            .on_drop(cx.listener(
-                |this, dragged: &super::DraggedTable, window, cx| {
+            .on_drop(
+                cx.listener(|this, dragged: &super::DraggedTable, window, cx| {
                     this.drop_table(dragged.clone(), window, cx);
-                },
-            ))
+                }),
+            )
             .drag_over::<super::DraggedTable>(|style, _, _, cx| {
                 style.bg(cx.theme().colors().drop_target_background)
             })
@@ -498,7 +498,9 @@ impl ElPipelineCanvas {
                     this.set_zoom(this.zoom * (1. + delta), cx);
                 } else {
                     let delta = match event.delta {
-                        gpui::ScrollDelta::Pixels(delta) => (f32::from(delta.x), f32::from(delta.y)),
+                        gpui::ScrollDelta::Pixels(delta) => {
+                            (f32::from(delta.x), f32::from(delta.y))
+                        }
                         gpui::ScrollDelta::Lines(delta) => (delta.x * 20., delta.y * 20.),
                     };
                     this.pan.0 += delta.0;
@@ -530,7 +532,9 @@ impl ElPipelineCanvas {
         let (primary, secondary) = match loaded.source_kind {
             Some(kind) if super::browsable(kind) => (
                 "Drag a table from the EL panel to add a stream.".to_owned(),
-                format!("Expand {source} under Connections and drop a table here, or press + Source."),
+                format!(
+                    "Expand {source} under Connections and drop a table here, or press + Source."
+                ),
             ),
             Some(kind) => (
                 "No streams yet — press + Source to add one.".to_owned(),
@@ -552,7 +556,11 @@ impl ElPipelineCanvas {
                     v_flex()
                         .items_center()
                         .gap_1()
-                        .child(Label::new(primary).size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            Label::new(primary)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
                         .child(
                             Label::new(secondary)
                                 .size(LabelSize::XSmall)
@@ -680,9 +688,10 @@ impl ElPipelineCanvas {
             return;
         };
         let run_view = panel.read(cx).run_view();
-        self._run_observers.push(cx.observe(&run_view, |this, _, cx| {
-            this.refresh_run_failures(cx);
-        }));
+        self._run_observers
+            .push(cx.observe(&run_view, |this, _, cx| {
+                this.refresh_run_failures(cx);
+            }));
         self._run_observers.push(cx.observe(&panel, |this, _, cx| {
             this.refresh_run_failures(cx);
         }));
@@ -724,7 +733,9 @@ impl ElPipelineCanvas {
                 (source, failure)
             })
             .collect();
-        let Some(state) = &mut self.mapping else { return };
+        let Some(state) = &mut self.mapping else {
+            return;
+        };
         let changed = state.run_failures.len() != mapped.len()
             || state
                 .run_failures
@@ -831,7 +842,9 @@ impl ElPipelineCanvas {
         self._probe = cx.spawn_in(_window, async move |this, cx| {
             let result = task.await;
             this.update_in(cx, |this, window, cx| {
-                let Some(state) = &mut this.mapping else { return };
+                let Some(state) = &mut this.mapping else {
+                    return;
+                };
                 if state.stream_ix != stream_ix {
                     return;
                 }
@@ -901,7 +914,9 @@ impl ElPipelineCanvas {
     ) {
         let Some(loaded) = &self.loaded else { return };
         let pipeline = loaded.pipeline.clone();
-        let Some(stream) = pipeline.streams.get(stream_ix) else { return };
+        let Some(stream) = pipeline.streams.get(stream_ix) else {
+            return;
+        };
         let stream_name = stream.name.clone();
         let project_root = self.project_root.clone();
         let title: SharedString = if failures_only {
@@ -938,9 +953,7 @@ impl ElPipelineCanvas {
                                 preview
                                     .rows
                                     .iter()
-                                    .map(|row| {
-                                        row.iter().map(|cell| cell.clone().into()).collect()
-                                    })
+                                    .map(|row| row.iter().map(|cell| cell.clone().into()).collect())
                                     .collect(),
                             )
                         };
@@ -1004,7 +1017,12 @@ impl ElPipelineCanvas {
         cx.notify();
     }
 
-    fn set_draft_cast(&mut self, draft_ix: usize, cast: Option<SharedString>, cx: &mut Context<Self>) {
+    fn set_draft_cast(
+        &mut self,
+        draft_ix: usize,
+        cast: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = &mut self.mapping {
             if let Some(draft) = state.drafts.get_mut(draft_ix) {
                 draft.cast = cast;
@@ -1016,10 +1034,17 @@ impl ElPipelineCanvas {
 
     /// Shows what the warehouse holds for one stream: opens the Query view
     /// on the target connection with `SELECT * … LIMIT 200`.
-    fn preview_target_table(&mut self, stream_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn preview_target_table(
+        &mut self,
+        stream_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(loaded) = &self.loaded else { return };
         let pipeline = loaded.pipeline.clone();
-        let Some(stream) = pipeline.streams.get(stream_ix) else { return };
+        let Some(stream) = pipeline.streams.get(stream_ix) else {
+            return;
+        };
         let connection: SharedString = pipeline.target.connection.clone().into();
         let schema = pipeline.target.schema.clone();
         let table = stream.target_table(&pipeline.target);
@@ -1104,7 +1129,9 @@ impl ElPipelineCanvas {
         cx: &mut Context<Self>,
     ) {
         let Some(loaded) = &self.loaded else { return };
-        let Some(stream) = loaded.pipeline.streams.get(stream_ix) else { return };
+        let Some(stream) = loaded.pipeline.streams.get(stream_ix) else {
+            return;
+        };
         let name = stream.name.clone();
         let last = loaded.pipeline.streams.len().saturating_sub(1);
         let entity = cx.entity().downgrade();
@@ -1241,7 +1268,11 @@ impl ElPipelineCanvas {
             return;
         }
         let Some(loaded) = &self.loaded else { return };
-        let Some(stream) = loaded.pipeline.streams.iter().find(|stream| stream.name == name)
+        let Some(stream) = loaded
+            .pipeline
+            .streams
+            .iter()
+            .find(|stream| stream.name == name)
         else {
             return;
         };
@@ -1295,12 +1326,7 @@ impl ElPipelineCanvas {
     }
 
     /// Buffer-routed write of an updated pipeline, then reload.
-    fn write_pipeline(
-        &mut self,
-        pipeline: Pipeline,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn write_pipeline(&mut self, pipeline: Pipeline, window: &mut Window, cx: &mut Context<Self>) {
         self.write_pipeline_then(pipeline, window, cx, |_, _| {});
     }
 
@@ -1350,7 +1376,11 @@ impl ElPipelineCanvas {
         cx: &mut Context<Self>,
     ) {
         let Some(state) = &self.mapping else { return };
-        let names: Vec<SharedString> = state.drafts.iter().map(|draft| draft.name.clone()).collect();
+        let names: Vec<SharedString> = state
+            .drafts
+            .iter()
+            .map(|draft| draft.name.clone())
+            .collect();
         let entity = cx.entity().downgrade();
         let menu = ui::ContextMenu::build(window, cx, |mut menu, _, _| {
             for name in names {
@@ -1396,7 +1426,13 @@ impl ElPipelineCanvas {
             .unwrap_or(0);
         let stream_ix = self.mapping_stream_ix().unwrap_or(state.stream_ix);
 
-        let mut rows = v_flex().id("el-map-rows").flex_1().min_h_0().overflow_y_scroll().gap_0p5().p_1();
+        let mut rows = v_flex()
+            .id("el-map-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .gap_0p5()
+            .p_1();
         for (draft_ix, draft) in state.drafts.iter().enumerate() {
             let include = draft.include;
             let strict = draft.strict;
@@ -1459,20 +1495,27 @@ impl ElPipelineCanvas {
                         .size(IconSize::XSmall)
                         .color(Color::Muted),
                 )
-                .child(div().w(px(100.)).flex_shrink_0().child(draft.rename.clone()))
+                .child(
+                    div()
+                        .w(px(100.))
+                        .flex_shrink_0()
+                        .child(draft.rename.clone()),
+                )
                 .child(
                     Button::new(
                         ("el-type", draft_ix),
                         draft.cast.clone().unwrap_or_else(|| "inherit".into()),
                     )
                     .label_size(LabelSize::XSmall)
-                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                        let position = match event {
-                            gpui::ClickEvent::Mouse(event) => event.up.position,
-                            _ => Point::default(),
-                        };
-                        this.deploy_type_menu(draft_ix, position, window, cx);
-                    })),
+                    .on_click(cx.listener(
+                        move |this, event: &gpui::ClickEvent, window, cx| {
+                            let position = match event {
+                                gpui::ClickEvent::Mouse(event) => event.up.position,
+                                _ => Point::default(),
+                            };
+                            this.deploy_type_menu(draft_ix, position, window, cx);
+                        },
+                    )),
                 )
                 .child(
                     IconButton::new(("el-strict", draft_ix), IconName::Warning)
@@ -1506,9 +1549,9 @@ impl ElPipelineCanvas {
                             "{} rows failed to cast in the last run{samples}",
                             failure.count
                         )))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_run_failures(window, cx)
-                        }))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.show_run_failures(window, cx)),
+                        )
                 }));
             rows = rows.child(row);
         }
@@ -1549,7 +1592,11 @@ impl ElPipelineCanvas {
                             state.stream_name.to_string()
                         })
                         .size(LabelSize::Small)
-                        .color(if state.dirty { Color::Modified } else { Color::Default }),
+                        .color(if state.dirty {
+                            Color::Modified
+                        } else {
+                            Color::Default
+                        }),
                     )
                     .child(
                         IconButton::new("el-map-next", IconName::ChevronRight)
@@ -1616,10 +1663,7 @@ impl ElPipelineCanvas {
                                     .label_size(LabelSize::XSmall)
                                     .toggle_state(mode == Mode::FullRefresh)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_sync_mode(
-                                            el_engine::spec::Mode::FullRefresh,
-                                            cx,
-                                        );
+                                        this.set_sync_mode(el_engine::spec::Mode::FullRefresh, cx);
                                     })),
                             )
                             .child(
@@ -1628,10 +1672,7 @@ impl ElPipelineCanvas {
                                     .toggle_state(mode == Mode::Incremental)
                                     .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_sync_mode(
-                                            el_engine::spec::Mode::Incremental,
-                                            cx,
-                                        );
+                                        this.set_sync_mode(el_engine::spec::Mode::Incremental, cx);
                                     })),
                             ),
                     )
@@ -1658,9 +1699,7 @@ impl ElPipelineCanvas {
                                                     }
                                                     _ => Point::default(),
                                                 };
-                                                this.deploy_sync_menu(
-                                                    false, position, window, cx,
-                                                );
+                                                this.deploy_sync_menu(false, position, window, cx);
                                             },
                                         )),
                                 )
@@ -1679,9 +1718,7 @@ impl ElPipelineCanvas {
                                                     }
                                                     _ => Point::default(),
                                                 };
-                                                this.deploy_sync_menu(
-                                                    true, position, window, cx,
-                                                );
+                                                this.deploy_sync_menu(true, position, window, cx);
                                             },
                                         )),
                                 ),
@@ -1690,12 +1727,16 @@ impl ElPipelineCanvas {
             })
             .children(state.sync_warning().map(|warning| {
                 div().px_2().pb_1().child(
-                    Label::new(warning).size(LabelSize::XSmall).color(Color::Warning),
+                    Label::new(warning)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
                 )
             }))
             .children(state.probe_error.clone().map(|error| {
                 div().px_2().py_1().child(
-                    Label::new(error).size(LabelSize::XSmall).color(Color::Warning),
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
                 )
             }))
             .child(rows)
@@ -1774,9 +1815,9 @@ impl ElPipelineCanvas {
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Filled)
                             .disabled(!state.dirty)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.apply_mapping(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.apply_mapping(window, cx)),
+                            ),
                     ),
             )
             .into_any_element()
@@ -1837,7 +1878,10 @@ impl ElPipelineCanvas {
             return;
         };
         if self.run_in_progress(cx) {
-            self.toast_error("A run is already in progress — see the EL console.".into(), cx);
+            self.toast_error(
+                "A run is already in progress — see the EL console.".into(),
+                cx,
+            );
             return;
         }
         let pipeline = loaded.pipeline.clone();
@@ -1890,7 +1934,9 @@ impl ElPipelineCanvas {
                     .as_ref()
                     .map(|loaded| loaded.pipeline.source.clone())
             });
-        let Some(connection_name) = connection_name else { return };
+        let Some(connection_name) = connection_name else {
+            return;
+        };
         let kind = loaded_connections(&self.project_root)
             .and_then(|connections| {
                 connections
@@ -1909,8 +1955,7 @@ impl ElPipelineCanvas {
             form.tables = super::builder::TablesPick::Loading;
         }
         let root = self.project_root.clone();
-        let task =
-            cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
+        let task = cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
         self._tables = cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -1967,15 +2012,17 @@ impl ElPipelineCanvas {
         } else {
             loaded_connections(&self.project_root)
         };
-        let pipeline = self.loaded.as_ref().map(|loaded| (*loaded.pipeline).clone());
+        let pipeline = self
+            .loaded
+            .as_ref()
+            .map(|loaded| (*loaded.pipeline).clone());
         match form.build(pipeline, connections, cx) {
             Err(error) => self.toast(format!("{error:#}"), cx),
             Ok(outcome) => {
                 let workspace = self.workspace.clone();
                 let project = self.project.clone();
                 let spec_path = self.spec_path.clone();
-                let connections_path =
-                    super::el_dir(&self.project_root).join("connections.yml");
+                let connections_path = super::el_dir(&self.project_root).join("connections.yml");
                 self.builder = None;
                 self._write = cx.spawn_in(window, async move |this, cx| {
                     let mut result = Ok(());
@@ -2024,7 +2071,12 @@ impl Item for ElPipelineCanvas {
         format!("Pipeline: {}", self.pipeline_name()).into()
     }
 
-    fn tab_content(&self, params: TabContentParams, _window: &Window, _cx: &App) -> gpui::AnyElement {
+    fn tab_content(
+        &self,
+        params: TabContentParams,
+        _window: &Window,
+        _cx: &App,
+    ) -> gpui::AnyElement {
         h_flex()
             .gap_1()
             .child(Icon::new(IconName::ArrowRightLeft).color(Color::Muted))
@@ -2061,11 +2113,13 @@ impl Render for ElPipelineCanvas {
         let run_tooltip: SharedString = match (&blocker, running) {
             (Some(blocker), _) => blocker.clone().into(),
             (None, true) => "A run is in progress — see the EL console".into(),
-            (None, false) => if cfg!(target_os = "macos") {
-                "Run pipeline (⌘⏎)".into()
-            } else {
-                "Run pipeline (ctrl-enter)".into()
-            },
+            (None, false) => {
+                if cfg!(target_os = "macos") {
+                    "Run pipeline (⌘⏎)".into()
+                } else {
+                    "Run pipeline (ctrl-enter)".into()
+                }
+            }
         };
         let deploy_blocked = self.parse_error.is_some() || self.loaded.is_none();
         let deploy_tooltip: SharedString = match &self.parse_error {
@@ -2262,8 +2316,9 @@ impl Render for ElPipelineCanvas {
                             .color(Color::Error),
                     )
                     .child(
-                        Button::new("el-open-broken-yaml", "Open YAML")
-                            .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx))),
+                        Button::new("el-open-broken-yaml", "Open YAML").on_click(
+                            cx.listener(|this, _, window, cx| this.open_yaml(window, cx)),
+                        ),
                     ),
             )
         } else if self.loaded.is_none() {

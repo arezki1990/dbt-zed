@@ -10,8 +10,8 @@ use std::time::SystemTime;
 use editor::Editor;
 use gpui::{
     App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, MouseButton, Pixels, Point, Subscription, Task, UniformListScrollHandle,
-    WeakEntity, Window, anchored, deferred, px,
+    FocusHandle, Focusable, MouseButton, Pixels, Point, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, anchored, deferred, px,
 };
 use settings::Settings as _;
 use ui::{ContextMenu, WithScrollbar, prelude::*};
@@ -161,14 +161,11 @@ impl DbtDatabasePanel {
                 editor.set_placeholder_text("Filter relations and columns…", window, cx);
                 editor
             });
-            cx.subscribe(
-                &filter_editor,
-                |_, _, event: &editor::EditorEvent, cx| {
-                    if matches!(event, editor::EditorEvent::BufferEdited) {
-                        cx.notify();
-                    }
-                },
-            )
+            cx.subscribe(&filter_editor, |_, _, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    cx.notify();
+                }
+            })
             .detach();
 
             Self {
@@ -269,8 +266,9 @@ impl DbtDatabasePanel {
                 depth: 0,
                 key: None,
                 expanded: false,
-                label: "No target/catalog.json — run `dbt compile --write-catalog` for column types."
-                    .into(),
+                label:
+                    "No target/catalog.json — run `dbt compile --write-catalog` for column types."
+                        .into(),
                 detail: None,
                 action: RowAction::Note,
             });
@@ -284,10 +282,12 @@ impl DbtDatabasePanel {
                 let schema_key = node_key(&[db.name.as_ref(), schema.name.as_ref()]);
                 let mut schema_rows = Vec::new();
                 for relation in &schema.relations {
-                    let rel_key =
-                        node_key(&[db.name.as_ref(), schema.name.as_ref(), relation.name.as_ref()]);
-                    let name_match =
-                        filtering && relation.name.to_lowercase().contains(&query);
+                    let rel_key = node_key(&[
+                        db.name.as_ref(),
+                        schema.name.as_ref(),
+                        relation.name.as_ref(),
+                    ]);
+                    let name_match = filtering && relation.name.to_lowercase().contains(&query);
                     let matching_columns: Vec<&crate::database::DbColumn> = match &relation.columns
                     {
                         ColumnState::Known(cols) if filtering && !name_match => cols
@@ -340,7 +340,8 @@ impl DbtDatabasePanel {
                                         cols.iter().collect()
                                     };
                                 for col in iter {
-                                    let mut detail = col.data_type.as_deref().map(str::to_lowercase);
+                                    let mut detail =
+                                        col.data_type.as_deref().map(str::to_lowercase);
                                     if let (Some(text), Some(_)) = (&mut detail, &col.description) {
                                         text.push_str(" · doc");
                                     }
@@ -360,8 +361,7 @@ impl DbtDatabasePanel {
                                 depth: 3,
                                 key: None,
                                 expanded: false,
-                                label: "columns unknown — run `dbt compile --write-catalog`"
-                                    .into(),
+                                label: "columns unknown — run `dbt compile --write-catalog`".into(),
                                 detail: None,
                                 action: RowAction::Note,
                             }),
@@ -435,7 +435,12 @@ impl DbtDatabasePanel {
             .ok();
     }
 
-    fn open_relation_file(&mut self, rel_path: &std::path::Path, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_relation_file(
+        &mut self,
+        rel_path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -551,11 +556,7 @@ impl DbtDatabasePanel {
             RowAction::Note => (Some(IconName::Info), Color::Muted),
         };
         if let Some(icon) = icon {
-            item = item.child(
-                Icon::new(icon)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            );
+            item = item.child(Icon::new(icon).size(IconSize::Small).color(Color::Muted));
         }
         item = item.child(
             div().min_w_0().flex_1().child(
@@ -578,9 +579,9 @@ impl DbtDatabasePanel {
         match &row.action {
             RowAction::Toggle => {
                 if let Some(key) = row.key.clone() {
-                    item = item.cursor_pointer().on_click(cx.listener(
-                        move |this, _, _, cx| this.toggle(key.clone(), cx),
-                    ));
+                    item = item
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle(key.clone(), cx)));
                 }
             }
             RowAction::Relation(relation) => {
@@ -602,31 +603,30 @@ impl DbtDatabasePanel {
             RowAction::Column { name } => {
                 let name = name.clone();
                 item = item.on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            let name = name.clone();
-                            let menu = ContextMenu::build(window, cx, |menu, _, _| {
-                                menu.context(this.focus_handle.clone()).entry(
-                                    "Copy column name",
-                                    None,
-                                    move |_, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            name.to_string(),
-                                        ));
-                                    },
-                                )
-                            });
-                            window.focus(&menu.focus_handle(cx), cx);
-                            let subscription =
-                                cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
-                                    this.context_menu.take();
-                                    cx.notify();
-                                });
-                            this.context_menu = Some((menu, event.position, subscription));
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let name = name.clone();
+                        let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.context(this.focus_handle.clone()).entry(
+                                "Copy column name",
+                                None,
+                                move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        name.to_string(),
+                                    ));
+                                },
+                            )
+                        });
+                        window.focus(&menu.focus_handle(cx), cx);
+                        let subscription = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+                            this.context_menu.take();
                             cx.notify();
-                        }),
-                    );
+                        });
+                        this.context_menu = Some((menu, event.position, subscription));
+                        cx.notify();
+                    }),
+                );
             }
             RowAction::Note => {}
         }
@@ -713,9 +713,7 @@ impl Render for DbtDatabasePanel {
             move |range, _window, cx| {
                 entity.update(cx, |this, cx| {
                     range
-                        .filter_map(|ix| {
-                            rows.get(ix).map(|row| this.render_row(row, ix, cx))
-                        })
+                        .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, ix, cx)))
                         .collect::<Vec<_>>()
                 })
             }
@@ -792,9 +790,11 @@ impl Render for DbtDatabasePanel {
             );
         } else if let Some(error) = &self.load_error {
             body = body.child(
-                div()
-                    .p_2()
-                    .child(Label::new(error.clone()).size(LabelSize::Small).color(Color::Warning)),
+                div().p_2().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                ),
             );
         } else if self.catalog.is_none() {
             let message: SharedString = if self.loading {
@@ -806,14 +806,18 @@ impl Render for DbtDatabasePanel {
             };
             body = body.child(
                 v_flex().flex_1().items_center().justify_center().child(
-                    Label::new(message).size(LabelSize::Small).color(Color::Muted),
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 ),
             );
         } else {
             drop(list);
             body = body.child(
                 v_flex().flex_1().items_center().justify_center().child(
-                    Label::new("No matches.").size(LabelSize::Small).color(Color::Muted),
+                    Label::new("No matches.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 ),
             );
         }

@@ -179,12 +179,7 @@ const REMOTE_LOG_CAP: usize = 400;
 /// Appends one daemon log line, ignoring anything already held. Returns
 /// whether the buffer changed — the log editor is only rebuilt when it
 /// did.
-fn append_log(
-    logs: &mut Vec<SharedString>,
-    next: &mut u64,
-    seq: u64,
-    line: String,
-) -> bool {
+fn append_log(logs: &mut Vec<SharedString>, next: &mut u64, seq: u64, line: String) -> bool {
     if seq < *next {
         return false;
     }
@@ -450,9 +445,7 @@ impl ElRunsPanel {
                 };
                 sql.update(cx, |editor, cx| {
                     if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
-                        buffer.update(cx, |buffer, cx| {
-                            buffer.set_language(Some(language), cx)
-                        });
+                        buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
                     }
                 });
             })
@@ -678,15 +671,25 @@ impl ElRunsPanel {
                     .collect()
             })
             .unwrap_or_default();
-        if self.selected.map_or(true, |ix| ix >= self.connections.len()) {
+        if self
+            .selected
+            .map_or(true, |ix| ix >= self.connections.len())
+        {
             self.selected = (!self.connections.is_empty()).then_some(0);
         }
-        self.remotes = el_engine::spec::load_remotes(
-            &super::el_dir(&root).join("remotes.yml"),
-        )
-        .map(|remotes| remotes.remotes.keys().map(|name| name.clone().into()).collect())
-        .unwrap_or_default();
-        if self.selected_remote.map_or(true, |ix| ix >= self.remotes.len()) {
+        self.remotes = el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
+            .map(|remotes| {
+                remotes
+                    .remotes
+                    .keys()
+                    .map(|name| name.clone().into())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self
+            .selected_remote
+            .map_or(true, |ix| ix >= self.remotes.len())
+        {
             self.selected_remote = (!self.remotes.is_empty()).then_some(0);
         }
     }
@@ -711,7 +714,9 @@ impl ElRunsPanel {
         self.remote_logs.clear();
         self.remote_log_next = 0;
         let epoch = self.remote_epoch;
-        let Some((root, name)) = self.remote_target() else { return };
+        let Some((root, name)) = self.remote_target() else {
+            return;
+        };
 
         let (sender, mut receiver) = futures::channel::mpsc::unbounded();
         // A real thread, not a background_spawn: `next` blocks, and this
@@ -818,12 +823,8 @@ impl ElRunsPanel {
                 self.remote_detail_pending = false;
             }
             Message::Log { seq, line } => {
-                self.remote_logs_dirty |= append_log(
-                    &mut self.remote_logs,
-                    &mut self.remote_log_next,
-                    seq,
-                    line,
-                );
+                self.remote_logs_dirty |=
+                    append_log(&mut self.remote_logs, &mut self.remote_log_next, seq, line);
             }
             // Proof of life, the opening handshake, and the two frames
             // that only tell the client what is about to arrive anyway.
@@ -839,12 +840,12 @@ impl ElRunsPanel {
     /// that finished before we attached is history the socket does not
     /// carry, so fetch it once from the JSON API.
     fn ensure_run_events(&mut self, run_id: u64, cx: &mut Context<Self>) {
-        if self.remote_run_events.contains_key(&run_id)
-            || self.remote_history_for == Some(run_id)
-        {
+        if self.remote_run_events.contains_key(&run_id) || self.remote_history_for == Some(run_id) {
             return;
         }
-        let Some((root, name)) = self.remote_target() else { return };
+        let Some((root, name)) = self.remote_target() else {
+            return;
+        };
         self.remote_history_for = Some(run_id);
         self._remote_history = cx.spawn(async move |this, cx| {
             let page = cx
@@ -872,7 +873,9 @@ impl ElRunsPanel {
     /// Whether the status socket is attached, as opposed to falling back
     /// to polling or not being connected at all.
     fn remote_is_live(&self) -> bool {
-        self.remote_status.as_ref().is_some_and(|status| status.live)
+        self.remote_status
+            .as_ref()
+            .is_some_and(|status| status.live)
     }
 
     /// One run's progress, empty when neither the socket nor a history
@@ -923,7 +926,9 @@ impl ElRunsPanel {
         self.remote_logs.clear();
         self.remote_log_next = 0;
         let epoch = self.remote_epoch;
-        let Some((root, name)) = self.remote_target() else { return };
+        let Some((root, name)) = self.remote_target() else {
+            return;
+        };
         self._remote_poll = cx.spawn(async move |this, cx| {
             let mut log_cursor = 0u64;
             loop {
@@ -933,11 +938,7 @@ impl ElRunsPanel {
                 let watched_run = this
                     .read_with(cx, |this, _| {
                         this.remote_run_detail.map(|id| {
-                            let held = this
-                                .remote_run_events
-                                .get(&id)
-                                .map(Vec::len)
-                                .unwrap_or(0);
+                            let held = this.remote_run_events.get(&id).map(Vec::len).unwrap_or(0);
                             (id, held)
                         })
                     })
@@ -951,9 +952,10 @@ impl ElRunsPanel {
                         let health = client.health().ok();
                         let logs = client.logs(since).ok();
                         let run_events = match watched_run {
-                            Some((run_id, cursor)) => {
-                                client.events(run_id, cursor).ok().map(|page| (run_id, page))
-                            }
+                            Some((run_id, cursor)) => client
+                                .events(run_id, cursor)
+                                .ok()
+                                .map(|page| (run_id, page)),
                             None => None,
                         };
                         anyhow::Ok((pipelines, runs, health, logs, run_events))
@@ -1010,10 +1012,8 @@ impl ElRunsPanel {
                                     }
                                     this.remote_logs
                                         .extend(lines.into_iter().map(SharedString::from));
-                                    let overflow = this
-                                        .remote_logs
-                                        .len()
-                                        .saturating_sub(REMOTE_LOG_CAP);
+                                    let overflow =
+                                        this.remote_logs.len().saturating_sub(REMOTE_LOG_CAP);
                                     if overflow > 0 {
                                         this.remote_logs.drain(..overflow);
                                     }
@@ -1031,9 +1031,7 @@ impl ElRunsPanel {
                 if !keep_going {
                     return;
                 }
-                cx.background_executor()
-                    .timer(Duration::from_secs(2))
-                    .await;
+                cx.background_executor().timer(Duration::from_secs(2)).await;
             }
         });
     }
@@ -1041,12 +1039,12 @@ impl ElRunsPanel {
     /// Fire-and-refresh action against the selected remote.
     fn remote_action(
         &mut self,
-        action: impl FnOnce(&el_engine::server::RemoteClient) -> anyhow::Result<()>
-            + Send
-            + 'static,
+        action: impl FnOnce(&el_engine::server::RemoteClient) -> anyhow::Result<()> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let Some(name) = self
             .selected_remote
             .and_then(|ix| self.remotes.get(ix))
@@ -1086,7 +1084,10 @@ impl ElRunsPanel {
         }
         self.query_error = None;
         let Some(root) = self.root.clone() else {
-            self.query_error = Some("No EL project in this workspace — open one or run el: initialize workspace.".into());
+            self.query_error = Some(
+                "No EL project in this workspace — open one or run el: initialize workspace."
+                    .into(),
+            );
             cx.notify();
             return;
         };
@@ -1150,7 +1151,11 @@ impl ElRunsPanel {
                 .gap_1()
                 .items_center()
                 .child(Label::new("on").size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(name.clone()).size(LabelSize::Default).color(Color::Accent))
+                .child(
+                    Label::new(name.clone())
+                        .size(LabelSize::Default)
+                        .color(Color::Accent),
+                )
                 .child(
                     Label::new(kind.clone())
                         .size(LabelSize::XSmall)
@@ -1185,7 +1190,9 @@ impl ElRunsPanel {
             .child(target)
             .child(div().flex_1())
             .children(status.map(|status| {
-                Label::new(status).size(LabelSize::XSmall).color(Color::Muted)
+                Label::new(status)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
             }))
             .child(
                 Button::new("el-query-run", "Run query")
@@ -1196,20 +1203,17 @@ impl ElRunsPanel {
             );
 
         let dragging = self.query_split_drag.is_some();
-        let editor = div()
-            .w_full()
-            .px_1()
-            .child(
-                div()
-                    .w_full()
-                    .h(px(self.query_split))
-                    .p_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(colors.border)
-                    .bg(colors.editor_background)
-                    .child(self.sql.clone()),
-            );
+        let editor = div().w_full().px_1().child(
+            div()
+                .w_full()
+                .h(px(self.query_split))
+                .p_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .child(self.sql.clone()),
+        );
         let splitter = div()
             .id("el-query-split")
             .w_full()
@@ -1218,7 +1222,11 @@ impl ElRunsPanel {
             .flex_shrink_0()
             .cursor(gpui::CursorStyle::ResizeRow)
             .border_t_1()
-            .border_color(if dragging { colors.border_focused } else { colors.border })
+            .border_color(if dragging {
+                colors.border_focused
+            } else {
+                colors.border
+            })
             .hover(|style| style.border_color(colors.border_focused))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -1240,7 +1248,12 @@ impl ElRunsPanel {
                 )
                 .into_any_element()
         } else if let Some(result) = &self.result {
-            render_grid(result, &self.result_scroll, "el-query-grid", cx.theme().colors().element_background)
+            render_grid(
+                result,
+                &self.result_scroll,
+                "el-query-grid",
+                cx.theme().colors().element_background,
+            )
         } else if self.connections.is_empty() {
             v_flex()
                 .flex_1()
@@ -1278,11 +1291,7 @@ impl ElRunsPanel {
 }
 
 impl ElRunsPanel {
-    fn render_remote(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
         if self.remote_logs_dirty {
             self.remote_logs_dirty = false;
@@ -1330,13 +1339,19 @@ impl ElRunsPanel {
             .child(chips)
             .child(div().flex_1())
             .children(self.remote_status_label().map(|status| {
-                Label::new(status).size(LabelSize::XSmall).color(Color::Success)
+                Label::new(status)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Success)
             }))
             .children(self.remote_error.clone().map(|error| {
-                Label::new(error).size(LabelSize::XSmall).color(Color::Error)
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
             }))
             .children(self.remote_action_error.clone().map(|error| {
-                Label::new(error).size(LabelSize::XSmall).color(Color::Error)
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
             }))
             .child(
                 Button::new("el-remote-logs", "Logs")
@@ -1395,7 +1410,11 @@ impl ElRunsPanel {
                 .child(log_pane)
                 .into_any_element();
         }
-        v_flex().size_full().child(toolbar).child(body).into_any_element()
+        v_flex()
+            .size_full()
+            .child(toolbar)
+            .child(body)
+            .into_any_element()
     }
 
     /// The overview: pipelines as a striped table (click a row for its
@@ -1405,7 +1424,9 @@ impl ElRunsPanel {
         let colors = &colors;
         let head = |width: f32, text: &'static str| {
             div().w(px(width)).flex_shrink_0().child(
-                Label::new(text).size(LabelSize::XSmall).color(Color::Accent),
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
             )
         };
         let pipeline_header = h_flex()
@@ -1427,7 +1448,10 @@ impl ElRunsPanel {
             let run_name = pipeline.name.clone();
             let cell = |width: f32, text: String, color: Color| {
                 div().w(px(width)).flex_shrink_0().overflow_hidden().child(
-                    Label::new(text).size(LabelSize::XSmall).color(color).truncate(),
+                    Label::new(text)
+                        .size(LabelSize::XSmall)
+                        .color(color)
+                        .truncate(),
                 )
             };
             let open_name = name.clone();
@@ -1474,10 +1498,7 @@ impl ElRunsPanel {
                     .child(tip_cell(
                         cell_id("profile"),
                         70.,
-                        pipeline
-                            .profile
-                            .clone()
-                            .unwrap_or_else(|| "default".into()),
+                        pipeline.profile.clone().unwrap_or_else(|| "default".into()),
                         if pipeline.profile.is_some() {
                             Color::Accent
                         } else {
@@ -1510,8 +1531,16 @@ impl ElRunsPanel {
                     ))
                     .child(cell(
                         60.,
-                        if pipeline.running { "running".into() } else { "idle".into() },
-                        if pipeline.running { Color::Accent } else { Color::Muted },
+                        if pipeline.running {
+                            "running".into()
+                        } else {
+                            "idle".into()
+                        },
+                        if pipeline.running {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
                     ))
                     .child(div().flex_1())
                     .child(
@@ -1538,8 +1567,7 @@ impl ElRunsPanel {
                 flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                     if let Some((start_y, start_split)) = this.remote_split_drag {
                         this.remote_split =
-                            (start_split + f32::from(event.position.y) - start_y)
-                                .clamp(56., 480.);
+                            (start_split + f32::from(event.position.y) - start_y).clamp(56., 480.);
                         cx.notify();
                     }
                 }))
@@ -1576,7 +1604,11 @@ impl ElRunsPanel {
                     .flex_shrink_0()
                     .cursor(gpui::CursorStyle::ResizeRow)
                     .border_t_1()
-                    .border_color(if dragging { colors.border_focused } else { colors.border })
+                    .border_color(if dragging {
+                        colors.border_focused
+                    } else {
+                        colors.border
+                    })
                     .hover(|style| style.border_color(colors.border_focused))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -1670,7 +1702,9 @@ impl ElRunsPanel {
             .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted))
             .child(div().flex_1())
             .children(running.then(|| {
-                Label::new("running").size(LabelSize::XSmall).color(Color::Accent)
+                Label::new("running")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent)
             }))
             .child(
                 Button::new("el-remote-detail-run", "Run")
@@ -1679,10 +1713,7 @@ impl ElRunsPanel {
                     .disabled(running || pipeline.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let name = run_name.clone();
-                        this.remote_action(
-                            move |client| client.start_run(&name).map(|_| ()),
-                            cx,
-                        );
+                        this.remote_action(move |client| client.start_run(&name).map(|_| ()), cx);
                     })),
             );
 
@@ -1711,7 +1742,9 @@ impl ElRunsPanel {
         let colors = cx.theme().colors().clone();
         let run = self.remote_runs.iter().find(|run| run.id == run_id);
         let is_running = run.is_some_and(|run| run.status == "running");
-        let status = run.map(|run| run.status.clone()).unwrap_or_else(|| "?".into());
+        let status = run
+            .map(|run| run.status.clone())
+            .unwrap_or_else(|| "?".into());
         let status_color = match status.as_str() {
             "ok" => Color::Success,
             "failed" => Color::Error,
@@ -1761,8 +1794,16 @@ impl ElRunsPanel {
                 ))
                 .size(LabelSize::Default),
             )
-            .child(Label::new(status).size(LabelSize::XSmall).color(status_color))
-            .child(Label::new(facts).size(LabelSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(status)
+                    .size(LabelSize::XSmall)
+                    .color(status_color),
+            )
+            .child(
+                Label::new(facts)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             .child(div().flex_1())
             .children(is_running.then(|| {
                 Button::new("el-run-detail-cancel", "Cancel")
@@ -1812,7 +1853,9 @@ impl ElRunsPanel {
 
         let head = |width: f32, text: &'static str| {
             div().w(px(width)).flex_shrink_0().child(
-                Label::new(text).size(LabelSize::XSmall).color(Color::Accent),
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
             )
         };
         let stream_header = h_flex()
@@ -1825,7 +1868,9 @@ impl ElRunsPanel {
             .child(head(90., "rows written"))
             .child(head(80., "cast fails"))
             .child(
-                Label::new("status").size(LabelSize::XSmall).color(Color::Accent),
+                Label::new("status")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
             );
         let mut rows = v_flex()
             .id("el-run-streams")
@@ -1834,15 +1879,20 @@ impl ElRunsPanel {
             .overflow_y_scroll()
             .px_1();
         if order.is_empty() {
-            rows = rows.child(div().px_1().py_1().child(
-                Label::new("Waiting for the run's events…")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ));
+            rows = rows.child(
+                div().px_1().py_1().child(
+                    Label::new("Waiting for the run's events…")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
         }
         let cell = |width: f32, text: String, color: Color| {
             div().w(px(width)).flex_shrink_0().overflow_hidden().child(
-                Label::new(text).size(LabelSize::XSmall).color(color).truncate(),
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(color)
+                    .truncate(),
             )
         };
         for (ix, stream) in order.iter().enumerate() {
@@ -1878,12 +1928,7 @@ impl ElRunsPanel {
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let (columns, rows) = failures_table(&failures);
-                                this.show_preview(
-                                    failures_title(&stream_name),
-                                    columns,
-                                    rows,
-                                    cx,
-                                );
+                                this.show_preview(failures_title(&stream_name), columns, rows, cx);
                             })),
                     )
                     .into_any_element()
@@ -1928,12 +1973,13 @@ impl ElRunsPanel {
                     .items_center()
                     .rounded_sm()
                     .when(ix % 2 == 1, |row| row.bg(colors.element_background))
-                    .child(tip_cell(cell_id("name"), 150., stream.clone(), Color::Default))
-                    .child(cell(
-                        80.,
-                        phase.unwrap_or_else(|| "—".into()),
-                        Color::Muted,
+                    .child(tip_cell(
+                        cell_id("name"),
+                        150.,
+                        stream.clone(),
+                        Color::Default,
                     ))
+                    .child(cell(80., phase.unwrap_or_else(|| "—".into()), Color::Muted))
                     .child(cell(90., read.to_string(), Color::Muted))
                     .child(cell(90., written.to_string(), Color::Default))
                     .child(casts_cell)
@@ -1975,7 +2021,11 @@ impl ElRunsPanel {
         let colors = cx.theme().colors().clone();
         let colors = &colors;
         let col = |width: f32, element: gpui::AnyElement| {
-            div().w(px(width)).flex_shrink_0().overflow_hidden().child(element)
+            div()
+                .w(px(width))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(element)
         };
         let head = |width: f32, text: &'static str| {
             col(
@@ -2145,11 +2195,13 @@ impl ElRunsPanel {
             );
         }
         if shown == 0 {
-            runs = runs.child(div().px_1().py_1().child(
-                Label::new("No runs yet — press Run above.")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ));
+            runs = runs.child(
+                div().px_1().py_1().child(
+                    Label::new("No runs yet — press Run above.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
         }
         v_flex()
             .flex_1()
@@ -2180,7 +2232,11 @@ pub(crate) fn relative_time(unix: u64, future: bool) -> String {
     } else {
         format!("{delta}s")
     };
-    if future { format!("in {text}") } else { format!("{text} ago") }
+    if future {
+        format!("in {text}")
+    } else {
+        format!("{text} ago")
+    }
 }
 
 fn duration_text(started: u64, finished: Option<u64>) -> String {
@@ -2220,8 +2276,15 @@ fn tip_text(
     div()
         .id(id)
         .overflow_hidden()
-        .when(!text.is_empty(), move |cell| cell.tooltip(ui::Tooltip::text(tip)))
-        .child(Label::new(text).size(LabelSize::XSmall).color(color).truncate())
+        .when(!text.is_empty(), move |cell| {
+            cell.tooltip(ui::Tooltip::text(tip))
+        })
+        .child(
+            Label::new(text)
+                .size(LabelSize::XSmall)
+                .color(color)
+                .truncate(),
+        )
 }
 
 /// [`tip_text`] at a fixed column width.
@@ -2246,37 +2309,41 @@ fn render_grid(
     let columns = table.columns.clone();
     let rows = table.rows.clone();
     let total = px(columns.len() as f32 * COL_WIDTH);
-    let header = h_flex().w(total).flex_shrink_0().children(columns.iter().map(|column| {
-        div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
-            Label::new(column.clone())
-                .size(LabelSize::XSmall)
-                .color(Color::Accent)
-                .truncate(),
-        )
-    }));
+    let header = h_flex()
+        .w(total)
+        .flex_shrink_0()
+        .children(columns.iter().map(|column| {
+            div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
+                Label::new(column.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent)
+                    .truncate(),
+            )
+        }));
     let count = rows.len();
-    let list = gpui::uniform_list(list_id, count, {
-        move |range, _, _| {
-            range
-                .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
-                .map(|(ix, row)| {
-                    h_flex()
-                        .w(total)
-                        .h(px(24.))
-                        .flex_shrink_0()
-                        .when(ix % 2 == 1, |row| row.bg(stripe))
-                        .children(row.iter().map(|cell| {
-                            div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
-                                Label::new(cell.clone()).size(LabelSize::XSmall).truncate(),
-                            )
-                        }))
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        }
-    })
-    .flex_1()
-    .track_scroll(scroll);
+    let list =
+        gpui::uniform_list(list_id, count, {
+            move |range, _, _| {
+                range
+                    .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
+                    .map(|(ix, row)| {
+                        h_flex()
+                            .w(total)
+                            .h(px(24.))
+                            .flex_shrink_0()
+                            .when(ix % 2 == 1, |row| row.bg(stripe))
+                            .children(row.iter().map(|cell| {
+                                div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
+                                    Label::new(cell.clone()).size(LabelSize::XSmall).truncate(),
+                                )
+                            }))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+        .flex_1()
+        .track_scroll(scroll);
 
     div()
         .id(gpui::SharedString::from(format!("{list_id}-scroll")))
@@ -2370,7 +2437,12 @@ impl Render for ElRunsPanel {
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(render_grid(preview, &self.preview_scroll, "el-preview-rows", colors.element_background))
+                    .child(render_grid(
+                        preview,
+                        &self.preview_scroll,
+                        "el-preview-rows",
+                        colors.element_background,
+                    ))
                     .into_any_element()
             }
             None => {
@@ -2404,9 +2476,10 @@ impl Render for ElRunsPanel {
                     .border_color(colors.border)
                     .child(tab("el-console-runs", "Runs", Surface::Runs, self, cx))
                     .child(tab("el-console-query", "Query", Surface::Query, self, cx))
-                    .children((!self.remotes.is_empty()).then(|| {
-                        tab("el-console-remote", "Remote", Surface::Remote, self, cx)
-                    }));
+                    .children(
+                        (!self.remotes.is_empty())
+                            .then(|| tab("el-console-remote", "Remote", Surface::Remote, self, cx)),
+                    );
                 let content: gpui::AnyElement = match self.surface {
                     Surface::Runs => self.run_view.clone().into_any_element(),
                     Surface::Query => self.render_query(cx),

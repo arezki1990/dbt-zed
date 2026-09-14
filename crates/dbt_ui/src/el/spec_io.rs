@@ -75,7 +75,6 @@ pub async fn write_text(
     text: String,
     cx: &mut AsyncWindowContext,
 ) -> Result<()> {
-
     let project_path = project
         .update(cx, |project, cx| {
             project.project_path_for_absolute_path(&spec_path, cx)

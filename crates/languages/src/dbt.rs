@@ -12,8 +12,8 @@ use futures::StreamExt;
 use gpui::{App, AsyncApp, SharedString};
 use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
 use language::{
-    LanguageRegistry, LspAdapter, LspAdapterDelegate, LspInstaller, ManifestName,
-    ManifestProvider, ManifestQuery, Toolchain,
+    LanguageRegistry, LspAdapter, LspAdapterDelegate, LspInstaller, ManifestName, ManifestProvider,
+    ManifestQuery, Toolchain,
 };
 use lsp::{LanguageServerBinary, LanguageServerName};
 use project::ContextProviderWithTasks;
@@ -130,8 +130,7 @@ impl LspInstaller for DbtLspAdapter {
     ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
         let delegate = delegate.clone();
         async move {
-            let destination_path =
-                container_dir.join(format!("{GO_LSP_BINARY}-{}", version.name));
+            let destination_path = container_dir.join(format!("{GO_LSP_BINARY}-{}", version.name));
 
             if smol::fs::metadata(&destination_path).await.is_err() {
                 let mut response = delegate

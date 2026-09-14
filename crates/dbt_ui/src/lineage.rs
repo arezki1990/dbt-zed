@@ -112,7 +112,12 @@ impl NodeOps {
                 })
                 .unwrap_or_default()
         };
-        let flag = |key: &str| value.get(key).and_then(|value| value.as_bool()).unwrap_or(false);
+        let flag = |key: &str| {
+            value
+                .get(key)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
         let ops = Self {
             joins: strings("joins"),
             aggregations: strings("aggregations"),
@@ -120,7 +125,10 @@ impl NodeOps {
             filters: strings("filters"),
             windows: flag("windows"),
             distinct: flag("distinct"),
-            unions: value.get("unions").and_then(|value| value.as_u64()).unwrap_or(0) as usize,
+            unions: value
+                .get("unions")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize,
         };
         (!ops.is_empty()).then_some(ops)
     }
@@ -130,18 +138,101 @@ impl NodeOps {
 /// excluding SQL keywords and common functions.
 pub(crate) fn expr_column_refs(expr: &str) -> Vec<String> {
     const SKIP: &[&str] = &[
-        "sum", "count", "avg", "min", "max", "cast", "coalesce", "case", "when", "then",
-        "else", "end", "as", "and", "or", "not", "null", "true", "false", "over",
-        "partition", "by", "order", "asc", "desc", "row_number", "rank", "dense_rank",
-        "lag", "lead", "nullif", "concat", "trim", "upper", "lower", "substring",
-        "substr", "round", "floor", "ceil", "abs", "date", "timestamp", "interval",
-        "extract", "from", "distinct", "int", "integer", "bigint", "varchar", "string",
-        "numeric", "decimal", "float", "boolean", "char", "text", "iff", "ifnull",
-        "listagg", "array_agg", "to_char", "to_date", "to_number", "try_cast", "left",
-        "right", "replace", "split_part", "len", "length", "greatest", "least",
-        "any_value", "first_value", "last_value", "current_date", "current_timestamp",
-        "year", "month", "week", "day", "dateadd", "datediff", "date_trunc", "md5",
-        "like", "in", "is", "between", "exists", "union", "all", "select",
+        "sum",
+        "count",
+        "avg",
+        "min",
+        "max",
+        "cast",
+        "coalesce",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "as",
+        "and",
+        "or",
+        "not",
+        "null",
+        "true",
+        "false",
+        "over",
+        "partition",
+        "by",
+        "order",
+        "asc",
+        "desc",
+        "row_number",
+        "rank",
+        "dense_rank",
+        "lag",
+        "lead",
+        "nullif",
+        "concat",
+        "trim",
+        "upper",
+        "lower",
+        "substring",
+        "substr",
+        "round",
+        "floor",
+        "ceil",
+        "abs",
+        "date",
+        "timestamp",
+        "interval",
+        "extract",
+        "from",
+        "distinct",
+        "int",
+        "integer",
+        "bigint",
+        "varchar",
+        "string",
+        "numeric",
+        "decimal",
+        "float",
+        "boolean",
+        "char",
+        "text",
+        "iff",
+        "ifnull",
+        "listagg",
+        "array_agg",
+        "to_char",
+        "to_date",
+        "to_number",
+        "try_cast",
+        "left",
+        "right",
+        "replace",
+        "split_part",
+        "len",
+        "length",
+        "greatest",
+        "least",
+        "any_value",
+        "first_value",
+        "last_value",
+        "current_date",
+        "current_timestamp",
+        "year",
+        "month",
+        "week",
+        "day",
+        "dateadd",
+        "datediff",
+        "date_trunc",
+        "md5",
+        "like",
+        "in",
+        "is",
+        "between",
+        "exists",
+        "union",
+        "all",
+        "select",
     ];
     let lower = expr.to_lowercase();
     let mut refs = Vec::new();
@@ -178,7 +269,14 @@ pub(crate) fn extract_ops(sql: &str) -> NodeOps {
         let before = norm[..at].trim_end();
         let mut kind = "join";
         for candidate in [
-            "left outer", "right outer", "full outer", "left", "right", "full", "inner", "cross",
+            "left outer",
+            "right outer",
+            "full outer",
+            "left",
+            "right",
+            "full",
+            "inner",
+            "cross",
         ] {
             if before.ends_with(candidate) {
                 kind = candidate;
@@ -208,7 +306,16 @@ pub(crate) fn extract_ops(sql: &str) -> NodeOps {
         }
     }
 
-    for name in ["sum", "count", "avg", "min", "max", "array_agg", "listagg", "string_agg"] {
+    for name in [
+        "sum",
+        "count",
+        "avg",
+        "min",
+        "max",
+        "array_agg",
+        "listagg",
+        "string_agg",
+    ] {
         let pattern = format!("{name}(");
         let mut from = 0;
         while let Some(found) = lower[from..].find(&pattern) {
@@ -531,7 +638,8 @@ impl LineageStore {
                     .iter()
                     .map(|(_, entity)| {
                         // Ops badges render beside the name; leave room for them.
-                        let badge_pad = if entity.data.get("ops").is_some_and(|ops| !ops.is_null()) {
+                        let badge_pad = if entity.data.get("ops").is_some_and(|ops| !ops.is_null())
+                        {
                             36.
                         } else {
                             0.
@@ -597,9 +705,7 @@ impl LineageStore {
                                         let refs = value
                                             .as_array()?
                                             .iter()
-                                            .filter_map(|item| {
-                                                item.as_str().map(str::to_owned)
-                                            })
+                                            .filter_map(|item| item.as_str().map(str::to_owned))
                                             .collect();
                                         Some((key.clone(), refs))
                                     })
@@ -850,8 +956,7 @@ fn parse_select_entries_at(
             b')' => depth -= 1,
             b'f' if depth == 0
                 && body_lower[i..].starts_with("from")
-                && (i == 0
-                    || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
                 && body_lower[i + 4..]
                     .chars()
                     .next()
@@ -919,8 +1024,7 @@ fn parse_select_entries_at(
 }
 
 fn parse_select_columns(sql: &str) -> Option<Vec<String>> {
-    parse_select_entries(sql)
-        .map(|entries| entries.into_iter().map(|(name, _)| name).collect())
+    parse_select_entries(sql).map(|entries| entries.into_iter().map(|(name, _)| name).collect())
 }
 
 fn build_graph(
@@ -957,8 +1061,7 @@ fn build_graph(
                 else {
                     continue;
                 };
-                if let Some(columns) =
-                    entry.get("columns").and_then(|columns| columns.as_object())
+                if let Some(columns) = entry.get("columns").and_then(|columns| columns.as_object())
                 {
                     for (name, meta) in columns {
                         if let Some(kind) = meta.get("type").and_then(|t| t.as_str()) {
@@ -991,8 +1094,7 @@ fn build_graph(
                 columns
                     .iter()
                     .filter_map(|(name, meta)| {
-                        let description =
-                            meta.get("description").and_then(|d| d.as_str())?.trim();
+                        let description = meta.get("description").and_then(|d| d.as_str())?.trim();
                         (!description.is_empty()).then(|| {
                             (
                                 name.to_lowercase(),
@@ -1027,7 +1129,9 @@ fn build_graph(
                     .iter()
                     .map(|(name, meta)| {
                         (
-                            meta.get("index").and_then(|index| index.as_i64()).unwrap_or(0),
+                            meta.get("index")
+                                .and_then(|index| index.as_i64())
+                                .unwrap_or(0),
                             name.clone(),
                         )
                     })
@@ -1322,7 +1426,9 @@ mod tests {
         let sql = "SELECT\n  c.employee_id,\n  CASE WHEN x < c.reference_seniority_date THEN 0 ELSE 1 END AS seniority_in_years,\n  seniority_in_years * 12 AS seniority_in_months\nFROM t";
         let entries = parse_all_select_entries(sql);
         assert_eq!(
-            entries.get("seniority_in_years").map(|expr| expr.contains("reference_seniority_date")),
+            entries
+                .get("seniority_in_years")
+                .map(|expr| expr.contains("reference_seniority_date")),
             Some(true)
         );
         assert!(entries.contains_key("seniority_in_months"));
@@ -1340,6 +1446,9 @@ mod tests {
     fn cte_rename_chain_resolves_to_base_expression() {
         let sql = "WITH base AS (SELECT sum(amount) AS total FROM x), o AS (SELECT total AS grand_total FROM base) SELECT grand_total FROM o";
         let entries = parse_all_select_entries(sql);
-        assert_eq!(entries.get("grand_total").map(String::as_str), Some("sum(amount)"));
+        assert_eq!(
+            entries.get("grand_total").map(String::as_str),
+            Some("sum(amount)")
+        );
     }
 }

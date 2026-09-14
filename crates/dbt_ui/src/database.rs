@@ -166,8 +166,8 @@ pub fn build_catalog(project_root: &Path) -> Result<DbCatalog> {
         let alias = string(node, "alias")
             .or_else(|| string(node, "name"))
             .unwrap_or_else(|| uid.to_owned());
-        let fqn = string(node, "relation_name")
-            .unwrap_or_else(|| format!("{database}.{schema}.{alias}"));
+        let fqn =
+            string(node, "relation_name").unwrap_or_else(|| format!("{database}.{schema}.{alias}"));
 
         let entry = catalog_by_uid.get(uid);
         let meta = entry.and_then(|e| e.get("metadata"));
@@ -189,7 +189,10 @@ pub fn build_catalog(project_root: &Path) -> Result<DbCatalog> {
             })
             .unwrap_or_default();
 
-        let columns = match entry.and_then(|e| e.get("columns")).and_then(|c| c.as_object()) {
+        let columns = match entry
+            .and_then(|e| e.get("columns"))
+            .and_then(|c| c.as_object())
+        {
             Some(cols) => {
                 let mut list: Vec<DbColumn> = cols
                     .values()
@@ -221,8 +224,12 @@ pub fn build_catalog(project_root: &Path) -> Result<DbCatalog> {
             file_path: string(node, "original_file_path").map(PathBuf::from),
             description: string(node, "description").map(Into::into),
             owner: meta.and_then(|m| string(m, "owner")).map(Into::into),
-            row_count: entry.and_then(|e| stat_u64(e, "row_count")).filter(|_| is_table),
-            bytes: entry.and_then(|e| stat_u64(e, "bytes")).filter(|_| is_table),
+            row_count: entry
+                .and_then(|e| stat_u64(e, "row_count"))
+                .filter(|_| is_table),
+            bytes: entry
+                .and_then(|e| stat_u64(e, "bytes"))
+                .filter(|_| is_table),
             columns,
         };
         grouped

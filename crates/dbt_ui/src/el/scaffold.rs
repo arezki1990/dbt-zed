@@ -74,7 +74,8 @@ streams:
     parse: '%Y-%m-%d %H:%M:%S'
 "#;
 
-const SAMPLE_CSV: &str = "id,amount,created_at\n1,10.50,2026-01-01 09:00:00\n2,badvalue,2026-01-02 10:30:00\n";
+const SAMPLE_CSV: &str =
+    "id,amount,created_at\n1,10.50,2026-01-01 09:00:00\n2,badvalue,2026-01-02 10:30:00\n";
 
 const PIPELINE_DUCKDB_EXAMPLE: &str = r#"# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json
 # A real database source, zero credentials: the demo DuckDB file created
@@ -162,7 +163,10 @@ pub fn ensure_schemas(project_root: &Path) -> Result<bool> {
     let dir = el.join(".zdbt");
     let mut wrote = false;
     for (name, schema) in [
-        ("el-pipeline.schema.json", el_engine::spec::pipeline_json_schema()),
+        (
+            "el-pipeline.schema.json",
+            el_engine::spec::pipeline_json_schema(),
+        ),
         (
             "el-connections.schema.json",
             el_engine::spec::connections_json_schema(),
@@ -176,8 +180,7 @@ pub fn ensure_schemas(project_root: &Path) -> Result<bool> {
             .map(|existing| existing != current)
             .unwrap_or(true);
         if stale {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             std::fs::write(&path, current)
                 .with_context(|| format!("writing {}", path.display()))?;
             wrote = true;
@@ -275,10 +278,8 @@ mod tests {
         assert!(again.is_empty());
 
         // The scaffolded pipeline parses and validates against connections.
-        let pipeline = el_engine::spec::load_pipeline(
-            &dir.path().join("el/pipelines/example.yml"),
-        )
-        .unwrap();
+        let pipeline =
+            el_engine::spec::load_pipeline(&dir.path().join("el/pipelines/example.yml")).unwrap();
         let connections =
             el_engine::spec::load_connections(&dir.path().join("el/connections.yml")).unwrap();
         let issues: Vec<_> = el_engine::spec::validate(&pipeline, &connections)
@@ -289,9 +290,10 @@ mod tests {
         assert!(issues.is_empty(), "{issues:?}");
 
         // Settings merged, existing keys preserved.
-        let settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join(".zed/settings.json")).unwrap())
-                .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".zed/settings.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(settings["dbt"]["target"], "dev");
         assert!(
             settings["lsp"]["yaml-language-server"]["settings"]["yaml"]["schemas"]

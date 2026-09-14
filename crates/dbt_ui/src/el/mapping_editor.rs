@@ -206,7 +206,11 @@ impl MappingEditorState {
 
     /// Serializes the draft into the pipeline. Returns false when nothing
     /// changed.
-    pub fn apply(&self, pipeline: &mut Pipeline, cx: &Context<crate::el::ElPipelineCanvas>) -> Result<bool> {
+    pub fn apply(
+        &self,
+        pipeline: &mut Pipeline,
+        cx: &Context<crate::el::ElPipelineCanvas>,
+    ) -> Result<bool> {
         // By NAME, not index: the YAML may have been reordered underneath.
         let defaults = pipeline.defaults.clone();
         let Some(stream) = pipeline
@@ -274,8 +278,7 @@ impl MappingEditorState {
                     .map(|d| d.rename.read(cx).text(cx).trim().to_owned())
                     .filter(|text| !text.is_empty());
                 let cast = draft.cast.as_ref().map(|cast| cast.to_string());
-                if rename.is_none() && cast.is_none() && !draft.strict && draft.parse.is_none()
-                {
+                if rename.is_none() && cast.is_none() && !draft.strict && draft.parse.is_none() {
                     return None; // pure pass-through needs no rule
                 }
                 Some(ColumnSpec {

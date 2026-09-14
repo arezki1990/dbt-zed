@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    Task, WeakEntity, Window,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
+    WeakEntity, Window,
 };
 use project::Project;
 use ui::prelude::*;
@@ -69,11 +69,16 @@ impl ElDeployModal {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let remotes: Vec<SharedString> = el_engine::spec::load_remotes(
-            &super::el_dir(&root).join("remotes.yml"),
-        )
-        .map(|remotes| remotes.remotes.keys().map(|name| name.clone().into()).collect())
-        .unwrap_or_default();
+        let remotes: Vec<SharedString> =
+            el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
+                .map(|remotes| {
+                    remotes
+                        .remotes
+                        .keys()
+                        .map(|name| name.clone().into())
+                        .collect()
+                })
+                .unwrap_or_default();
         if remotes.is_empty() {
             // Same action name as the panel's "+": open the Add server
             // wizard right away instead of pointing at a file to hand-edit.
@@ -128,8 +133,11 @@ impl ElDeployModal {
     /// Why the on-disk spec must not ship right now, or None.
     fn unsaved_refusal(&self, cx: &App) -> Option<SharedString> {
         super::spec_io::has_unsaved_edits(&self.project, &self.spec_path, cx).then(|| {
-            format!("{} has unsaved edits — save it, then deploy again.", self.file_name())
-                .into()
+            format!(
+                "{} has unsaved edits — save it, then deploy again.",
+                self.file_name()
+            )
+            .into()
         })
     }
 
@@ -220,7 +228,12 @@ impl ElDeployModal {
                         this.selected_profile = active
                             .clone()
                             .filter(|name| profiles.iter().any(|p| p == name));
-                        RemoteFacts::Loaded { profiles, active, pipelines, tracks_checkout }
+                        RemoteFacts::Loaded {
+                            profiles,
+                            active,
+                            pipelines,
+                            tracks_checkout,
+                        }
                     }
                     Err(error) => RemoteFacts::Failed(format!("{error:#}").into()),
                 };
@@ -236,7 +249,10 @@ impl ElDeployModal {
             && self.local.is_some()
             && matches!(
                 self.facts,
-                RemoteFacts::Loaded { tracks_checkout: false, .. }
+                RemoteFacts::Loaded {
+                    tracks_checkout: false,
+                    ..
+                }
             )
     }
 
@@ -270,8 +286,8 @@ impl ElDeployModal {
             let result = cx
                 .background_spawn(async move {
                     // Ship the file as it is on disk, re-validated now.
-                    let yaml = std::fs::read_to_string(&spec_path)
-                        .context("reading the pipeline")?;
+                    let yaml =
+                        std::fs::read_to_string(&spec_path).context("reading the pipeline")?;
                     let parsed = el_engine::spec::load_pipeline(&spec_path)?;
                     if parsed.pipeline != task_name {
                         anyhow::bail!(
@@ -284,10 +300,8 @@ impl ElDeployModal {
                             parsed.pipeline
                         );
                     }
-                    let client = el_engine::server::RemoteClient::connect(
-                        &task_root,
-                        &task_remote,
-                    )?;
+                    let client =
+                        el_engine::server::RemoteClient::connect(&task_root, &task_remote)?;
                     client.deploy(&[(task_name, yaml, task_profile)])?;
                     anyhow::Ok(())
                 })
@@ -320,7 +334,9 @@ impl ElDeployModal {
                     // The console refreshes by reading the workspace —
                     // update it only after the lease above is released.
                     let console = workspace
-                        .read_with(cx, |workspace, cx| workspace.panel::<super::ElRunsPanel>(cx))
+                        .read_with(cx, |workspace, cx| {
+                            workspace.panel::<super::ElRunsPanel>(cx)
+                        })
                         .ok()
                         .flatten();
                     if let Some(console) = console {
@@ -350,26 +366,24 @@ impl ElDeployModal {
         tracks_checkout: bool,
     ) -> Div {
         let mut rows = v_flex().w_full().px_2().pb_2().gap_0p5();
-        let line = |text: String, color: Color| {
-            Label::new(text).size(LabelSize::XSmall).color(color)
-        };
+        let line =
+            |text: String, color: Color| Label::new(text).size(LabelSize::XSmall).color(color);
         if let Some(refusal) = &self.refusal {
             return rows.child(line(refusal.to_string(), Color::Error));
         }
         if tracks_checkout {
             rows = rows.child(line(
-                format!("{remote} tracks its git checkout — deploy by pushing to it, not from here."),
+                format!(
+                    "{remote} tracks its git checkout — deploy by pushing to it, not from here."
+                ),
                 Color::Error,
             ));
         }
         let Some(local) = &self.local else {
             return rows.child(line(format!("Reading {}…", self.file_name()), Color::Muted));
         };
-        let pf = el_engine::server::deploy_preflight(
-            local,
-            pipelines,
-            self.selected_profile.as_deref(),
-        );
+        let pf =
+            el_engine::server::deploy_preflight(local, pipelines, self.selected_profile.as_deref());
         let profile_text = match &self.selected_profile {
             Some(profile) => format!("profile {profile}"),
             None => "the server default profile".to_owned(),
@@ -408,7 +422,9 @@ impl ElDeployModal {
                 }
                 if let (Some(previous), None) = (&replaced.previous_schedule, &pf.schedule) {
                     rows = rows.child(line(
-                        format!("The current schedule {previous} stops — manual runs only afterwards."),
+                        format!(
+                            "The current schedule {previous} stops — manual runs only afterwards."
+                        ),
                         Color::Warning,
                     ));
                 }
@@ -462,7 +478,11 @@ impl ElDeployModal {
                 };
                 rows = rows.child(line(
                     text,
-                    if pf.first_fire_unix.is_some() { Color::Muted } else { Color::Warning },
+                    if pf.first_fire_unix.is_some() {
+                        Color::Muted
+                    } else {
+                        Color::Warning
+                    },
                 ));
             }
             None => {
@@ -510,10 +530,7 @@ impl Render for ElDeployModal {
                     .p_2()
                     .border_b_1()
                     .border_color(colors.border)
-                    .child(
-                        Label::new(format!("Deploy {}", self.pipeline))
-                            .size(LabelSize::Small),
-                    )
+                    .child(Label::new(format!("Deploy {}", self.pipeline)).size(LabelSize::Small))
                     .child(div().flex_1())
                     .child(
                         IconButton::new("el-deploy-close", IconName::Close)
@@ -524,7 +541,9 @@ impl Render for ElDeployModal {
 
         if self.remotes.len() > 1 {
             let mut remote_row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
-                Label::new("server").size(LabelSize::XSmall).color(Color::Muted),
+                Label::new("server")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             );
             for (ix, name) in self.remotes.iter().enumerate() {
                 let selected = ix == self.selected_remote;
@@ -549,9 +568,13 @@ impl Render for ElDeployModal {
                     .color(Color::Muted),
             ),
             RemoteFacts::Failed(error) => div().p_2().child(
-                Label::new(error.clone()).size(LabelSize::XSmall).color(Color::Error),
+                Label::new(error.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error),
             ),
-            RemoteFacts::Loaded { profiles, active, .. } => {
+            RemoteFacts::Loaded {
+                profiles, active, ..
+            } => {
                 let mut rows = v_flex().w_full().p_2().gap_1();
                 rows = rows.child(
                     Label::new("Run this pipeline under:")
@@ -577,14 +600,17 @@ impl Render for ElDeployModal {
                     let selected = self.selected_profile.as_deref() == Some(profile);
                     let profile = profile.clone();
                     chips = chips.child(
-                        Button::new(("el-deploy-profile", ix), SharedString::from(profile.clone()))
-                            .label_size(LabelSize::XSmall)
-                            .toggle_state(selected)
-                            .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_profile = Some(profile.clone());
-                                cx.notify();
-                            })),
+                        Button::new(
+                            ("el-deploy-profile", ix),
+                            SharedString::from(profile.clone()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .toggle_state(selected)
+                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_profile = Some(profile.clone());
+                            cx.notify();
+                        })),
                     );
                 }
                 rows = rows.child(chips);
@@ -604,22 +630,34 @@ impl Render for ElDeployModal {
 
         // What the deploy changes on the server, or why it can't ship.
         match &self.facts {
-            RemoteFacts::Loaded { pipelines, tracks_checkout, .. } => {
+            RemoteFacts::Loaded {
+                pipelines,
+                tracks_checkout,
+                ..
+            } => {
                 card = card.child(self.render_consequences(&remote, pipelines, *tracks_checkout));
             }
             _ => {
                 if let Some(refusal) = &self.refusal {
-                    card = card.child(div().px_2().pb_2().child(
-                        Label::new(refusal.clone()).size(LabelSize::XSmall).color(Color::Error),
-                    ));
+                    card = card.child(
+                        div().px_2().pb_2().child(
+                            Label::new(refusal.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        ),
+                    );
                 }
             }
         }
 
         if let Some(error) = &self.error {
-            card = card.child(div().px_2().pb_1().child(
-                Label::new(error.clone()).size(LabelSize::XSmall).color(Color::Error),
-            ));
+            card = card.child(
+                div().px_2().pb_1().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                ),
+            );
         }
 
         let deploy_label: SharedString = if self.deploying {

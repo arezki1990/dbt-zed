@@ -113,21 +113,22 @@ impl ElRemoteModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut error = None;
-        let existing: Option<RemoteSpec> = editing.as_ref().and_then(|name| {
-            match load_remotes_strict(&root) {
-                Ok(remotes) => {
-                    let found = remotes.remotes.get(name).cloned();
-                    if found.is_none() {
-                        error = Some(format!("{name:?} is gone from remotes.yml").into());
+        let existing: Option<RemoteSpec> =
+            editing
+                .as_ref()
+                .and_then(|name| match load_remotes_strict(&root) {
+                    Ok(remotes) => {
+                        let found = remotes.remotes.get(name).cloned();
+                        if found.is_none() {
+                            error = Some(format!("{name:?} is gone from remotes.yml").into());
+                        }
+                        found
                     }
-                    found
-                }
-                Err(load_error) => {
-                    error = Some(format!("{load_error:#}").into());
-                    None
-                }
-            }
-        });
+                    Err(load_error) => {
+                        error = Some(format!("{load_error:#}").into());
+                        None
+                    }
+                });
         let mut make = |placeholder: &str, initial: &str| {
             let placeholder = placeholder.to_owned();
             let initial = initial.to_owned();
@@ -143,7 +144,10 @@ impl ElRemoteModal {
         let name = make("prod_vm", editing.as_deref().unwrap_or(""));
         let url = make(
             "https://el.example.com:7431",
-            existing.as_ref().map(|remote| remote.url.as_str()).unwrap_or(""),
+            existing
+                .as_ref()
+                .map(|remote| remote.url.as_str())
+                .unwrap_or(""),
         );
         let token_var = make(
             "ZDBT_EL_TOKEN",
@@ -183,7 +187,13 @@ impl ElRemoteModal {
         cx.notify();
     }
 
-    fn write(&mut self, remotes: Remotes, done: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn write(
+        &mut self,
+        remotes: Remotes,
+        done: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.writing = true;
         cx.notify();
         let workspace = self.workspace.clone();
@@ -226,7 +236,10 @@ impl ElRemoteModal {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            self.fail("the server needs a plain name (letters, digits, _ -)".into(), cx);
+            self.fail(
+                "the server needs a plain name (letters, digits, _ -)".into(),
+                cx,
+            );
             return false;
         }
         let url = self.url.read(cx).text(cx).trim().to_owned();
@@ -251,7 +264,10 @@ impl ElRemoteModal {
                 return false;
             }
             if token_var.is_empty() && !url.starts_with("http://") {
-                self.fail("a server beyond localhost needs a token variable".into(), cx);
+                self.fail(
+                    "a server beyond localhost needs a token variable".into(),
+                    cx,
+                );
                 return false;
             }
         }
@@ -268,7 +284,10 @@ impl ElRemoteModal {
             var = self.generated_token_var(cx);
         }
         if !(var.len() <= 64 && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
-            return self.fail("the token variable must be a plain NAME (e.g. ZDBT_EL_TOKEN)".into(), cx);
+            return self.fail(
+                "the token variable must be a plain NAME (e.g. ZDBT_EL_TOKEN)".into(),
+                cx,
+            );
         }
         let mut bytes = [0u8; 24];
         if let Err(error) = std::fs::File::open("/dev/urandom")
@@ -281,7 +300,10 @@ impl ElRemoteModal {
         let write = (|| -> std::io::Result<()> {
             use std::io::Write as _;
             let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-            if existing.lines().any(|line| line.starts_with(&format!("{var}="))) {
+            if existing
+                .lines()
+                .any(|line| line.starts_with(&format!("{var}=")))
+            {
                 return Err(std::io::Error::other(format!(
                     "{var} already exists in .env — pick another variable name"
                 )));
@@ -306,7 +328,8 @@ impl ElRemoteModal {
         }
         self.error = None;
         // Reflect the variable actually used in the field.
-        self.token_var.update(cx, |editor, cx| editor.set_text(var.clone(), window, cx));
+        self.token_var
+            .update(cx, |editor, cx| editor.set_text(var.clone(), window, cx));
         self.generated = Some((var, value));
         cx.notify();
     }
@@ -332,7 +355,10 @@ impl ElRemoteModal {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            return self.fail("the server needs a plain name (letters, digits, _ -)".into(), cx);
+            return self.fail(
+                "the server needs a plain name (letters, digits, _ -)".into(),
+                cx,
+            );
         }
         let url = self.url.read(cx).text(cx).trim().to_owned();
         if let Err(error) = el_engine::server::check_remote_url(&url) {
@@ -359,7 +385,10 @@ impl ElRemoteModal {
             Some(format!("${{{token_var}}}"))
         };
         if token.is_none() && !url.starts_with("http://") {
-            return self.fail("a server beyond localhost needs a token variable".into(), cx);
+            return self.fail(
+                "a server beyond localhost needs a token variable".into(),
+                cx,
+            );
         }
 
         let mut remotes = match load_remotes_strict(&self.root) {
@@ -417,13 +446,21 @@ impl ElRemoteModal {
         }
         let remote_project = {
             let text = self.ssh_project.read(cx).text(cx).trim().to_owned();
-            if text.is_empty() { "/srv/el-project".to_owned() } else { text }
+            if text.is_empty() {
+                "/srv/el-project".to_owned()
+            } else {
+                text
+            }
         };
         let name = self.name.read(cx).text(cx).trim().to_owned();
         let url = self.url.read(cx).text(cx).trim().to_owned();
         let profile = {
             let text = self.ssh_profile.read(cx).text(cx).trim().to_owned();
-            if text.is_empty() { "prod".to_owned() } else { text }
+            if text.is_empty() {
+                "prod".to_owned()
+            } else {
+                text
+            }
         };
         let Ok(exe) = std::env::current_exe() else {
             return self.fail("could not locate the zdbt binary".into(), cx);
@@ -485,7 +522,9 @@ impl ElRemoteModal {
         if self.writing {
             return;
         }
-        let Some(original) = self.editing.clone() else { return };
+        let Some(original) = self.editing.clone() else {
+            return;
+        };
         if !self.delete_armed {
             self.delete_armed = true;
             cx.notify();
@@ -531,9 +570,13 @@ impl Render for ElRemoteModal {
                 .w_full()
                 .gap_3()
                 .items_center()
-                .child(div().w(px(150.)).flex_shrink_0().child(
-                    Label::new(label).size(LabelSize::Default).color(Color::Muted),
-                ))
+                .child(
+                    div().w(px(150.)).flex_shrink_0().child(
+                        Label::new(label)
+                            .size(LabelSize::Default)
+                            .color(Color::Muted),
+                    ),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -547,14 +590,21 @@ impl Render for ElRemoteModal {
                 )
         };
         let steps: &[(Step, &str)] = if self.mode == Mode::Install {
-            &[(Step::Details, "Server"), (Step::Install, "Install"), (Step::Review, "Review")]
+            &[
+                (Step::Details, "Server"),
+                (Step::Install, "Install"),
+                (Step::Review, "Review"),
+            ]
         } else {
             &[(Step::Details, "Server"), (Step::Review, "Review")]
         };
         let title: SharedString = if editing {
             "Edit server".into()
         } else {
-            let position = steps.iter().position(|(step, _)| *step == self.step).unwrap_or(0);
+            let position = steps
+                .iter()
+                .position(|(step, _)| *step == self.step)
+                .unwrap_or(0);
             format!("Add server — step {} of {}", position + 1, steps.len()).into()
         };
 
@@ -595,9 +645,8 @@ impl Render for ElRemoteModal {
                         .color(if active { Color::Accent } else { Color::Muted }),
                 );
                 if ix + 1 < steps.len() {
-                    trail = trail.child(
-                        Label::new("›").size(LabelSize::Default).color(Color::Muted),
-                    );
+                    trail =
+                        trail.child(Label::new("›").size(LabelSize::Default).color(Color::Muted));
                 }
             }
             card = card.child(trail);
@@ -641,7 +690,11 @@ impl Render for ElRemoteModal {
                             .w_full()
                             .gap_2()
                             .items_center()
-                            .child(div().flex_1().child(field_row("token variable", self.token_var.clone())))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(field_row("token variable", self.token_var.clone())),
+                            )
                             .child(
                                 Button::new("el-remote-gen-token", "Generate")
                                     .label_size(LabelSize::Default)
@@ -687,11 +740,13 @@ impl Render for ElRemoteModal {
                             .w_full()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(150.)).flex_shrink_0().child(
-                                Label::new("token variable")
-                                    .size(LabelSize::Default)
-                                    .color(Color::Muted),
-                            ))
+                            .child(
+                                div().w(px(150.)).flex_shrink_0().child(
+                                    Label::new("token variable")
+                                        .size(LabelSize::Default)
+                                        .color(Color::Muted),
+                                ),
+                            )
                             .child(
                                 Label::new(format!(
                                     "{} — generated for you",
@@ -773,7 +828,11 @@ impl Render for ElRemoteModal {
                         Label::new(format!(
                             "Then installs the daemon on {host} under {} running profile {} \
                              (a terminal tab shows progress).",
-                            if dir.is_empty() { "/srv/el-project" } else { &dir },
+                            if dir.is_empty() {
+                                "/srv/el-project"
+                            } else {
+                                &dir
+                            },
                             if profile.is_empty() { "prod" } else { &profile }
                         ))
                         .size(LabelSize::Small)
@@ -786,9 +845,13 @@ impl Render for ElRemoteModal {
         card = card.child(body);
 
         if let Some(error) = &self.error {
-            card = card.child(div().px_4().pb_2().child(
-                Label::new(error.clone()).size(LabelSize::Small).color(Color::Error),
-            ));
+            card = card.child(
+                div().px_4().pb_2().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                ),
+            );
         }
 
         let mut footer = h_flex()
@@ -802,7 +865,11 @@ impl Render for ElRemoteModal {
             footer = footer.child(
                 Button::new(
                     "el-remote-delete",
-                    if self.delete_armed { "Confirm remove" } else { "Remove" },
+                    if self.delete_armed {
+                        "Confirm remove"
+                    } else {
+                        "Remove"
+                    },
                 )
                 .label_size(LabelSize::Default)
                 .color(Color::Error)
@@ -832,11 +899,19 @@ impl Render for ElRemoteModal {
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
         );
         let primary: SharedString = match (editing, self.step, self.mode) {
-            (true, _, _) => if self.writing { "Saving…" } else { "Save changes" }.into(),
-            (false, Step::Review, Mode::Install) => "Install & add server".into(),
-            (false, Step::Review, Mode::Existing) => {
-                if self.writing { "Saving…" } else { "Add server" }.into()
+            (true, _, _) => if self.writing {
+                "Saving…"
+            } else {
+                "Save changes"
             }
+            .into(),
+            (false, Step::Review, Mode::Install) => "Install & add server".into(),
+            (false, Step::Review, Mode::Existing) => if self.writing {
+                "Saving…"
+            } else {
+                "Add server"
+            }
+            .into(),
             _ => "Next".into(),
         };
         card.child(

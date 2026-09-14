@@ -277,7 +277,10 @@ impl ElConnectionModal {
                 oracle_schema = conn.schema.clone().unwrap_or_default();
                 oracle_wallet = conn.wallet_dir.clone().unwrap_or_default();
                 oracle_tns = conn.tns_admin.clone().unwrap_or_default();
-                oracle_driver = conn.driver.map(|driver| driver.as_str().to_owned()).unwrap_or_default();
+                oracle_driver = conn
+                    .driver
+                    .map(|driver| driver.as_str().to_owned())
+                    .unwrap_or_default();
             }
             Some(Connection::Snowflake(conn)) => {
                 account = conn.account.clone();
@@ -309,7 +312,11 @@ impl ElConnectionModal {
         }
 
         let fields = vec![
-            make("url / path", "${PG_PROD_URL}  ·  or  el/data.duckdb", &url_or_path),
+            make(
+                "url / path",
+                "${PG_PROD_URL}  ·  or  el/data.duckdb",
+                &url_or_path,
+            ),
             make("account", "${SNOWFLAKE_ACCOUNT}", &account),
             make("user", "${SNOWFLAKE_USER}", &user),
             make("role", "LOADER (optional)", &role),
@@ -322,7 +329,11 @@ impl ElConnectionModal {
             make("schema", "ERP (optional)", &oracle_schema),
             make("wallet dir", "el/wallet (optional)", &oracle_wallet),
             make("tns admin", "el/tns (optional)", &oracle_tns),
-            make("driver", "auto — thick for Oracle 10g/11g (optional)", &oracle_driver),
+            make(
+                "driver",
+                "auto — thick for Oracle 10g/11g (optional)",
+                &oracle_driver,
+            ),
         ];
         let name = make("name", "pg_prod", editing.as_deref().unwrap_or("")).editor;
 
@@ -744,7 +755,9 @@ impl ElConnectionModal {
 
             let succeeded = result.is_ok();
             if succeeded {
-                panel.update(cx, |panel, cx| panel.connections_changed(cx)).ok();
+                panel
+                    .update(cx, |panel, cx| panel.connections_changed(cx))
+                    .ok();
                 let message = match (editing, renamed_from) {
                     (false, _) => format!("Connection {new_name} added."),
                     (true, Some(old)) if updated_pipelines > 0 => format!(
@@ -791,7 +804,9 @@ impl ElConnectionModal {
         if self.writing {
             return;
         }
-        let Some(original) = self.editing.clone() else { return };
+        let Some(original) = self.editing.clone() else {
+            return;
+        };
         // Re-scan at click time — the open-time snapshot may be stale.
         match referencing_pipelines(&self.root, &original) {
             Ok(referencing) if !referencing.is_empty() => {
@@ -843,7 +858,9 @@ impl ElConnectionModal {
             )
             .await;
             if result.is_ok() {
-                panel.update(cx, |panel, cx| panel.connections_changed(cx)).ok();
+                panel
+                    .update(cx, |panel, cx| panel.connections_changed(cx))
+                    .ok();
                 workspace
                     .update(cx, |workspace, cx| {
                         super::toast(workspace, &format!("Connection {original} deleted."), cx)
@@ -957,9 +974,13 @@ impl Render for ElConnectionModal {
             // The file (or the connection) is unreadable: explain, offer
             // the YAML, change nothing.
             if let Some(error) = &self.error {
-                card = card.child(div().p_2().child(
-                    Label::new(error.clone()).size(LabelSize::Small).color(Color::Error),
-                ));
+                card = card.child(
+                    div().p_2().child(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    ),
+                );
             }
             return card.child(
                 h_flex()
@@ -972,9 +993,9 @@ impl Render for ElConnectionModal {
                         Button::new("el-conn-open-yaml", "Open connections.yml")
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Filled)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_yaml(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_yaml(window, cx)),
+                            ),
                     )
                     .child(div().flex_1())
                     .child(
@@ -988,7 +1009,9 @@ impl Render for ElConnectionModal {
         if !editing && !self.declared_profiles.is_empty() {
             // Where the new connection goes: shared base, or one profile.
             let mut scope_row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
-                Label::new("define in").size(LabelSize::XSmall).color(Color::Muted),
+                Label::new("define in")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             );
             scope_row = scope_row.child(
                 Button::new("el-conn-scope-base", "base (all profiles)")
@@ -1037,13 +1060,16 @@ impl Render for ElConnectionModal {
                 let selected = self.runs_on.as_deref() == Some(remote);
                 let remote = remote.clone();
                 row = row.child(
-                    Button::new(("el-conn-workspace", ix), SharedString::from(remote.clone()))
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(selected)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.runs_on = Some(remote.clone());
-                            cx.notify();
-                        })),
+                    Button::new(
+                        ("el-conn-workspace", ix),
+                        SharedString::from(remote.clone()),
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .toggle_state(selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.runs_on = Some(remote.clone());
+                        cx.notify();
+                    })),
                 );
             }
             card = card.child(row);
@@ -1073,9 +1099,13 @@ impl Render for ElConnectionModal {
                 .w_full()
                 .gap_2()
                 .items_center()
-                .child(div().w(px(140.)).flex_shrink_0().child(
-                    Label::new(label).size(LabelSize::XSmall).color(Color::Muted),
-                ))
+                .child(
+                    div().w(px(140.)).flex_shrink_0().child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
                 .child(div().flex_1().child(editor))
         };
 
@@ -1084,8 +1114,10 @@ impl Render for ElConnectionModal {
         if supported {
             match self.conn_type {
                 ConnType::Postgres | ConnType::Mysql | ConnType::Duckdb => {
-                    fields = fields
-                        .child(field_row(self.fields[0].label, self.fields[0].editor.clone()));
+                    fields = fields.child(field_row(
+                        self.fields[0].label,
+                        self.fields[0].editor.clone(),
+                    ));
                 }
                 ConnType::Oracle => {
                     for field in &self.fields[7..13] {
@@ -1098,9 +1130,13 @@ impl Render for ElConnectionModal {
                         .w_full()
                         .gap_1()
                         .items_center()
-                        .child(div().w(px(140.)).flex_shrink_0().child(
-                            Label::new("auth").size(LabelSize::XSmall).color(Color::Muted),
-                        ))
+                        .child(
+                            div().w(px(140.)).flex_shrink_0().child(
+                                Label::new("auth")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
                         .child(
                             Button::new("el-conn-auth-key", "key pair")
                                 .label_size(LabelSize::XSmall)
@@ -1152,19 +1188,29 @@ impl Render for ElConnectionModal {
                 format!("Used by: {}", self.referencing.join(", ")).into()
             };
             card = card.child(
-                div().px_2().pb_1().child(
-                    Label::new(note).size(LabelSize::XSmall).color(Color::Muted),
-                ),
+                div()
+                    .px_2()
+                    .pb_1()
+                    .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
             );
         }
 
         if let Some(error) = &self.error {
-            card = card.child(div().px_2().pb_1().child(
-                Label::new(error.clone()).size(LabelSize::XSmall).color(Color::Error),
-            ));
+            card = card.child(
+                div().px_2().pb_1().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                ),
+            );
         }
 
-        let mut footer = h_flex().w_full().p_2().gap_1().border_t_1().border_color(colors.border);
+        let mut footer = h_flex()
+            .w_full()
+            .p_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(colors.border);
         if editing {
             footer = footer.child(
                 Button::new(
@@ -1281,7 +1327,10 @@ mod tests {
         };
         let yaml = el_engine::spec::to_canonical_connections_yaml(&connections);
         assert!(yaml.contains("type: oracle"), "{yaml}");
-        assert!(yaml.contains("connect: db.example.com:1521/ORCLPDB1"), "{yaml}");
+        assert!(
+            yaml.contains("connect: db.example.com:1521/ORCLPDB1"),
+            "{yaml}"
+        );
         assert!(yaml.contains("${ORACLE_PASSWORD}"), "{yaml}");
         // Unset optionals are not written back as nulls.
         assert!(!yaml.contains("wallet_dir"), "{yaml}");
@@ -1292,7 +1341,14 @@ mod tests {
         let reloaded = el_engine::spec::load_connections(&path).unwrap();
         let stored = reloaded.connections.get("ora_erp").unwrap();
         assert_eq!(stored.kind(), "oracle");
-        assert_eq!(el_engine::spec::to_canonical_connections_yaml(&reloaded), yaml);
-        assert!(stored.shape_issues().is_empty(), "{:?}", stored.shape_issues());
+        assert_eq!(
+            el_engine::spec::to_canonical_connections_yaml(&reloaded),
+            yaml
+        );
+        assert!(
+            stored.shape_issues().is_empty(),
+            "{:?}",
+            stored.shape_issues()
+        );
     }
 }

@@ -11,9 +11,7 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast::{
-    Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-};
+use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::{GenericDialect, SnowflakeDialect};
 use sqlparser::parser::Parser;
 
@@ -57,10 +55,13 @@ pub fn column_lineage(
     let statements = Parser::parse_sql(&SnowflakeDialect {}, sql)
         .or_else(|_| Parser::parse_sql(&GenericDialect {}, sql))
         .ok()?;
-    let query = statements.iter().rev().find_map(|statement| match statement {
-        Statement::Query(query) => Some(query),
-        _ => None,
-    })?;
+    let query = statements
+        .iter()
+        .rev()
+        .find_map(|statement| match statement {
+            Statement::Query(query) => Some(query),
+            _ => None,
+        })?;
     let scope = resolve_query(query, upstream, &HashMap::new(), 0)?;
     let mut out: HashMap<String, Vec<Leaf>> = HashMap::new();
     for (name, leaves) in scope.columns {
@@ -154,10 +155,12 @@ fn resolve_select(
             }
             SelectItem::QualifiedWildcard(kind, _) => {
                 let qualifier = norm_ident(&kind.to_string());
-                let qualifier = qualifier.rsplit('.').next().unwrap_or(&qualifier).to_owned();
-                if let Some((_, scope)) =
-                    sources.iter().find(|(alias, _)| *alias == qualifier)
-                {
+                let qualifier = qualifier
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&qualifier)
+                    .to_owned();
+                if let Some((_, scope)) = sources.iter().find(|(alias, _)| *alias == qualifier) {
                     columns.extend(scope.columns.iter().cloned());
                 }
             }
@@ -433,13 +436,11 @@ mod tests {
     #[test]
     #[ignore]
     fn corpus_dbt_employees() {
-        let target = std::path::Path::new(
-            "/Users/arezkipro/projects/dbt-employees/employees/target",
-        );
-        let manifest: serde_json::Value = serde_json::from_reader(
-            std::fs::File::open(target.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let target =
+            std::path::Path::new("/Users/arezkipro/projects/dbt-employees/employees/target");
+        let manifest: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(target.join("manifest.json")).unwrap())
+                .unwrap();
         let catalog: serde_json::Value = std::fs::File::open(target.join("catalog.json"))
             .ok()
             .and_then(|file| serde_json::from_reader(file).ok())
@@ -458,12 +459,7 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        let all = |section: &str| {
-            manifest[section]
-                .as_object()
-                .cloned()
-                .unwrap_or_default()
-        };
+        let all = |section: &str| manifest[section].as_object().cloned().unwrap_or_default();
         let nodes = all("nodes");
         let sources = all("sources");
         let get = |uid: &str| nodes.get(uid).or_else(|| sources.get(uid));
@@ -488,8 +484,7 @@ mod tests {
             if node["resource_type"] != "model" {
                 continue;
             }
-            let Some(sql) = node.get("compiled_code").and_then(|value| value.as_str())
-            else {
+            let Some(sql) = node.get("compiled_code").and_then(|value| value.as_str()) else {
                 continue;
             };
             let mut upstream_map = HashMap::new();
@@ -499,8 +494,12 @@ mod tests {
                 .unwrap_or_default()
             {
                 let parent_uid = parent.as_str().unwrap_or_default();
-                let Some(parent_node) = get(parent_uid) else { continue };
-                let Some(ident) = table_ident(parent_uid) else { continue };
+                let Some(parent_node) = get(parent_uid) else {
+                    continue;
+                };
+                let Some(ident) = table_ident(parent_uid) else {
+                    continue;
+                };
                 let mut columns = catalog_cols(parent_uid);
                 if columns.is_empty() {
                     columns = parent_node["columns"]
@@ -524,14 +523,20 @@ mod tests {
                     parsed += 1;
                     for column in catalog_cols(uid) {
                         total_cols += 1;
-                        if lineage.get(&column).is_some_and(|leaves| !leaves.is_empty())
+                        if lineage
+                            .get(&column)
+                            .is_some_and(|leaves| !leaves.is_empty())
                         {
                             linked += 1;
                         } else if fail_names.len() < 25 {
                             fail_names.push(format!(
                                 "{}.{column}{}",
                                 node["name"].as_str().unwrap_or(""),
-                                if lineage.contains_key(&column) { " (empty)" } else { " (absent)" },
+                                if lineage.contains_key(&column) {
+                                    " (empty)"
+                                } else {
+                                    " (absent)"
+                                },
                             ));
                         }
                     }

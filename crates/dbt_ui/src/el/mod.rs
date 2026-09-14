@@ -6,11 +6,11 @@ pub mod canvas_item;
 pub mod cli;
 pub mod connection_modal;
 pub mod deploy_modal;
-pub mod remote_modal;
-pub mod rename_stream_modal;
 pub mod layout;
 pub mod mapping_editor;
 pub mod panel;
+pub mod remote_modal;
+pub mod rename_stream_modal;
 pub mod run_view;
 pub mod runs_panel;
 pub mod scaffold;
@@ -50,10 +50,7 @@ pub fn el_dir(project_root: &Path) -> PathBuf {
 /// The EL project root in this workspace: a dbt root when present, else
 /// any worktree already holding `el/`, else the first worktree (so
 /// Initialize can create a standalone EL project).
-pub fn discover_el_root(
-    workspace: &Workspace,
-    cx: &gpui::App,
-) -> Option<PathBuf> {
+pub fn discover_el_root(workspace: &Workspace, cx: &gpui::App) -> Option<PathBuf> {
     if let Some(root) = crate::database_panel::discover_workspace_root(workspace, cx) {
         return Some(root);
     }
@@ -100,8 +97,7 @@ pub fn db_worker(project_root: &Path, connection: &str) -> anyhow::Result<DbWork
     }
 }
 
-pub const WORKER_MISSING: &str =
-    "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER, or pick a \
+pub const WORKER_MISSING: &str = "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER, or pick a \
      remote's worker in the EL panel.";
 
 fn local_connection(
@@ -125,9 +121,11 @@ pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<
             let (connection, env) = local_connection(project_root, connection)?;
             el_engine::explore::list_tables(&worker, project_root, &connection, &env)
         }
-        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
-            .explore_tables(connection)
-            .with_context(|| format!("on remote {remote}")),
+        DbWorker::Remote(remote) => {
+            el_engine::server::RemoteClient::connect(project_root, &remote)?
+                .explore_tables(connection)
+                .with_context(|| format!("on remote {remote}"))
+        }
     }
 }
 
@@ -143,9 +141,11 @@ pub fn run_query(
             let (connection, env) = local_connection(project_root, connection)?;
             el_engine::explore::run_query(&worker, project_root, &connection, &env, sql, limit)
         }
-        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
-            .explore_query(connection, sql, limit)
-            .with_context(|| format!("on remote {remote}")),
+        DbWorker::Remote(remote) => {
+            el_engine::server::RemoteClient::connect(project_root, &remote)?
+                .explore_query(connection, sql, limit)
+                .with_context(|| format!("on remote {remote}"))
+        }
     }
 }
 
@@ -160,17 +160,14 @@ pub fn preview_stream(
     // A preview reads through the pipeline's source, so it belongs to that
     // connection's workspace — not to whichever one the tree last touched.
     match db_worker(project_root, &pipeline.source)? {
-        DbWorker::Local(worker) => el_engine::preview_stream(
-            project_root,
-            pipeline,
-            stream,
-            limit,
-            Some(&worker),
-            cancel,
-        ),
-        DbWorker::Remote(remote) => el_engine::server::RemoteClient::connect(project_root, &remote)?
-            .explore_preview(&el_engine::spec::to_canonical_yaml(pipeline), stream, limit)
-            .with_context(|| format!("on remote {remote}")),
+        DbWorker::Local(worker) => {
+            el_engine::preview_stream(project_root, pipeline, stream, limit, Some(&worker), cancel)
+        }
+        DbWorker::Remote(remote) => {
+            el_engine::server::RemoteClient::connect(project_root, &remote)?
+                .explore_preview(&el_engine::spec::to_canonical_yaml(pipeline), stream, limit)
+                .with_context(|| format!("on remote {remote}"))
+        }
     }
 }
 
@@ -199,11 +196,7 @@ pub fn find_worker() -> Option<PathBuf> {
 /// `el::OpenPipelines`: opens the canvas for the project's pipeline(s) —
 /// the first (alphabetically) when several exist; the database panel's
 /// pipeline list is the picker for the rest.
-pub fn open_pipelines(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
+pub fn open_pipelines(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(root) = discover_el_root(workspace, cx) else {
         toast(workspace, "No project folder open in this workspace.", cx);
         return;
@@ -236,7 +229,10 @@ pub fn initialize_workspace(
         Ok(created) => {
             toast(
                 workspace,
-                &format!("EL workspace ready — {} file(s) created under el/.", created.len()),
+                &format!(
+                    "EL workspace ready — {} file(s) created under el/.",
+                    created.len()
+                ),
                 cx,
             );
             let example = el_dir(&root).join("pipelines").join("example.yml");

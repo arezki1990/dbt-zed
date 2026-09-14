@@ -105,7 +105,10 @@ fn ops_tooltip(ops: &crate::lineage::NodeOps) -> String {
     }
     if !ops.aggregations.is_empty() {
         let group = if ops.group_by { " over group by" } else { "" };
-        lines.push(format!("Aggregations: {}{group}", ops.aggregations.join(", ")));
+        lines.push(format!(
+            "Aggregations: {}{group}",
+            ops.aggregations.join(", ")
+        ));
     } else if ops.group_by {
         lines.push("Aggregation: group by".to_owned());
     }
@@ -301,11 +304,7 @@ fn active_model_file(workspace: &Workspace, cx: &App) -> Option<(String, PathBuf
         .abs_path()
         .to_path_buf();
     let settings = DbtSettings::get_global(cx);
-    let root = discover_project_root(
-        &abs_path,
-        &worktree_root,
-        settings.project_dir.as_deref(),
-    )?;
+    let root = discover_project_root(&abs_path, &worktree_root, settings.project_dir.as_deref())?;
     Some((model, root))
 }
 
@@ -334,11 +333,8 @@ pub fn show_model_data(
                 .worktree_for_id(file.worktree_id(cx), cx)?;
             let worktree_root = worktree.read(cx).abs_path().to_path_buf();
             let settings = DbtSettings::get_global(cx);
-            let root = discover_project_root(
-                &abs_path,
-                &worktree_root,
-                settings.project_dir.as_deref(),
-            )?;
+            let root =
+                discover_project_root(&abs_path, &worktree_root, settings.project_dir.as_deref())?;
             let rel_path = abs_path.strip_prefix(&root).ok()?.to_path_buf();
 
             // A non-empty selection runs as an ad-hoc query, SQL-IDE style;
@@ -397,14 +393,11 @@ impl DbtResultsPanel {
                 editor.set_placeholder_text("Search results…", window, cx);
                 editor
             });
-            cx.subscribe(
-                &search_editor,
-                |_, _, event: &editor::EditorEvent, cx| {
-                    if matches!(event, editor::EditorEvent::BufferEdited) {
-                        cx.notify();
-                    }
-                },
-            )
+            cx.subscribe(&search_editor, |_, _, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    cx.notify();
+                }
+            })
             .detach();
 
             // Browsing model files drives the lineage: whenever the active
@@ -413,8 +406,7 @@ impl DbtResultsPanel {
                 &workspace_entity,
                 |this: &mut Self, workspace, event: &workspace::Event, cx| {
                     if let workspace::Event::ActiveItemChanged = event {
-                        if let Some((model, root)) = active_model_file(workspace.read(cx), cx)
-                        {
+                        if let Some((model, root)) = active_model_file(workspace.read(cx), cx) {
                             this.refresh_lineage(model, root, cx);
                         }
                     }
@@ -422,30 +414,30 @@ impl DbtResultsPanel {
             )
             .detach();
             Self {
-            focus_handle: cx.focus_handle(),
-            languages,
-            workspace: workspace_handle,
-            lineage_store: Arc::new(LineageStore::default()),
-            state: ResultsState::Empty,
-            view: ResultsView::Table,
-            compiled_editor: None,
-            lineage_layout: None,
-            lineage_tree: None,
-            expanded: Default::default(),
-            show_upstream: true,
-            show_downstream: true,
-            show_columns: false,
-            show_tree: true,
-            show_details: false,
-            cell_detail: None,
-            collapsed_up: Default::default(),
-            collapsed_down: Default::default(),
-            selected_column: None,
-            pan: (0., 0.),
-            zoom: 1.0,
-            node_offsets: Default::default(),
-            graph_drag: None,
-            drag_moved: false,
+                focus_handle: cx.focus_handle(),
+                languages,
+                workspace: workspace_handle,
+                lineage_store: Arc::new(LineageStore::default()),
+                state: ResultsState::Empty,
+                view: ResultsView::Table,
+                compiled_editor: None,
+                lineage_layout: None,
+                lineage_tree: None,
+                expanded: Default::default(),
+                show_upstream: true,
+                show_downstream: true,
+                show_columns: false,
+                show_tree: true,
+                show_details: false,
+                cell_detail: None,
+                collapsed_up: Default::default(),
+                collapsed_down: Default::default(),
+                selected_column: None,
+                pan: (0., 0.),
+                zoom: 1.0,
+                node_offsets: Default::default(),
+                graph_drag: None,
+                drag_moved: false,
                 canvas_scroll: ScrollHandle::new(),
                 lineage_model: None,
                 search_editor,
@@ -473,11 +465,7 @@ impl DbtResultsPanel {
     }
 
     /// Row indices of the loaded results after applying search and sort.
-    fn display_indices(
-        &self,
-        rows: &[Vec<SharedString>],
-        cx: &App,
-    ) -> Vec<usize> {
+    fn display_indices(&self, rows: &[Vec<SharedString>], cx: &App) -> Vec<usize> {
         let query = self.search_editor.read(cx).text(cx).trim().to_lowercase();
         let mut indices: Vec<usize> = rows
             .iter()
@@ -499,7 +487,11 @@ impl DbtResultsPanel {
                 let a = rows[a].get(column).map(|c| c.as_ref()).unwrap_or("");
                 let b = rows[b].get(column).map(|c| c.as_ref()).unwrap_or("");
                 let ordering = compare(a, b);
-                if ascending { ordering } else { ordering.reverse() }
+                if ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
             });
         }
         indices
@@ -550,12 +542,7 @@ impl DbtResultsPanel {
                 self.workspace
                     .update(cx, |workspace, cx| {
                         workspace
-                            .open_abs_path(
-                                path,
-                                workspace::OpenOptions::default(),
-                                window,
-                                cx,
-                            )
+                            .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
                             .detach();
                     })
                     .ok();
@@ -662,7 +649,9 @@ impl DbtResultsPanel {
         let store = self.lineage_store.clone();
         let expansions = self.depth_expansions.clone();
         let task = cx.background_spawn(async move {
-            let tree = store.lineage_tree(&root, &model, tree_depth, max_nodes).ok();
+            let tree = store
+                .lineage_tree(&root, &model, tree_depth, max_nodes)
+                .ok();
             let layout = store
                 .lineage_layout(&root, &model, graph_depth, max_nodes, &expansions)
                 .ok();
@@ -703,8 +692,7 @@ impl DbtResultsPanel {
     /// never from the Workspace entity, which is mid-update when panel
     /// actions run (reading it there double-leases and panics).
     fn http_client(&self, cx: &Context<Self>) -> Option<Arc<dyn http_client::HttpClient>> {
-        let client: Arc<dyn http_client::HttpClient> =
-            client::Client::global(cx).http_client();
+        let client: Arc<dyn http_client::HttpClient> = client::Client::global(cx).http_client();
         Some(client)
     }
 
@@ -1163,8 +1151,7 @@ impl DbtResultsPanel {
         column: &str,
     ) -> Option<Arc<LayoutGraph>> {
         use crate::lineage::{
-            GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_NODE_HEIGHT, GRAPH_PADDING,
-            GRAPH_ROW_GAP,
+            GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_NODE_HEIGHT, GRAPH_PADDING, GRAPH_ROW_GAP,
         };
         let marks = Self::column_highlights(full, column);
         let mut kept: Vec<(usize, crate::lineage::GraphLayoutNode)> = Vec::new();
@@ -1225,10 +1212,7 @@ impl DbtResultsPanel {
                     26. + 8. * longest as f32
                 })
                 .fold(120.0_f32, f32::max);
-            let level_height: f32 = ixs
-                .iter()
-                .map(|&kept_ix| row_pitch(&kept[kept_ix].1))
-                .sum();
+            let level_height: f32 = ixs.iter().map(|&kept_ix| row_pitch(&kept[kept_ix].1)).sum();
             let mut y = GRAPH_PADDING + (tallest - level_height) / 2.;
             for &kept_ix in ixs {
                 let node = &mut kept[kept_ix].1;
@@ -1544,7 +1528,11 @@ impl DbtResultsPanel {
                 if collapsed.contains(layout.nodes[ix].name.as_str()) {
                     continue;
                 }
-                let links = if upstream { &incoming[ix] } else { &outgoing[ix] };
+                let links = if upstream {
+                    &incoming[ix]
+                } else {
+                    &outgoing[ix]
+                };
                 for &linked in links {
                     if !visible[linked] {
                         visible[linked] = true;
@@ -1718,18 +1706,21 @@ impl DbtResultsPanel {
         let edges = canvas(
             move |_, _, _| {},
             move |bounds, _, window, _| {
-                let draw_curve =
-                    |window: &mut Window, start: Point<Pixels>, end: Point<Pixels>, width: f32, color| {
-                        let mid_x = (start.x + end.x) / 2.;
-                        let mid = point(mid_x, (start.y + end.y) / 2.);
-                        let mut builder = PathBuilder::stroke(px(width));
-                        builder.move_to(start);
-                        builder.curve_to(mid, point(mid_x, start.y));
-                        builder.curve_to(end, point(mid_x, end.y));
-                        if let Ok(path) = builder.build() {
-                            window.paint_path(path, color);
-                        }
-                    };
+                let draw_curve = |window: &mut Window,
+                                  start: Point<Pixels>,
+                                  end: Point<Pixels>,
+                                  width: f32,
+                                  color| {
+                    let mid_x = (start.x + end.x) / 2.;
+                    let mid = point(mid_x, (start.y + end.y) / 2.);
+                    let mut builder = PathBuilder::stroke(px(width));
+                    builder.move_to(start);
+                    builder.curve_to(mid, point(mid_x, start.y));
+                    builder.curve_to(end, point(mid_x, end.y));
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, color);
+                    }
+                };
                 let draw_arrow = |window: &mut Window, end: Point<Pixels>, color| {
                     let mut arrow = PathBuilder::fill();
                     arrow.move_to(end);
@@ -1799,11 +1790,10 @@ impl DbtResultsPanel {
                                 // The selected column's transformation path
                                 // lights up in accent with direction arrows —
                                 // selecting either endpoint works.
-                                let is_selected =
-                                    edge_column_marks.as_ref().is_some_and(|marks| {
-                                        marks[to_ix].contains(to_lower.as_str())
-                                            && marks[from_ix].contains(source.as_str())
-                                    });
+                                let is_selected = edge_column_marks.as_ref().is_some_and(|marks| {
+                                    marks[to_ix].contains(to_lower.as_str())
+                                        && marks[from_ix].contains(source.as_str())
+                                });
                                 if is_selected {
                                     draw_curve(window, start, end, 2.0, accent);
                                     draw_arrow(window, end, accent);
@@ -2220,27 +2210,25 @@ impl DbtResultsPanel {
         let materialization_color = Self::materialization_color(&node.materialization, cx);
         let muted = cx.theme().colors().text_muted;
 
-        let mut body = v_flex()
-            .gap_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .flex_wrap()
-                    .child(Label::new(node.name.clone()).size(LabelSize::Small))
-                    .child(
-                        div()
-                            .px_1p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(materialization_color)
-                            .child(
-                                Label::new(node.materialization.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    ),
-            );
+        let mut body = v_flex().gap_2().child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .flex_wrap()
+                .child(Label::new(node.name.clone()).size(LabelSize::Small))
+                .child(
+                    div()
+                        .px_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(materialization_color)
+                        .child(
+                            Label::new(node.materialization.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
+        );
         if let Some(relation) = get_str("relation") {
             body = body.child(
                 div()
@@ -2272,15 +2260,18 @@ impl DbtResultsPanel {
             );
         }
         if !tags.is_empty() {
-            body = body.child(h_flex().gap_1().flex_wrap().children(tags.into_iter().map(
-                |tag| {
-                    div()
-                        .px_1p5()
-                        .rounded_md()
-                        .bg(cx.theme().colors().element_background)
-                        .child(Label::new(tag).size(LabelSize::XSmall).color(Color::Muted))
-                },
-            )));
+            body = body.child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(tags.into_iter().map(|tag| {
+                        div()
+                            .px_1p5()
+                            .rounded_md()
+                            .bg(cx.theme().colors().element_background)
+                            .child(Label::new(tag).size(LabelSize::XSmall).color(Color::Muted))
+                    })),
+            );
         }
         if let Some(ops) = node.ops.as_ref() {
             body = body.child(
@@ -2346,8 +2337,7 @@ impl DbtResultsPanel {
         cx: &mut Context<Self>,
     ) {
         for tree_node in nodes {
-            let key: SharedString =
-                format!("{id_prefix}:{depth}:{}", tree_node.node.name).into();
+            let key: SharedString = format!("{id_prefix}:{depth}:{}", tree_node.node.name).into();
             let is_expanded = self.expanded.contains(&key);
             let expandable = !tree_node.children.is_empty();
 
@@ -2531,7 +2521,9 @@ impl DbtResultsPanel {
                             .flex()
                             .items_center()
                             .cursor_pointer()
-                            .child(Label::new(format!("{column}{indicator}")).size(LabelSize::Small))
+                            .child(
+                                Label::new(format!("{column}{indicator}")).size(LabelSize::Small),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.sort = match this.sort {
                                     Some((s, true)) if s == ix => Some((ix, false)),
@@ -2553,10 +2545,8 @@ impl DbtResultsPanel {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                                    let cw =
-                                        this.col_widths.get(&ix).copied().unwrap_or(140.);
-                                    this.col_resize =
-                                        Some((ix, f32::from(event.position.x), cw));
+                                    let cw = this.col_widths.get(&ix).copied().unwrap_or(140.);
+                                    this.col_resize = Some((ix, f32::from(event.position.x), cw));
                                     cx.stop_propagation();
                                 }),
                             ),
@@ -2569,8 +2559,7 @@ impl DbtResultsPanel {
         let indices_arc = indices.clone();
         let columns_vec: Vec<SharedString> = columns.to_vec();
         let visible_arc = Arc::new(visible.clone());
-        let widths_arc: Arc<Vec<f32>> =
-            Arc::new(visible.iter().map(|ix| width_of(*ix)).collect());
+        let widths_arc: Arc<Vec<f32>> = Arc::new(visible.iter().map(|ix| width_of(*ix)).collect());
         let mut stripe_bg = cx.theme().colors().text;
         stripe_bg.a = 0.03;
         let hover_bg = cx.theme().colors().element_hover;
@@ -2601,8 +2590,7 @@ impl DbtResultsPanel {
                         for (vi, &ix) in visible_arc.iter().enumerate() {
                             let w = widths_arc[vi];
                             let cell = row.get(ix).cloned().unwrap_or_default();
-                            let column_name =
-                                columns_vec.get(ix).cloned().unwrap_or_default();
+                            let column_name = columns_vec.get(ix).cloned().unwrap_or_default();
                             // Collapse newlines/whitespace so every cell is
                             // exactly one line — uniform_list assumes a fixed
                             // row height, so a multi-line JSON cell would make
@@ -2621,9 +2609,7 @@ impl DbtResultsPanel {
                             let panel = panel.clone();
                             cells = cells.child(
                                 div()
-                                    .id(SharedString::from(format!(
-                                        "dbt-cell-{display_ix}-{vi}"
-                                    )))
+                                    .id(SharedString::from(format!("dbt-cell-{display_ix}-{vi}")))
                                     .w(px(w))
                                     .h_full()
                                     .flex_none()
@@ -2664,16 +2650,14 @@ impl DbtResultsPanel {
             .overflow_hidden()
             // Column resize is a global drag while active.
             .when(self.col_resize.is_some(), |this| {
-                this.on_mouse_move(cx.listener(
-                    |this, event: &gpui::MouseMoveEvent, _, cx| {
-                        if let Some((ix, start_x, start_w)) = this.col_resize {
-                            let new_w = (start_w + (f32::from(event.position.x) - start_x))
-                                .clamp(60., 900.);
-                            this.col_widths.insert(ix, new_w);
-                            cx.notify();
-                        }
-                    },
-                ))
+                this.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((ix, start_x, start_w)) = this.col_resize {
+                        let new_w =
+                            (start_w + (f32::from(event.position.x) - start_x)).clamp(60., 900.);
+                        this.col_widths.insert(ix, new_w);
+                        cx.notify();
+                    }
+                }))
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -2692,13 +2676,7 @@ impl DbtResultsPanel {
                     // through to the uniform_list so the two axes don't fight.
                     .restrict_scroll_to_axis()
                     .track_scroll(&self.grid_h_scroll)
-                    .child(
-                        v_flex()
-                            .w(px(total))
-                            .h_full()
-                            .child(header)
-                            .child(list),
-                    ),
+                    .child(v_flex().w(px(total)).h_full().child(header).child(list)),
             )
             // Scrollbars as sibling overlays (not on the scroll container),
             // reading the same handles — the pattern Zed's own table uses,
@@ -2756,16 +2734,16 @@ impl DbtResultsPanel {
                                                     ui::ToggleState::Selected
                                                 },
                                             )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if !this.hidden_columns.remove(&ix) {
-                                                    this.hidden_columns.insert(ix);
-                                                }
-                                                cx.notify();
-                                            })),
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    if !this.hidden_columns.remove(&ix) {
+                                                        this.hidden_columns.insert(ix);
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            ),
                                         )
-                                        .child(
-                                            Label::new(column.clone()).size(LabelSize::Small),
-                                        )
+                                        .child(Label::new(column.clone()).size(LabelSize::Small))
                                 })),
                         ),
                 )
@@ -2868,11 +2846,10 @@ impl DbtResultsPanel {
                 .gap_2()
                 .items_start()
                 .child(
-                    div().w(px(140.)).flex_shrink_0().child(
-                        Label::new(key)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    div()
+                        .w(px(140.))
+                        .flex_shrink_0()
+                        .child(Label::new(key).size(LabelSize::XSmall).color(Color::Muted)),
                 )
                 .child(
                     div()
@@ -2921,7 +2898,11 @@ impl DbtResultsPanel {
         sections.push(section(
             "Executable",
             vec![
-                row("dbt binary".into(), info.binary.clone().into(), Color::Default),
+                row(
+                    "dbt binary".into(),
+                    info.binary.clone().into(),
+                    Color::Default,
+                ),
                 row(
                     "resolved from".into(),
                     info.binary_source.into(),
@@ -2955,10 +2936,18 @@ impl DbtResultsPanel {
                     Color::Warning
                 },
             ),
-            row("found via".into(), info.profiles_source.into(), Color::Muted),
+            row(
+                "found via".into(),
+                info.profiles_source.into(),
+                Color::Muted,
+            ),
             row("profile".into(), profile, profile_color),
             row("active target".into(), target, target_color),
-            row("target from".into(), info.target_source.into(), Color::Muted),
+            row(
+                "target from".into(),
+                info.target_source.into(),
+                Color::Muted,
+            ),
         ];
         if !info.targets.is_empty() {
             let active = info.active_target.clone();
@@ -2974,34 +2963,27 @@ impl DbtResultsPanel {
                                 .color(Color::Muted),
                         ),
                     )
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .flex_wrap()
-                            .children(info.targets.iter().map(|name| {
-                                let is_active = active.as_deref() == Some(name.as_str());
-                                div()
-                                    .px_1p5()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(if is_active {
-                                        colors.text_accent
+                    .child(h_flex().flex_1().min_w_0().gap_1().flex_wrap().children(
+                        info.targets.iter().map(|name| {
+                            let is_active = active.as_deref() == Some(name.as_str());
+                            div()
+                                .px_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if is_active {
+                                    colors.text_accent
+                                } else {
+                                    colors.border
+                                })
+                                .child(Label::new(name.clone()).size(LabelSize::XSmall).color(
+                                    if is_active {
+                                        Color::Accent
                                     } else {
-                                        colors.border
-                                    })
-                                    .child(
-                                        Label::new(name.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(if is_active {
-                                                Color::Accent
-                                            } else {
-                                                Color::Muted
-                                            }),
-                                    )
-                            })),
-                    )
+                                        Color::Muted
+                                    },
+                                ))
+                        }),
+                    ))
                     .into_any_element(),
             );
         }
@@ -3068,11 +3050,9 @@ impl DbtResultsPanel {
             }))
             .children(sections)
             .child(
-                Label::new(
-                    "Passwords, keys and tokens are masked and never leave profiles.yml.",
-                )
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+                Label::new("Passwords, keys and tokens are masked and never leave profiles.yml.")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             )
             .into_any_element()
     }
@@ -3445,10 +3425,7 @@ fn merge_env_file(path: &std::path::Path, vars: &mut Vec<(String, String)>) {
     }
 }
 
-pub(crate) fn load_dotenv(
-    root: &std::path::Path,
-    env_file: Option<&str>,
-) -> Vec<(String, String)> {
+pub(crate) fn load_dotenv(root: &std::path::Path, env_file: Option<&str>) -> Vec<(String, String)> {
     // Search the project root and its ancestors up to the git repo root (a
     // dbt project often lives in a subdirectory of the repo, with .env at the
     // top). Never walk past .git — outer files load first so inner override.
@@ -3513,7 +3490,12 @@ pub(crate) fn apply_common_args(
     }
     command.envs(dotenv);
     // Explicit settings override .env.
-    command.envs(settings.env.iter().map(|(key, value)| (key.clone(), value.clone())));
+    command.envs(
+        settings
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 }
 
 /// Runs `dbt compile` for the same target and returns the compiled SQL:
@@ -3588,12 +3570,10 @@ pub(crate) fn parse_show_output(
             }
         } else if trimmed.starts_with('{') {
             match serde_json::from_str::<serde_json::Value>(trimmed) {
-                Ok(serde_json::Value::Object(mut object)) => {
-                    match object.remove("show") {
-                        Some(serde_json::Value::Array(rows)) => rows,
-                        _ => continue,
-                    }
-                }
+                Ok(serde_json::Value::Object(mut object)) => match object.remove("show") {
+                    Some(serde_json::Value::Array(rows)) => rows,
+                    _ => continue,
+                },
                 _ => continue,
             }
         } else {
@@ -3602,7 +3582,12 @@ pub(crate) fn parse_show_output(
         let columns: Vec<SharedString> = json_rows
             .first()
             .and_then(|row| row.as_object())
-            .map(|object| object.keys().map(|key| SharedString::from(key.clone())).collect())
+            .map(|object| {
+                object
+                    .keys()
+                    .map(|key| SharedString::from(key.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let rows = json_rows
             .iter()
@@ -3612,9 +3597,7 @@ pub(crate) fn parse_show_output(
                     .iter()
                     .map(|column| match object.get(column.as_ref()) {
                         None | Some(serde_json::Value::Null) => SharedString::default(),
-                        Some(serde_json::Value::String(value)) => {
-                            SharedString::from(value.clone())
-                        }
+                        Some(serde_json::Value::String(value)) => SharedString::from(value.clone()),
                         Some(other) => SharedString::from(other.to_string()),
                     })
                     .collect()
@@ -3747,12 +3730,10 @@ impl Render for DbtResultsPanel {
                                                 .child(
                                                     Button::new("dbt-cell-close", "✕")
                                                         .label_size(LabelSize::Small)
-                                                        .on_click(cx.listener(
-                                                            |this, _, _, cx| {
-                                                                this.cell_detail = None;
-                                                                cx.notify();
-                                                            },
-                                                        )),
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.cell_detail = None;
+                                                            cx.notify();
+                                                        })),
                                                 ),
                                         ),
                                 )

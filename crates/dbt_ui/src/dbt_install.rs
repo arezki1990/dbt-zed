@@ -173,7 +173,10 @@ async fn install_core(settings: &DbtSettings) -> Result<()> {
         smol::fs::metadata(managed_core_binary_path()).await.is_ok(),
         "the dbt Core install did not produce a dbt executable"
     );
-    log::info!("dbt: installed dbt Core at {:?}", managed_core_binary_path());
+    log::info!(
+        "dbt: installed dbt Core at {:?}",
+        managed_core_binary_path()
+    );
     Ok(())
 }
 
@@ -191,7 +194,11 @@ async fn resolve_version(http: &dyn HttpClient, requested: &str) -> Result<Strin
     response.body_mut().read_to_string(&mut body).await?;
     let json: serde_json::Value =
         serde_json::from_str(&body).context("parsing dbt Fusion versions.json")?;
-    let channel = if requested.is_empty() { "latest" } else { requested };
+    let channel = if requested.is_empty() {
+        "latest"
+    } else {
+        requested
+    };
     let tag = json
         .get(channel)
         .and_then(|entry| entry.get("tag"))
