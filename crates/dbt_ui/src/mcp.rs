@@ -206,10 +206,10 @@ fn call_tool(store: &LineageStore, name: &str, arguments: &Value) -> Result<Stri
 }
 
 fn list_models(root: &Path) -> Result<String> {
-    let manifest: Value = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(root.join("target").join("manifest.json"))
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(root.join("target").join("manifest.json"))
             .context("opening target/manifest.json — run `dbt parse` first")?,
-    ))?;
+    )?;
     let mut models = Vec::new();
     for section in ["nodes", "sources"] {
         for node in manifest

@@ -1032,9 +1032,9 @@ fn build_graph(
     manifest_path: &Path,
     manifest_mtime: SystemTime,
 ) -> Result<Loaded> {
-    let manifest: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(manifest_path).context("opening target/manifest.json")?,
-    ))
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(manifest_path).context("opening target/manifest.json")?,
+    )
     .context("parsing target/manifest.json")?;
 
     let db_path = project_root.join("target").join("zed-dbt-lineage.db");
@@ -1045,9 +1045,9 @@ fn build_graph(
     // Column metadata: catalog.json (real warehouse columns, ordered) when
     // available, produced by `dbt compile --write-catalog`.
     let catalog: Option<serde_json::Value> =
-        std::fs::File::open(project_root.join("target").join("catalog.json"))
+        std::fs::read(project_root.join("target").join("catalog.json"))
             .ok()
-            .and_then(|file| serde_json::from_reader(std::io::BufReader::new(file)).ok());
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     // Per-node details card data: types/stats from catalog, docs from manifest.
     let node_details = |unique_id: &str, node: &serde_json::Value| -> serde_json::Value {
         let mut column_types = serde_json::Map::new();

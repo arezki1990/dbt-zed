@@ -70,7 +70,6 @@ enum TablesState {
 }
 
 enum Row {
-    Header(SharedString),
     /// Section headers: collapse chevron, label, and the "+" action.
     PipelinesHeader,
     ConnectionsHeader,
@@ -596,7 +595,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         let task = cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
         let key = name.clone();
         self._list_tasks.insert(
-            key.clone(),
+            key,
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 this.update(cx, |this, cx| {
@@ -1021,7 +1020,6 @@ impl Render for ElPanel {
                                             },
                                         );
                                     }
-                                    let panel = panel.clone();
                                     menu.separator().entry(
                                         "Edit connections.yml",
                                         None,
@@ -1085,13 +1083,6 @@ impl ElPanel {
             .items_center()
             .hover(|style| style.bg(cx.theme().colors().element_hover));
         match row {
-            Row::Header(title) => base
-                .child(
-                    Label::new(title.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .into_any_element(),
             Row::PipelinesHeader => self
                 .render_section_header(base, "pipelines", "Pipelines", cx)
                 .child(

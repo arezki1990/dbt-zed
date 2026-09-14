@@ -158,7 +158,7 @@ impl ElRunView {
             chunk_rows: 50_000,
             profile_override: None,
         };
-        let engine_cancel = cancel.clone();
+        let engine_cancel = cancel;
         // The engine run is blocking: one background thread for its
         // lifetime, cancellation via the flag between chunks.
         let engine = cx.background_spawn(async move {

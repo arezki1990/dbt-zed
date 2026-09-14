@@ -340,7 +340,7 @@ pub fn show_model_data(
             // A non-empty selection runs as an ad-hoc query, SQL-IDE style;
             // otherwise the whole model runs.
             let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-            let selection = editor.read(cx).selections.newest_anchor().clone();
+            let selection = *editor.read(cx).selections.newest_anchor();
             let range = selection.start.to_offset(&snapshot)..selection.end.to_offset(&snapshot);
             let target = if range.is_empty() {
                 ShowTarget::Model {
@@ -386,7 +386,7 @@ impl DbtResultsPanel {
     ) -> Entity<Self> {
         let languages = workspace.project().read(cx).languages().clone();
         let workspace_handle = cx.entity().downgrade();
-        let workspace_entity = cx.entity().clone();
+        let workspace_entity = cx.entity();
         cx.new(|cx| {
             let search_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
@@ -1349,7 +1349,7 @@ impl DbtResultsPanel {
                     Some(expr) if is_transform => format!("{local} = {expr}"),
                     Some(_) => format!("{local} · passthrough"),
                     None if node.kind == "source" => format!("{local} · source"),
-                    None => local.clone(),
+                    None => local,
                 };
                 (node.level, node.name.clone(), label, is_transform)
             })
@@ -2006,7 +2006,7 @@ impl DbtResultsPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener({
-                            let name = node.name.clone();
+                            let name = node.name;
                             move |this, event: &gpui::MouseDownEvent, _, cx| {
                                 this.drag_moved = false;
                                 this.graph_drag =
@@ -2440,7 +2440,7 @@ impl DbtResultsPanel {
                         )
                         .icon_size(IconSize::Small)
                         .on_click(cx.listener({
-                            let key = section_key.clone();
+                            let key = section_key;
                             move |this, _, _, cx| {
                                 if !this.expanded.remove(&key) {
                                     this.expanded.insert(key.clone());
@@ -2556,7 +2556,7 @@ impl DbtResultsPanel {
 
         // Rows, virtualized.
         let rows_arc = rows.clone();
-        let indices_arc = indices.clone();
+        let indices_arc = indices;
         let columns_vec: Vec<SharedString> = columns.to_vec();
         let visible_arc = Arc::new(visible.clone());
         let widths_arc: Arc<Vec<f32>> = Arc::new(visible.iter().map(|ix| width_of(*ix)).collect());
@@ -3748,7 +3748,7 @@ impl Render for DbtResultsPanel {
                                                 .font_family("Menlo")
                                                 .text_size(px(12.))
                                                 .whitespace_normal()
-                                                .child(value.clone()),
+                                                .child(value),
                                         ),
                                 ),
                         ),

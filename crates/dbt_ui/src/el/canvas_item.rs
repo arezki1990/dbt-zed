@@ -1105,7 +1105,7 @@ impl ElPipelineCanvas {
             name: dragged.table.clone(),
             source: el_engine::spec::SourceObject::Table {
                 schema: Some(dragged.schema.clone()),
-                table: dragged.table.clone(),
+                table: dragged.table,
             },
             mode: None,
             primary_key: vec![],

@@ -365,6 +365,10 @@ fn install_remote(args: &[String]) -> i32 {
 
 /// Runs a remote shell command via the user's ssh; `stdin` is piped
 /// verbatim when given (how the token travels — never on a command line).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "headless `zdbt el` CLI: no executor runs here and waiting on ssh is the point"
+)]
 fn run_ssh(host: &str, ssh_flags: &[String], command: &str, stdin: Option<&str>) -> bool {
     use std::io::Write as _;
     let mut cmd = std::process::Command::new("ssh");

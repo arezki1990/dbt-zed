@@ -119,16 +119,16 @@ fn stat_u64(entry: &serde_json::Value, id: &str) -> Option<u64> {
 /// Builds the offline tree. Synchronous filesystem + JSON work only — call it
 /// from a background task.
 pub fn build_catalog(project_root: &Path) -> Result<DbCatalog> {
-    let manifest: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(project_root.join("target").join("manifest.json"))
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(project_root.join("target").join("manifest.json"))
             .context("no target/manifest.json — run `dbt parse` first")?,
-    ))
+    )
     .context("parsing target/manifest.json")?;
 
     let catalog: Option<serde_json::Value> =
-        std::fs::File::open(project_root.join("target").join("catalog.json"))
+        std::fs::read(project_root.join("target").join("catalog.json"))
             .ok()
-            .and_then(|file| serde_json::from_reader(std::io::BufReader::new(file)).ok());
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
     let adapter = manifest
         .get("metadata")

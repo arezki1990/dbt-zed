@@ -258,7 +258,7 @@ fn collect_expr_leaves(
     depth: usize,
     out: &mut Vec<Leaf>,
 ) {
-    let mut push_all = |leaves: &Vec<Leaf>, out: &mut Vec<Leaf>| {
+    let push_all = |leaves: &Vec<Leaf>, out: &mut Vec<Leaf>| {
         for leaf in leaves {
             if !out.contains(leaf) {
                 out.push(leaf.clone());
@@ -439,11 +439,10 @@ mod tests {
         let target =
             std::path::Path::new("/Users/arezkipro/projects/dbt-employees/employees/target");
         let manifest: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(target.join("manifest.json")).unwrap())
-                .unwrap();
-        let catalog: serde_json::Value = std::fs::File::open(target.join("catalog.json"))
+            serde_json::from_slice(&std::fs::read(target.join("manifest.json")).unwrap()).unwrap();
+        let catalog: serde_json::Value = std::fs::read(target.join("catalog.json"))
             .ok()
-            .and_then(|file| serde_json::from_reader(file).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::json!({"nodes": {}, "sources": {}}));
 
         let catalog_cols = |uid: &str| -> Vec<String> {
