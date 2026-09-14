@@ -269,7 +269,7 @@ fn dbt_task_context() -> ContextProviderWithTasks {
             vec![
                 "show".into(),
                 "--select".into(),
-                model.clone(),
+                model,
                 "--limit".into(),
                 "50".into(),
             ],
