@@ -213,7 +213,21 @@ pub async fn start(project_root: &Path, image: &str) -> Result<()> {
         .await
         .context("running docker")?;
     if !output.status.success() {
-        bail!("{}", first_line(&String::from_utf8_lossy(&output.stderr)));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // `docker run` leaves a created, never-started container behind when
+        // it can't start one; don't leave that for the panel to report.
+        docker_command()
+            .args(["rm", "--force", &name])
+            .output()
+            .await
+            .ok();
+        if stderr.contains("port is already allocated") {
+            bail!(
+                "port {PORT} is already in use — another project's local runner \
+                 probably holds it; stop that one first"
+            );
+        }
+        bail!("{}", first_line(&stderr));
     }
     Ok(())
 }
@@ -567,6 +581,18 @@ mod tests {
             eprintln!("started in {:?}", started.elapsed());
             let result = async {
                 assert_eq!(container(root).await?, Container::Running);
+
+                // A second project can't have the port: it gets told why, and
+                // no dead container is left behind.
+                let other = tempfile::tempdir()?;
+                std::fs::create_dir_all(super::super::el_dir(other.path()))?;
+                let refused = start(other.path(), &image).await.unwrap_err();
+                assert!(
+                    format!("{refused:#}").contains("already in use"),
+                    "{refused:#}"
+                );
+                assert_eq!(container(other.path()).await?, Container::Missing);
+
                 let client = el_engine::server::RemoteClient::connect(root, REMOTE_NAME)?;
                 let mut health = client.health();
                 for _ in 0..60 {
