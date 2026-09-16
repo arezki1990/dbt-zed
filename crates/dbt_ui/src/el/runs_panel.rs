@@ -1387,15 +1387,28 @@ impl ElRunsPanel {
                     })),
             );
 
-        let body: gpui::AnyElement = if self.remote_pipelines.is_empty()
+        // Empty lists alone can't tell "still connecting" from "connected to a
+        // server with nothing on it" — a fresh local runner is the latter. The
+        // server's first answer (a snapshot, or health) is what sets the status.
+        let holds_nothing = self.remote_pipelines.is_empty()
             && self.remote_runs.is_empty()
-            && self.remote_error.is_none()
-        {
+            && self.remote_error.is_none();
+        let body: gpui::AnyElement = if holds_nothing && self.remote_status.is_none() {
             v_flex()
                 .flex_1()
                 .p_2()
                 .child(
                     Label::new("Connecting to the remote…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        } else if holds_nothing {
+            v_flex()
+                .flex_1()
+                .p_2()
+                .child(
+                    Label::new("Connected — nothing is deployed on this server yet.")
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
