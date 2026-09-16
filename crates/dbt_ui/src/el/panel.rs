@@ -4,6 +4,7 @@
 //! panels; works in standalone EL projects with no dbt_project.yml.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Task,
@@ -15,6 +16,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+use super::local_runner::{self, Access, Container};
 use crate::ToggleElPanelFocus;
 
 pub struct ElPanel {
@@ -38,6 +40,9 @@ pub struct ElPanel {
     missing_env: std::collections::HashMap<SharedString, Vec<String>>,
     /// Remote name → the token variable that is not set locally.
     remotes_missing_token: std::collections::HashMap<SharedString, String>,
+    /// The built-in local runner: the licence check's answer, the
+    /// container's state, and whatever start or stop is in flight.
+    runner: RunnerState,
     /// Section keys the user folded ("pipelines", "connections", "remotes").
     collapsed: std::collections::HashSet<&'static str>,
     /// Connections whose table list is unfolded in the explorer.
@@ -69,6 +74,21 @@ enum TablesState {
     Failed(SharedString),
 }
 
+/// The Remotes section's built-in `localhost` runner.
+struct RunnerState {
+    /// None until the first licence check answers.
+    access: Option<Access>,
+    /// None when Docker could not be asked.
+    container: Option<Container>,
+    /// "starting…" or "stopping…" while an action runs.
+    busy: Option<&'static str>,
+    error: Option<SharedString>,
+    /// The project the last check ran for; another project checks again.
+    checked_root: Option<PathBuf>,
+    _check: Task<()>,
+    _action: Task<()>,
+}
+
 enum Row {
     /// Section headers: collapse chevron, label, and the "+" action.
     PipelinesHeader,
@@ -83,6 +103,10 @@ enum Row {
         table: String,
     },
     ConnNote(SharedString, Color),
+    /// The built-in local runner (`localhost`), with its start/stop control.
+    LocalRunner,
+    /// A note about the local runner; the tooltip carries Docker's own words.
+    RunnerNote(SharedString, Color, Option<SharedString>),
     /// "Set X in .env to connect" under a connection or server whose
     /// `${VAR}` references are unset — click opens .env.
     EnvHint(Vec<String>),
@@ -144,6 +168,15 @@ impl ElPanel {
             remotes: Vec::new(),
             missing_env: Default::default(),
             remotes_missing_token: Default::default(),
+            runner: RunnerState {
+                access: None,
+                container: None,
+                busy: None,
+                error: None,
+                checked_root: None,
+                _check: Task::ready(()),
+                _action: Task::ready(()),
+            },
             collapsed: Default::default(),
             expanded: Default::default(),
             tables: Default::default(),
@@ -169,6 +202,9 @@ impl ElPanel {
         let Some(root) = root else {
             return;
         };
+        if self.runner.checked_root.as_ref() != Some(&root) {
+            self.check_runner(&root, cx);
+        }
         let el = super::el_dir(&root);
         // Self-heal the derived JSON schemas the YAML headers point at —
         // hand-made projects never ran Initialize.
@@ -405,6 +441,130 @@ impl ElPanel {
         rows
     }
 
+    /// The built-in runner, or what stands in its way. Only a licensed
+    /// machine gets the row itself; everyone else is told what to do next.
+    fn runner_rows(&self) -> Vec<Row> {
+        let note = |text: &str, color: Color, detail: &String| {
+            Row::RunnerNote(text.to_owned().into(), color, Some(detail.clone().into()))
+        };
+        match &self.runner.access {
+            None => vec![Row::RunnerNote(
+                "Checking the local runner licence…".into(),
+                Color::Muted,
+                None,
+            )],
+            Some(Access::Licensed) => {
+                let mut rows = vec![Row::LocalRunner];
+                if let Some(error) = &self.runner.error {
+                    rows.push(Row::ConnNote(error.clone(), Color::Error));
+                }
+                rows
+            }
+            Some(Access::Unlicensed(detail)) => vec![note(
+                "The local runner needs a licence — ask your provider for access.",
+                Color::Warning,
+                detail,
+            )],
+            Some(Access::SignIn(detail)) => vec![note(
+                "Sign in to the runner's registry and refresh, or ask your provider for a licence.",
+                Color::Warning,
+                detail,
+            )],
+            Some(Access::NoDocker(detail)) => vec![note(
+                "Start Docker and refresh to run pipelines on this machine.",
+                Color::Muted,
+                detail,
+            )],
+            Some(Access::Unavailable(detail)) => vec![note(
+                "The local runner can't be checked right now.",
+                Color::Muted,
+                detail,
+            )],
+        }
+    }
+
+    /// Asks the registry whether this machine may run the EL image, and
+    /// Docker what the project's runner container is doing, off the UI
+    /// thread. A registry that never answers counts as unavailable.
+    fn check_runner(&mut self, root: &std::path::Path, cx: &mut Context<Self>) {
+        self.runner.checked_root = Some(root.to_path_buf());
+        let root = root.to_path_buf();
+        let timeout = cx.background_executor().timer(Duration::from_secs(20));
+        let task = cx.background_spawn(async move {
+            let image = local_runner::image(&root);
+            let access = smol::future::or(local_runner::check_access(&image), async move {
+                timeout.await;
+                Access::Unavailable("the registry did not answer within 20 seconds".to_owned())
+            })
+            .await;
+            let container = local_runner::container(&root).await.ok();
+            (access, container)
+        });
+        self.runner._check = cx.spawn(async move |this, cx| {
+            let (access, container) = task.await;
+            this.update(cx, |this, cx| {
+                this.runner.access = Some(access);
+                this.runner.container = container;
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    fn start_runner(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.runner.busy = Some("starting…");
+        self.runner.error = None;
+        cx.notify();
+        let task = cx.background_spawn({
+            let root = root.clone();
+            async move {
+                let image = local_runner::image(&root);
+                local_runner::start(&root, &image).await
+            }
+        });
+        self.runner._action = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.runner.busy = None;
+                if let Err(error) = result {
+                    this.runner.error = Some(format!("{error:#}").into());
+                }
+                // remotes.yml may have gained `localhost`, and the container
+                // has changed either way.
+                this.refresh(cx);
+                this.check_runner(&root, cx);
+            })
+            .ok();
+        });
+    }
+
+    fn stop_runner(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.runner.busy = Some("stopping…");
+        self.runner.error = None;
+        cx.notify();
+        let task = cx.background_spawn({
+            let root = root.clone();
+            async move { local_runner::stop(&root).await }
+        });
+        self.runner._action = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.runner.busy = None;
+                if let Err(error) = result {
+                    this.runner.error = Some(format!("{error:#}").into());
+                }
+                this.check_runner(&root, cx);
+            })
+            .ok();
+        });
+    }
+
     /// The bottom list: declared servers.
     fn remote_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
@@ -412,7 +572,9 @@ impl ElPanel {
         if self.collapsed.contains("remotes") {
             return rows;
         }
-        if self.remotes.is_empty() {
+        let runner_offered = matches!(self.runner.access, Some(Access::Licensed));
+        rows.extend(self.runner_rows());
+        if self.remotes.is_empty() && !runner_offered {
             rows.push(Row::RemotesEmpty);
             rows.push(Row::ConnNote(
                 "A server runs deployed pipelines on a schedule.".into(),
@@ -420,6 +582,10 @@ impl ElPanel {
             ));
         }
         for (name, host) in &self.remotes {
+            // The runner row already stands for `localhost`.
+            if runner_offered && name.as_ref() == local_runner::REMOTE_NAME {
+                continue;
+            }
             rows.push(Row::Remote(name.clone(), host.clone()));
             if let Some(var) = self.remotes_missing_token.get(name) {
                 rows.push(Row::EnvHint(vec![var.clone()]));
@@ -959,6 +1125,9 @@ impl Render for ElPanel {
                                     this.load_tables(name, cx);
                                 }
                                 this.refresh(cx);
+                                if let Some(root) = this.root.clone() {
+                                    this.check_runner(&root, cx);
+                                }
                             })),
                     ),
             )
@@ -1286,6 +1455,88 @@ impl ElPanel {
                     }))
                     .into_any_element()
             }
+            Row::LocalRunner => {
+                let running = self.runner.container == Some(Container::Running);
+                let busy = self.runner.busy;
+                let status: SharedString = match (busy, &self.runner.container) {
+                    (Some(busy), _) => busy.into(),
+                    (None, Some(Container::Running)) => "running".into(),
+                    (None, Some(Container::Stopped(status))) if !status.is_empty() => {
+                        status.clone().into()
+                    }
+                    _ => "stopped".into(),
+                };
+                let control = if running {
+                    IconButton::new("el-runner-stop", IconName::Stop)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(busy.is_some())
+                        .tooltip(Tooltip::text("Stop the local runner"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.stop_runner(cx);
+                        }))
+                } else {
+                    IconButton::new("el-runner-start", IconName::PlayFilled)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(busy.is_some())
+                        .tooltip(Tooltip::text("Start the local runner"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.start_runner(cx);
+                        }))
+                };
+                base.child(
+                    Icon::new(IconName::Server)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(local_runner::REMOTE_NAME).size(LabelSize::Small))
+                .child(div().flex_1())
+                .child(
+                    Label::new(status)
+                        .size(LabelSize::XSmall)
+                        .color(if running {
+                            Color::Success
+                        } else {
+                            Color::Muted
+                        })
+                        .truncate(),
+                )
+                .child(control)
+                .tooltip(|_, cx| {
+                    Tooltip::with_meta(
+                        "Local runner",
+                        None,
+                        "The EL daemon in this machine's Docker, serving this project at \
+                         http://127.0.0.1:7431 as the `localhost` server in el/remotes.yml. \
+                         Point a connection at it with `workspace: localhost`.",
+                        cx,
+                    )
+                })
+                .when(running, |row| {
+                    row.cursor_pointer()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_remote(local_runner::REMOTE_NAME.into(), window, cx);
+                        }))
+                })
+                .into_any_element()
+            }
+            Row::RunnerNote(text, color, detail) => base
+                .pl_6()
+                .child(
+                    Label::new(text.clone())
+                        .size(LabelSize::XSmall)
+                        .color(*color),
+                )
+                .when_some(detail.clone(), |row, detail| {
+                    let text = text.clone();
+                    row.tooltip(move |_, cx| {
+                        Tooltip::with_meta(text.clone(), None, detail.clone(), cx)
+                    })
+                })
+                .into_any_element(),
             Row::ConnNote(text, color) => base
                 .pl_6()
                 .child(
