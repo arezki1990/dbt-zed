@@ -328,10 +328,16 @@ pub fn is_runner_url(raw: &str) -> bool {
 /// so a project keeps one entry per daemon; otherwise it becomes `localhost`.
 pub fn runner_remote(project_root: &Path) -> Result<RunnerRemote> {
     let remotes = load_remotes(project_root)?;
-    let adopted = remotes
+    // With several servers at the address, `localhost` is the runner's own
+    // name and the one connections were pointed at; otherwise the first wins.
+    let mut at_address = remotes
         .remotes
         .iter()
-        .find(|(_, remote)| is_runner_url(&remote.url));
+        .filter(|(_, remote)| is_runner_url(&remote.url));
+    let adopted = at_address
+        .clone()
+        .find(|(name, _)| name.as_str() == REMOTE_NAME)
+        .or_else(|| at_address.next());
     Ok(match adopted {
         Some((name, remote)) => match remote.token.as_deref() {
             Some(template) => {
@@ -718,6 +724,20 @@ mod tests {
         assert_eq!(remote.token_var, "ZDBT_EL_TOKEN");
         declare_remote(dir.path(), &remote).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn localhost_wins_when_several_servers_share_the_address() {
+        let dir = tempfile::tempdir().unwrap();
+        remotes_file(
+            dir.path(),
+            "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ZDBT_EL_TOKEN}\n  localhost:\n    url: http://127.0.0.1:7431\n    token: ${EL_RUNNER_TOKEN}\n",
+        );
+        let remote = runner_remote(dir.path()).unwrap();
+        assert_eq!(
+            (remote.name.as_str(), remote.token_var.as_str()),
+            (REMOTE_NAME, TOKEN_VAR)
+        );
     }
 
     #[test]
