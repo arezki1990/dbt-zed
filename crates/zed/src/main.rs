@@ -212,6 +212,11 @@ fn main() {
         dbt_ui::mcp::serve();
         return;
     }
+    // Fork: `--el-mcp` serves the extract-load tools the same way.
+    if std::env::args().any(|arg| arg == "--el-mcp") {
+        dbt_ui::el::mcp::serve();
+        return;
+    }
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode

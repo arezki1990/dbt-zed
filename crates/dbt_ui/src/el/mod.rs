@@ -10,6 +10,7 @@ pub mod dialog;
 pub mod layout;
 pub mod local_runner;
 pub mod mapping_editor;
+pub mod mcp;
 pub mod panel;
 pub mod remote_modal;
 pub mod rename_stream_modal;

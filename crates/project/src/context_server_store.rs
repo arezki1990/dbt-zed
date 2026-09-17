@@ -1156,19 +1156,22 @@ impl ContextServerStore {
         // this binary re-invoked with --dbt-mcp — unless the user configured
         // their own "dbt" entry.
         if !merged.contains_key("dbt") {
-            let has_dbt_project = worktree_store.read(cx).visible_worktrees(cx).any(|worktree| {
-                let root = worktree.read(cx).abs_path();
-                if root.join("dbt_project.yml").is_file() {
-                    return true;
-                }
-                std::fs::read_dir(&root)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .take(64)
-                    .any(|entry| entry.path().join("dbt_project.yml").is_file())
-            });
+            let has_dbt_project = worktree_store
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| {
+                    let root = worktree.read(cx).abs_path();
+                    if root.join("dbt_project.yml").is_file() {
+                        return true;
+                    }
+                    std::fs::read_dir(&root)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .take(64)
+                        .any(|entry| entry.path().join("dbt_project.yml").is_file())
+                });
             if has_dbt_project && let Ok(exe) = std::env::current_exe() {
                 merged.insert(
                     "dbt".into(),
@@ -1180,6 +1183,48 @@ impl ContextServerStore {
                             command: settings::ContextServerCommand {
                                 path: exe,
                                 args: vec!["--dbt-mcp".to_owned()],
+                                env: None,
+                                timeout: None,
+                            },
+                        },
+                    },
+                );
+            }
+        }
+        // Fork: extract-load projects — an el/ holding connections or
+        // pipelines — get the EL tools the same way, as "el".
+        if !merged.contains_key("el") {
+            let is_el_project = |dir: &std::path::Path| {
+                let el = dir.join("el");
+                el.join("connections.yml").is_file() || el.join("pipelines").is_dir()
+            };
+            let has_el_project = worktree_store
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| {
+                    let root = worktree.read(cx).abs_path();
+                    if is_el_project(&root) {
+                        return true;
+                    }
+                    std::fs::read_dir(&root)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .take(64)
+                        .any(|entry| is_el_project(&entry.path()))
+                });
+            if has_el_project && let Ok(exe) = std::env::current_exe() {
+                merged.insert(
+                    "el".into(),
+                    ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: ContextServerSettings::Stdio {
+                            enabled: true,
+                            remote: false,
+                            command: settings::ContextServerCommand {
+                                path: exe,
+                                args: vec!["--el-mcp".to_owned()],
                                 env: None,
                                 timeout: None,
                             },

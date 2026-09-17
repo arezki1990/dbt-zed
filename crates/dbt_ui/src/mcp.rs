@@ -61,6 +61,18 @@ fn arg_str<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
 
 pub fn serve() {
     let store = LineageStore::default();
+    serve_stdio("zdbt", tool_descriptors(), |name, arguments| {
+        call_tool(&store, name, arguments)
+    });
+}
+
+/// The MCP loop both zdbt servers share: one JSON-RPC message per line on
+/// stdin, one response per line on stdout, until stdin closes.
+pub fn serve_stdio(
+    server_name: &str,
+    tools: Value,
+    mut call: impl FnMut(&str, &Value) -> Result<String>,
+) {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -79,8 +91,7 @@ pub fn serve() {
         // Notifications (no id) need no response.
         let Some(id) = id else { continue };
         let params = message.get("params").cloned().unwrap_or(Value::Null);
-        let result = handle(&store, method, &params);
-        let response = match result {
+        let response = match handle(server_name, &tools, &mut call, method, &params) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err(error) => json!({
                 "jsonrpc": "2.0",
@@ -89,31 +100,49 @@ pub fn serve() {
             }),
         };
         let mut out = stdout.lock();
-        let _ = writeln!(out, "{response}");
-        let _ = out.flush();
+        if writeln!(out, "{response}")
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            break; // the client went away
+        }
     }
 }
 
-fn handle(store: &LineageStore, method: &str, params: &Value) -> Result<Value> {
+fn handle(
+    server_name: &str,
+    tools: &Value,
+    call: &mut impl FnMut(&str, &Value) -> Result<String>,
+    method: &str,
+    params: &Value,
+) -> Result<Value> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "zdbt", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": server_name, "version": env!("CARGO_PKG_VERSION") },
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
+        "tools/list" => Ok(json!({ "tools": tools })),
         "tools/call" => {
             let name = params
                 .get("name")
                 .and_then(|name| name.as_str())
                 .context("tools/call without a name")?;
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            let text = call_tool(store, name, &arguments)?;
-            Ok(json!({
-                "content": [{ "type": "text", "text": text }],
-                "isError": false,
-            }))
+            // A tool that fails answers as a tool result, so the model reads
+            // why and can correct itself; JSON-RPC errors are for the
+            // protocol.
+            Ok(match call(name, &arguments) {
+                Ok(text) => json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false,
+                }),
+                Err(error) => json!({
+                    "content": [{ "type": "text", "text": format!("{error:#}") }],
+                    "isError": true,
+                }),
+            })
         }
         other => anyhow::bail!("unsupported method: {other}"),
     }
