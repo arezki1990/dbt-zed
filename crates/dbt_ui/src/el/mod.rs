@@ -148,6 +148,62 @@ pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<
     }
 }
 
+/// The local worker for one level of a catalog tree. A remote's daemon
+/// only lists a catalog whole, so its connections are grouped instead.
+fn level_worker(
+    project_root: &Path,
+    name: &str,
+) -> anyhow::Result<(PathBuf, el_engine::spec::Connection, el_engine::env::EnvMap)> {
+    match db_worker(project_root, name)? {
+        DbWorker::Local(worker) => {
+            let (connection, env) = local_connection(project_root, name)?;
+            Ok((worker, connection, env))
+        }
+        DbWorker::Remote(remote) => {
+            anyhow::bail!("{name} runs on {remote}, which lists its catalog whole")
+        }
+    }
+}
+
+/// A Snowflake account's databases. Blocking.
+pub fn list_databases(project_root: &Path, connection: &str) -> anyhow::Result<Vec<String>> {
+    let (worker, connection, env) = level_worker(project_root, connection)?;
+    el_engine::explore::list_databases(&worker, project_root, &connection, &env)
+}
+
+/// One Snowflake database's schemas. Blocking.
+pub fn list_schemas(
+    project_root: &Path,
+    connection: &str,
+    database: &str,
+) -> anyhow::Result<Vec<String>> {
+    let (worker, connection, env) = level_worker(project_root, connection)?;
+    el_engine::explore::list_schemas(&worker, project_root, &connection, &env, database)
+}
+
+/// One Snowflake schema's tables and views, by name. Blocking.
+pub fn list_schema_tables(
+    project_root: &Path,
+    connection: &str,
+    database: &str,
+    schema: &str,
+) -> anyhow::Result<Vec<String>> {
+    let (worker, connection, env) = level_worker(project_root, connection)?;
+    Ok(
+        el_engine::explore::list_schema_tables(
+            &worker,
+            project_root,
+            &connection,
+            &env,
+            database,
+            schema,
+        )?
+        .into_iter()
+        .map(|(_, table)| table)
+        .collect(),
+    )
+}
+
 /// Runs an ad-hoc query on the checkout's database worker. Blocking.
 pub fn run_query(
     project_root: &Path,

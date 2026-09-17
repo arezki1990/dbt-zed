@@ -53,6 +53,12 @@ pub struct ElPanel {
     /// Each unfolded connection's table search and page, kept while folded
     /// so reopening one finds its list as it was left.
     browsers: std::collections::HashMap<SharedString, TableBrowser>,
+    /// Each connection's database/schema/table tree: what is unfolded, the
+    /// pages of long schemas, and the levels listed one at a time.
+    trees: std::collections::HashMap<SharedString, CatalogTree>,
+    /// Snowflake connections that name their database: the tree starts
+    /// there instead of listing the account.
+    pinned_databases: std::collections::HashMap<SharedString, String>,
     /// Bumped on profile/connection changes: in-flight table listings
     /// from the previous environment are dropped, not displayed.
     tables_epoch: u64,
@@ -86,6 +92,49 @@ enum TablesState {
         haystack: Vec<String>,
     },
     Failed(SharedString),
+}
+
+/// One level of a catalog listed on its own.
+enum Listing<T> {
+    Loading,
+    Loaded(T),
+    Failed(SharedString),
+}
+
+/// A connection's explorer tree. A level with a single entry starts
+/// unfolded, so `toggled` records the clicks that flipped the default.
+#[derive(Default)]
+struct CatalogTree {
+    /// Snowflake on this machine lists by level, since its whole account can
+    /// take a minute: the databases, then schemas and tables as unfolded.
+    databases: Option<Listing<Vec<String>>>,
+    schemas: std::collections::HashMap<String, Listing<Vec<String>>>,
+    /// Keyed by (database, schema).
+    tables: std::collections::HashMap<(String, String), Listing<Vec<String>>>,
+    toggled_databases: std::collections::HashSet<String>,
+    /// (database, schema); the database is "" for kinds that are one
+    /// database.
+    toggled_schemas: std::collections::HashSet<(String, String)>,
+    pages: std::collections::HashMap<(String, String), usize>,
+}
+
+/// What a pager row pages: the search's matches, or one schema's tables.
+#[derive(Clone)]
+enum PagerScope {
+    Search,
+    Schema(String, String),
+}
+
+/// Snowflake on this machine is browsed a level at a time; everything
+/// else — and Snowflake behind a remote, whose daemon lists a catalog
+/// whole — arrives in one listing and is grouped here.
+fn lists_by_level(kind: &str, workspace: &str) -> bool {
+    kind == "snowflake" && workspace == "local"
+}
+
+/// Tree indentation: the connection row sits at depth 0.
+fn indent(depth: usize) -> Pixels {
+    px(8. + 16. * depth as f32)
 }
 
 struct TableBrowser {
@@ -124,24 +173,49 @@ enum Row {
     Remote(SharedString, SharedString),
     Pipeline(PathBuf),
     Connection(SharedString, SharedString, SharedString),
+    /// A Snowflake database in a connection's tree.
+    Database {
+        connection: SharedString,
+        database: String,
+        open: bool,
+    },
+    /// A schema; `database` is "" for kinds that are one database. `tables`
+    /// counts them once they are known.
+    Schema {
+        connection: SharedString,
+        database: String,
+        schema: String,
+        tables: Option<usize>,
+        open: bool,
+        depth: usize,
+    },
+    /// `schema` is what a query names: `DATABASE.SCHEMA` on Snowflake.
     Table {
         connection: SharedString,
         schema: String,
         table: String,
+        depth: usize,
     },
     ConnNote(SharedString, Color),
-    /// A connection's tables are being listed; a 10g dictionary can take
-    /// several seconds, so it spins rather than sits still.
-    TablesLoading,
+    /// A level of a tree that is loading, empty or failed; loading spins,
+    /// since a 10g dictionary or a Snowflake account can take seconds.
+    TreeNote {
+        text: SharedString,
+        color: Color,
+        depth: usize,
+        loading: bool,
+    },
     /// The search field over a connection's tables.
     TableSearch(SharedString),
     /// After a page of tables: which ones out of how many, with page
     /// buttons when there is more than one page.
     TablePager {
         connection: SharedString,
+        scope: PagerScope,
         shown: Range<usize>,
         total: usize,
         searching: bool,
+        depth: usize,
     },
     /// The built-in local runner (`localhost`), with its start/stop control.
     LocalRunner,
@@ -222,6 +296,8 @@ impl ElPanel {
             expanded: Default::default(),
             tables: Default::default(),
             browsers: Default::default(),
+            trees: Default::default(),
+            pinned_databases: Default::default(),
             tables_epoch: 0,
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
@@ -290,6 +366,7 @@ impl ElPanel {
             })
             .unwrap_or_default();
         self.missing_env.clear();
+        self.pinned_databases.clear();
         match el_engine::spec::load_active_connections(&root) {
             Ok((connections, profile)) => {
                 self.profile = profile.map(Into::into);
@@ -309,6 +386,16 @@ impl ElPanel {
                         let missing = connection.missing_env_refs(&env);
                         if !missing.is_empty() {
                             self.missing_env.insert(name.clone(), missing);
+                        }
+                        if let el_engine::spec::Connection::Snowflake(snowflake) = connection {
+                            if let Some(database) = snowflake.database.as_deref().and_then(|template| {
+                                el_engine::env::resolve_templates(template, &env).ok()
+                            }) {
+                                let database = database.expose().trim().to_owned();
+                                if !database.is_empty() {
+                                    self.pinned_databases.insert(name.clone(), database);
+                                }
+                            }
                         }
                         let workspace: SharedString =
                             connection.workspace().unwrap_or("local").to_owned().into();
@@ -354,6 +441,7 @@ impl ElPanel {
         self.tables.clear();
         self.expanded.clear();
         self.browsers.clear();
+        self.trees.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
         // The selection file is one voice among three — say what actually
@@ -460,18 +548,7 @@ impl ElPanel {
                 if !self.expanded.contains(name) {
                     continue;
                 }
-                match self.tables.get(name) {
-                    None | Some(TablesState::Loading) => rows.push(Row::TablesLoading),
-                    Some(TablesState::Failed(message)) => {
-                        rows.push(Row::ConnNote(message.clone(), Color::Error));
-                    }
-                    Some(TablesState::Loaded { tables, .. }) if tables.is_empty() => {
-                        rows.push(Row::ConnNote("No tables.".into(), Color::Muted));
-                    }
-                    Some(TablesState::Loaded { tables, .. }) => {
-                        self.push_table_rows(&mut rows, name, tables);
-                    }
-                }
+                self.push_catalog_rows(&mut rows, name, kind, workspace);
             }
         } else {
             rows.push(Row::ConnectionsHeader);
@@ -479,46 +556,313 @@ impl ElPanel {
         rows
     }
 
-    /// One page of a connection's tables, narrowed by its search.
-    fn push_table_rows(
+    /// An unfolded connection: its search field, then the tables the search
+    /// matches or, without one, the database/schema/table tree.
+    fn push_catalog_rows(
         &self,
         rows: &mut Vec<Row>,
         name: &SharedString,
-        tables: &[(String, String)],
+        kind: &str,
+        workspace: &str,
     ) {
-        let browser = self.browsers.get(name);
-        let searching = browser.is_some_and(|browser| !browser.terms.is_empty());
-        if tables.len() > TABLES_SEARCH_MIN || searching {
+        let by_level = lists_by_level(kind, workspace);
+        let searching = self
+            .browsers
+            .get(name)
+            .is_some_and(|browser| !browser.terms.is_empty());
+        let flat = self.tables.get(name);
+        let long = matches!(flat, Some(TablesState::Loaded { tables, .. }) if tables.len() > TABLES_SEARCH_MIN);
+        if by_level || searching || long {
             rows.push(Row::TableSearch(name.clone()));
         }
-        let total = match browser {
-            Some(browser) if searching => browser.matches.len(),
-            _ => tables.len(),
+        let note = |text: &str, color: Color, depth: usize, loading: bool| Row::TreeNote {
+            text: text.to_owned().into(),
+            color,
+            depth,
+            loading,
         };
-        if total == 0 {
-            rows.push(Row::ConnNote("No tables match.".into(), Color::Muted));
+        if searching || !by_level {
+            match flat {
+                None | Some(TablesState::Loading) => rows.push(note(
+                    if by_level {
+                        "Listing every database to search them…"
+                    } else {
+                        "Loading tables…"
+                    },
+                    Color::Muted,
+                    1,
+                    true,
+                )),
+                Some(TablesState::Failed(message)) => rows.push(Row::TreeNote {
+                    text: message.clone(),
+                    color: Color::Error,
+                    depth: 1,
+                    loading: false,
+                }),
+                Some(TablesState::Loaded { tables, .. }) if tables.is_empty() => {
+                    rows.push(note("No tables.", Color::Muted, 1, false));
+                }
+                Some(TablesState::Loaded { tables, .. }) if searching => {
+                    self.push_search_rows(rows, name, tables);
+                }
+                Some(TablesState::Loaded { tables, .. }) => {
+                    self.push_grouped_rows(rows, name, kind == "snowflake", tables);
+                }
+            }
             return;
         }
-        let shown = page_range(total, browser.map_or(0, |browser| browser.page));
+        self.push_level_rows(rows, name);
+    }
+
+    /// The search's matches, a page at a time.
+    fn push_search_rows(&self, rows: &mut Vec<Row>, name: &SharedString, tables: &[(String, String)]) {
+        let Some(browser) = self.browsers.get(name) else {
+            return;
+        };
+        let total = browser.matches.len();
+        if total == 0 {
+            rows.push(Row::TreeNote {
+                text: "No tables match.".into(),
+                color: Color::Muted,
+                depth: 1,
+                loading: false,
+            });
+            return;
+        }
+        let shown = page_range(total, browser.page);
         for position in shown.clone() {
-            let index = match browser {
-                Some(browser) if searching => browser.matches.get(position).copied(),
-                _ => Some(position),
-            };
-            if let Some((schema, table)) = index.and_then(|index| tables.get(index)) {
+            if let Some((schema, table)) = browser
+                .matches
+                .get(position)
+                .and_then(|index| tables.get(*index))
+            {
                 rows.push(Row::Table {
                     connection: name.clone(),
                     schema: schema.clone(),
                     table: table.clone(),
+                    depth: 1,
                 });
             }
         }
-        if searching || total > TABLES_PAGE {
+        rows.push(Row::TablePager {
+            connection: name.clone(),
+            scope: PagerScope::Search,
+            shown,
+            total,
+            searching: true,
+            depth: 1,
+        });
+    }
+
+    /// One listing grouped into a tree. It is sorted, so each schema is one
+    /// contiguous run; Snowflake's `DATABASE.SCHEMA` adds a database level.
+    fn push_grouped_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        name: &SharedString,
+        with_databases: bool,
+        tables: &[(String, String)],
+    ) {
+        let mut groups: Vec<(String, String, Range<usize>)> = Vec::new();
+        for (index, (schema, _)) in tables.iter().enumerate() {
+            let (database, schema) = match schema.split_once('.') {
+                Some((database, schema)) if with_databases => (database, schema),
+                _ => ("", schema.as_str()),
+            };
+            match groups.last_mut() {
+                Some((last_database, last_schema, range))
+                    if last_database == database && last_schema == schema =>
+                {
+                    range.end = index + 1;
+                }
+                _ => groups.push((database.to_owned(), schema.to_owned(), index..index + 1)),
+            }
+        }
+        let tree = self.trees.get(name);
+        let databases: Vec<&str> = {
+            let mut seen: Vec<&str> = Vec::new();
+            for (database, _, _) in &groups {
+                if seen.last() != Some(&database.as_str()) {
+                    seen.push(database);
+                }
+            }
+            seen
+        };
+        for database in &databases {
+            let schema_depth = if with_databases {
+                let open = (databases.len() == 1)
+                    != tree.is_some_and(|tree| tree.toggled_databases.contains(*database));
+                rows.push(Row::Database {
+                    connection: name.clone(),
+                    database: database.to_string(),
+                    open,
+                });
+                if !open {
+                    continue;
+                }
+                2
+            } else {
+                1
+            };
+            let in_database: Vec<&(String, String, Range<usize>)> =
+                groups.iter().filter(|(owner, _, _)| owner == database).collect();
+            for (database, schema, range) in &in_database {
+                let key = (database.clone(), schema.clone());
+                let open = (in_database.len() == 1)
+                    != tree.is_some_and(|tree| tree.toggled_schemas.contains(&key));
+                rows.push(Row::Schema {
+                    connection: name.clone(),
+                    database: database.clone(),
+                    schema: schema.clone(),
+                    tables: Some(range.len()),
+                    open,
+                    depth: schema_depth,
+                });
+                if open {
+                    let page = tree.and_then(|tree| tree.pages.get(&key)).copied().unwrap_or(0);
+                    let names: Vec<String> = tables[range.clone()]
+                        .iter()
+                        .map(|(_, table)| table.clone())
+                        .collect();
+                    let qualified = tables[range.start].0.clone();
+                    self.push_schema_tables(rows, name, &key, &qualified, &names, page, schema_depth + 1);
+                }
+            }
+        }
+    }
+
+    /// A Snowflake account listed a level at a time, as far as it is
+    /// unfolded.
+    fn push_level_rows(&self, rows: &mut Vec<Row>, name: &SharedString) {
+        let tree = self.trees.get(name);
+        let note = |text: SharedString, color: Color, depth: usize, loading: bool| Row::TreeNote {
+            text,
+            color,
+            depth,
+            loading,
+        };
+        let databases = match tree.and_then(|tree| tree.databases.as_ref()) {
+            None | Some(Listing::Loading) => {
+                rows.push(note("Listing databases…".into(), Color::Muted, 1, true));
+                return;
+            }
+            Some(Listing::Failed(message)) => {
+                rows.push(note(message.clone(), Color::Error, 1, false));
+                return;
+            }
+            Some(Listing::Loaded(databases)) => databases,
+        };
+        if databases.is_empty() {
+            rows.push(note("No databases this role can see.".into(), Color::Muted, 1, false));
+            return;
+        }
+        let Some(tree) = tree else {
+            return;
+        };
+        for database in databases {
+            let open = (databases.len() == 1) != tree.toggled_databases.contains(database);
+            rows.push(Row::Database {
+                connection: name.clone(),
+                database: database.clone(),
+                open,
+            });
+            if !open {
+                continue;
+            }
+            let schemas = match tree.schemas.get(database) {
+                None | Some(Listing::Loading) => {
+                    rows.push(note("Listing schemas…".into(), Color::Muted, 2, true));
+                    continue;
+                }
+                Some(Listing::Failed(message)) => {
+                    rows.push(note(message.clone(), Color::Error, 2, false));
+                    continue;
+                }
+                Some(Listing::Loaded(schemas)) => schemas,
+            };
+            if schemas.is_empty() {
+                rows.push(note(
+                    "No schemas this role can see.".into(),
+                    Color::Muted,
+                    2,
+                    false,
+                ));
+                continue;
+            }
+            for schema in schemas {
+                let key = (database.clone(), schema.clone());
+                let listing = tree.tables.get(&key);
+                let open = (schemas.len() == 1) != tree.toggled_schemas.contains(&key);
+                rows.push(Row::Schema {
+                    connection: name.clone(),
+                    database: database.clone(),
+                    schema: schema.clone(),
+                    tables: match listing {
+                        Some(Listing::Loaded(tables)) => Some(tables.len()),
+                        _ => None,
+                    },
+                    open,
+                    depth: 2,
+                });
+                if !open {
+                    continue;
+                }
+                match listing {
+                    None | Some(Listing::Loading) => {
+                        rows.push(note("Listing tables…".into(), Color::Muted, 3, true));
+                    }
+                    Some(Listing::Failed(message)) => {
+                        rows.push(note(message.clone(), Color::Error, 3, false));
+                    }
+                    Some(Listing::Loaded(tables)) => {
+                        let page = tree.pages.get(&key).copied().unwrap_or(0);
+                        let qualified = format!("{database}.{schema}");
+                        self.push_schema_tables(rows, name, &key, &qualified, tables, page, 3);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One schema's tables, a page at a time. `qualified` is the schema as
+    /// a query names it.
+    #[allow(clippy::too_many_arguments)]
+    fn push_schema_tables(
+        &self,
+        rows: &mut Vec<Row>,
+        name: &SharedString,
+        key: &(String, String),
+        qualified: &str,
+        tables: &[String],
+        page: usize,
+        depth: usize,
+    ) {
+        if tables.is_empty() {
+            rows.push(Row::TreeNote {
+                text: "No tables.".into(),
+                color: Color::Muted,
+                depth,
+                loading: false,
+            });
+            return;
+        }
+        let shown = page_range(tables.len(), page);
+        for table in &tables[shown.clone()] {
+            rows.push(Row::Table {
+                connection: name.clone(),
+                schema: qualified.to_owned(),
+                table: table.clone(),
+                depth,
+            });
+        }
+        if tables.len() > TABLES_PAGE {
             rows.push(Row::TablePager {
                 connection: name.clone(),
+                scope: PagerScope::Schema(key.0.clone(), key.1.clone()),
                 shown,
-                total,
-                searching,
+                total: tables.len(),
+                searching: false,
+                depth,
             });
         }
     }
@@ -831,7 +1175,15 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                 let browser = self.table_browser(name.clone(), window, cx);
                 self.browsers.insert(name.clone(), browser);
             }
-            if !self.tables.contains_key(&name) {
+            if self.connection_lists_by_level(&name) {
+                if self
+                    .trees
+                    .get(&name)
+                    .is_none_or(|tree| tree.databases.is_none())
+                {
+                    self.load_databases(name.clone(), cx);
+                }
+            } else if !self.tables.contains_key(&name) {
                 self.load_tables(name.clone(), cx);
             }
         }
@@ -878,6 +1230,202 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         );
     }
 
+    fn connection_lists_by_level(&self, name: &SharedString) -> bool {
+        self.connections
+            .iter()
+            .find(|(connection, _, _)| connection == name)
+            .is_some_and(|(_, kind, workspace)| lists_by_level(kind, workspace))
+    }
+
+    /// Lists a Snowflake account's databases — or takes the one the
+    /// connection names — and unfolds into whichever start open.
+    fn load_databases(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        if let Some(database) = self.pinned_databases.get(&name).cloned() {
+            self.trees.entry(name.clone()).or_default().databases =
+                Some(Listing::Loaded(vec![database.clone()]));
+            self.load_schemas(name, database, cx);
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.trees.entry(name.clone()).or_default().databases = Some(Listing::Loading);
+        let epoch = self.tables_epoch;
+        let connection = name.to_string();
+        let task = cx.background_spawn(async move { super::list_databases(&root, &connection) });
+        self._list_tasks.insert(
+            format!("{name}\u{1}databases").into(),
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    if this.tables_epoch != epoch {
+                        return; // a different environment answered
+                    }
+                    let tree = this.trees.entry(name.clone()).or_default();
+                    let (listing, open) = match result {
+                        Ok(databases) => {
+                            let open: Vec<String> = databases
+                                .iter()
+                                .filter(|database| {
+                                    (databases.len() == 1)
+                                        != tree.toggled_databases.contains(*database)
+                                })
+                                .cloned()
+                                .collect();
+                            (Listing::Loaded(databases), open)
+                        }
+                        Err(error) => (Listing::Failed(format!("{error:#}").into()), Vec::new()),
+                    };
+                    tree.databases = Some(listing);
+                    for database in open {
+                        if !tree.schemas.contains_key(&database) {
+                            this.load_schemas(name.clone(), database, cx);
+                            break; // the others load when unfolded again
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
+    }
+
+    fn load_schemas(&mut self, name: SharedString, database: String, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.trees
+            .entry(name.clone())
+            .or_default()
+            .schemas
+            .insert(database.clone(), Listing::Loading);
+        let epoch = self.tables_epoch;
+        let (connection, listed) = (name.to_string(), database.clone());
+        let task =
+            cx.background_spawn(async move { super::list_schemas(&root, &connection, &listed) });
+        self._list_tasks.insert(
+            format!("{name}\u{1}{database}").into(),
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    if this.tables_epoch != epoch {
+                        return;
+                    }
+                    let tree = this.trees.entry(name.clone()).or_default();
+                    let (listing, open) = match result {
+                        Ok(schemas) => {
+                            let open: Vec<String> = schemas
+                                .iter()
+                                .filter(|schema| {
+                                    (schemas.len() == 1)
+                                        != tree
+                                            .toggled_schemas
+                                            .contains(&(database.clone(), (*schema).clone()))
+                                })
+                                .cloned()
+                                .collect();
+                            (Listing::Loaded(schemas), open)
+                        }
+                        Err(error) => (Listing::Failed(format!("{error:#}").into()), Vec::new()),
+                    };
+                    tree.schemas.insert(database.clone(), listing);
+                    let missing: Vec<String> = open
+                        .into_iter()
+                        .filter(|schema| !tree.tables.contains_key(&(database.clone(), schema.clone())))
+                        .collect();
+                    for schema in missing {
+                        this.load_schema_tables(name.clone(), database.clone(), schema, cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
+    }
+
+    fn load_schema_tables(
+        &mut self,
+        name: SharedString,
+        database: String,
+        schema: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let key = (database.clone(), schema.clone());
+        self.trees
+            .entry(name.clone())
+            .or_default()
+            .tables
+            .insert(key.clone(), Listing::Loading);
+        let epoch = self.tables_epoch;
+        let connection = name.to_string();
+        let task = cx.background_spawn(async move {
+            super::list_schema_tables(&root, &connection, &database, &schema)
+        });
+        self._list_tasks.insert(
+            format!("{name}\u{1}{}\u{1}{}", key.0, key.1).into(),
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    if this.tables_epoch != epoch {
+                        return;
+                    }
+                    let listing = match result {
+                        Ok(tables) => Listing::Loaded(tables),
+                        Err(error) => Listing::Failed(format!("{error:#}").into()),
+                    };
+                    this.trees
+                        .entry(name.clone())
+                        .or_default()
+                        .tables
+                        .insert(key, listing);
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
+    }
+
+    fn toggle_database(
+        &mut self,
+        name: SharedString,
+        database: String,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = self.trees.entry(name.clone()).or_default();
+        if !tree.toggled_databases.remove(&database) {
+            tree.toggled_databases.insert(database.clone());
+        }
+        let unlisted = !open && !tree.schemas.contains_key(&database);
+        if unlisted && self.connection_lists_by_level(&name) {
+            self.load_schemas(name, database, cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_schema(
+        &mut self,
+        name: SharedString,
+        database: String,
+        schema: String,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (database.clone(), schema.clone());
+        let tree = self.trees.entry(name.clone()).or_default();
+        if !tree.toggled_schemas.remove(&key) {
+            tree.toggled_schemas.insert(key.clone());
+        }
+        let unlisted = !open && !tree.tables.contains_key(&key);
+        if unlisted && self.connection_lists_by_level(&name) {
+            self.load_schema_tables(name, database, schema, cx);
+        }
+        cx.notify();
+    }
+
     fn table_browser(
         &mut self,
         name: SharedString,
@@ -910,7 +1458,13 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         };
         browser.terms = super::search_terms(&browser.search.read(cx).text(cx));
         browser.page = 0;
+        let searching = !browser.terms.is_empty();
         self.match_tables(name);
+        // A tree listed by level has nothing to search until the whole
+        // catalog is listed once.
+        if searching && !self.tables.contains_key(name) && self.connection_lists_by_level(name) {
+            self.load_tables(name.clone(), cx);
+        }
         cx.notify();
     }
 
@@ -954,23 +1508,44 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         true
     }
 
-    fn show_table_page(&mut self, name: &SharedString, page: usize, cx: &mut Context<Self>) {
-        let Some(browser) = self.browsers.get_mut(name) else {
-            return;
-        };
-        let total = match self.tables.get(name) {
-            Some(TablesState::Loaded { tables, .. }) if browser.terms.is_empty() => tables.len(),
-            Some(TablesState::Loaded { .. }) => browser.matches.len(),
-            _ => 0,
-        };
-        browser.page = page_range(total, page).start / TABLES_PAGE;
-        // A new page starts at its first table, not wherever the previous
-        // page was scrolled to.
-        if let Some(ix) = self
-            .connection_rows()
-            .iter()
-            .position(|row| matches!(row, Row::Connection(connection, ..) if connection == name))
-        {
+    fn show_table_page(
+        &mut self,
+        name: &SharedString,
+        scope: &PagerScope,
+        page: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // The rows clamp a page past the end; a new page starts at the top
+        // of what it belongs to, not wherever the previous one was scrolled.
+        match scope {
+            PagerScope::Search => {
+                if let Some(browser) = self.browsers.get_mut(name) {
+                    browser.page = page;
+                }
+            }
+            PagerScope::Schema(database, schema) => {
+                self.trees
+                    .entry(name.clone())
+                    .or_default()
+                    .pages
+                    .insert((database.clone(), schema.clone()), page);
+            }
+        }
+        let rows = self.connection_rows();
+        let anchor = rows.iter().position(|row| match (scope, row) {
+            (
+                PagerScope::Schema(database, schema),
+                Row::Schema {
+                    connection,
+                    database: row_database,
+                    schema: row_schema,
+                    ..
+                },
+            ) => connection == name && row_database == database && row_schema == schema,
+            (PagerScope::Search, Row::Connection(connection, ..)) => connection == name,
+            _ => false,
+        });
+        if let Some(ix) = anchor {
             self.scroll_lower.scroll_to_item(ix, ScrollStrategy::Top);
         }
         cx.notify();
@@ -982,6 +1557,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         self.tables.clear();
         self.expanded.clear();
         self.browsers.clear();
+        self.trees.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
     }
@@ -1318,10 +1894,19 @@ impl Render for ElPanel {
                                 // Explicit refresh also invalidates cached
                                 // table listings.
                                 this.tables.clear();
-                                for name in this.expanded.clone() {
-                                    this.load_tables(name, cx);
+                                for tree in this.trees.values_mut() {
+                                    tree.databases = None;
+                                    tree.schemas.clear();
+                                    tree.tables.clear();
                                 }
                                 this.refresh(cx);
+                                for name in this.expanded.clone() {
+                                    if this.connection_lists_by_level(&name) {
+                                        this.load_databases(name, cx);
+                                    } else {
+                                        this.load_tables(name, cx);
+                                    }
+                                }
                                 if let Some(root) = this.root.clone() {
                                     this.check_runner(&root, cx);
                                 }
@@ -1605,15 +2190,104 @@ impl ElPanel {
                 })
                 .into_any_element()
             }
+            Row::Database {
+                connection,
+                database,
+                open,
+            } => {
+                let (toggle_connection, toggle_database, open) =
+                    (connection.clone(), database.clone(), *open);
+                base.cursor_pointer()
+                    .pl(indent(1))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(if open { IconName::BoxOpen } else { IconName::Box })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(database.clone()).size(LabelSize::Small).truncate())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_database(
+                            toggle_connection.clone(),
+                            toggle_database.clone(),
+                            open,
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            }
+            Row::Schema {
+                connection,
+                database,
+                schema,
+                tables,
+                open,
+                depth,
+            } => {
+                let (toggle_connection, toggle_database, toggle_schema, open) =
+                    (connection.clone(), database.clone(), schema.clone(), *open);
+                base.cursor_pointer()
+                    .pl(indent(*depth))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(if open {
+                            IconName::FolderOpen
+                        } else {
+                            IconName::Folder
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(Label::new(schema.clone()).size(LabelSize::Small).truncate())
+                    .child(div().flex_1())
+                    .children(tables.map(|count| {
+                        Label::new(super::thousands(count))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_schema(
+                            toggle_connection.clone(),
+                            toggle_database.clone(),
+                            toggle_schema.clone(),
+                            open,
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
+            }
             Row::Table {
                 connection,
                 schema,
                 table,
+                depth,
             } => {
                 let connection = connection.clone();
                 let schema = schema.clone();
                 let table = table.clone();
-                let label = format!("{schema}.{table}");
+                // Under its schema a table needs only its own name; a search
+                // result carries the schema it came from.
+                let label = if *depth > 1 {
+                    table.clone()
+                } else {
+                    format!("{schema}.{table}")
+                };
                 let dragged = super::DraggedTable {
                     connection: connection.clone(),
                     schema: schema.clone(),
@@ -1644,7 +2318,7 @@ impl ElPanel {
                     .find(|(name, _, _)| *name == connection)
                     .is_some_and(|(_, kind, _)| super::extractable(kind));
                 base.cursor_pointer()
-                    .pl_6()
+                    .pl(indent(*depth))
                     .child(
                         Icon::new(IconName::Table)
                             .size(IconSize::XSmall)
@@ -1775,17 +2449,25 @@ impl ElPanel {
                         .color(*color),
                 )
                 .into_any_element(),
-            Row::TablesLoading => base
-                .pl_6()
+            Row::TreeNote {
+                text,
+                color,
+                depth,
+                loading,
+            } => base
+                .pl(indent(*depth))
+                .when(*loading, |row| {
+                    row.child(
+                        SpinnerLabel::new()
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
                 .child(
-                    SpinnerLabel::new()
+                    Label::new(text.clone())
                         .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new("Loading tables…")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        .color(*color)
+                        .truncate(),
                 )
                 .into_any_element(),
             Row::TableSearch(connection) => {
@@ -1842,9 +2524,11 @@ impl ElPanel {
             }
             Row::TablePager {
                 connection,
+                scope,
                 shown,
                 total,
                 searching,
+                depth,
             } => {
                 let pages = total.div_ceil(TABLES_PAGE);
                 let page = shown.start / TABLES_PAGE;
@@ -1864,13 +2548,13 @@ impl ElPanel {
                 } else {
                     format!("{} {noun}", super::thousands(*total))
                 };
-                let previous = connection.clone();
-                let next = connection.clone();
+                let (previous, previous_scope) = (connection.clone(), scope.clone());
+                let (next, next_scope) = (connection.clone(), scope.clone());
                 h_flex()
                     .id(ix)
                     .h(px(24.))
                     .w_full()
-                    .pl_6()
+                    .pl(indent(*depth))
                     .pr_2()
                     .gap_1()
                     .items_center()
@@ -1889,7 +2573,12 @@ impl ElPanel {
                                 .disabled(page == 0)
                                 .tooltip(Tooltip::text("Previous page"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.show_table_page(&previous, page.saturating_sub(1), cx);
+                                    this.show_table_page(
+                                        &previous,
+                                        &previous_scope,
+                                        page.saturating_sub(1),
+                                        cx,
+                                    );
                                 })),
                         )
                         .child(
@@ -1904,7 +2593,7 @@ impl ElPanel {
                                 .disabled(page + 1 >= pages)
                                 .tooltip(Tooltip::text("Next page"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.show_table_page(&next, page + 1, cx);
+                                    this.show_table_page(&next, &next_scope, page + 1, cx);
                                 })),
                         )
                     })
