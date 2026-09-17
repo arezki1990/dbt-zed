@@ -278,7 +278,14 @@ impl ElRunView {
             .filter(|row| row.error.is_some())
             .map(|row| row.stream.to_string())
             .collect();
-        if failed.is_empty() {
+        self.rerun_streams(failed, cx);
+    }
+
+    /// Runs the named streams of the last run's pipeline again, from the
+    /// YAML as it is now.
+    fn rerun_streams(&mut self, streams: Vec<String>, cx: &mut Context<Self>) {
+        let Some(run) = &self.run else { return };
+        if streams.is_empty() || self.is_running() {
             return;
         }
         let root = run.project_root.clone();
@@ -305,7 +312,7 @@ impl ElRunView {
             }
             None => run.spec.clone(),
         };
-        self.start_run_streams(root, spec, spec_path, failed, cx);
+        self.start_run_streams(root, spec, spec_path, streams, cx);
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -574,6 +581,20 @@ impl Render for ElRunView {
                         CopyButton::new(("el-run-stream-copy", ix), error.clone())
                             .icon_size(IconSize::XSmall)
                             .tooltip_label("Copy error"),
+                    );
+            }
+            if !running {
+                let stream = row.stream.to_string();
+                line = line
+                    .when(row.error.is_none(), |line| line.child(div().flex_1()))
+                    .child(
+                        IconButton::new(("el-run-stream-again", ix), IconName::PlayFilled)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(format!("Run {stream} again, on its own")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.rerun_streams(vec![stream.clone()], cx);
+                            })),
                     );
             }
             body = body.child(line);

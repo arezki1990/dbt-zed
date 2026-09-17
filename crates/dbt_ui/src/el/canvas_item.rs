@@ -359,6 +359,39 @@ impl ElPipelineCanvas {
                                 .size(LabelSize::Small)
                                 .truncate(),
                         ),
+                    )
+                    // A stream runs on its own from its source node: the
+                    // fix-one-table loop needn't re-extract every other one.
+                    .when_some(
+                        match node.kind {
+                            ElNodeKind::Stream { stream_ix } => Some(stream_ix),
+                            _ => None,
+                        },
+                        |header, stream_ix| {
+                            header.child(
+                                div()
+                                    // A press here is a click, never the
+                                    // start of a node drag.
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        IconButton::new(
+                                            ("el-run-stream", ix),
+                                            IconName::PlayFilled,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Run just this stream"))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.run_stream_at(stream_ix, window, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                        },
                     ),
             )
             .child(
@@ -1137,6 +1170,17 @@ impl ElPipelineCanvas {
         let entity = cx.entity().downgrade();
         let menu = ui::ContextMenu::build(window, cx, |menu, _, _| {
             menu.header(name.clone())
+                .entry("Run just this stream", None, {
+                    let (entity, name) = (entity.clone(), name.clone());
+                    move |window, cx| {
+                        entity
+                            .update(cx, |this, cx| {
+                                this.run_streams(vec![name.clone()], window, cx)
+                            })
+                            .ok();
+                    }
+                })
+                .separator()
                 .entry("Rename stream…", None, {
                     let (entity, name) = (entity.clone(), name.clone());
                     move |window, cx| {
@@ -1865,6 +1909,17 @@ impl ElPipelineCanvas {
 
     fn run_pipeline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_streams(Vec::new(), window, cx);
+    }
+
+    fn run_stream_at(&mut self, stream_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self
+            .loaded
+            .as_ref()
+            .and_then(|loaded| loaded.pipeline.streams.get(stream_ix))
+            .map(|stream| stream.name.clone());
+        if let Some(name) = name {
+            self.run_streams(vec![name], window, cx);
+        }
     }
 
     /// Runs the pipeline — all streams when `only` is empty, else just the
