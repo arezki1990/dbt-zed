@@ -50,6 +50,8 @@ pub struct ElRunsPanel {
     result: Option<ConsoleGrid>,
     result_scroll: UniformListScrollHandle,
     result_h_scroll: ScrollHandle,
+    /// The value of the cell a grid opened whole.
+    detail_scroll: ScrollHandle,
     elapsed: Option<Duration>,
     query_error: Option<SharedString>,
     _query: Task<()>,
@@ -91,6 +93,10 @@ pub struct ElRunsPanel {
     /// across a failure so it does not retry forever — closing the detail
     /// clears it, which is how a person asks again.
     remote_history_for: Option<u64>,
+    remote_pipelines_scroll: ScrollHandle,
+    remote_runs_scroll: ScrollHandle,
+    run_streams_scroll: ScrollHandle,
+    run_error_scroll: ScrollHandle,
     /// Height of the SQL editor in the Query tab; its splitter drags it.
     query_split: f32,
     query_split_drag: Option<(f32, f32)>,
@@ -577,6 +583,7 @@ impl ElRunsPanel {
                 result: None,
                 result_scroll: UniformListScrollHandle::new(),
                 result_h_scroll: ScrollHandle::new(),
+                detail_scroll: ScrollHandle::new(),
                 elapsed: None,
                 query_error: None,
                 _query: Task::ready(()),
@@ -598,6 +605,10 @@ impl ElRunsPanel {
                 remote_run_events: HashMap::new(),
                 remote_run_error: None,
                 remote_history_for: None,
+                remote_pipelines_scroll: ScrollHandle::new(),
+                remote_runs_scroll: ScrollHandle::new(),
+                run_streams_scroll: ScrollHandle::new(),
+                run_error_scroll: ScrollHandle::new(),
                 query_split: 110.,
                 query_split_drag: None,
                 remote_split: 170.,
@@ -1529,11 +1540,11 @@ impl ElRunsPanel {
                 )
                 .into_any_element()
         } else if let Some(run_id) = self.remote_run_detail {
-            self.render_remote_run_detail(run_id, cx)
+            self.render_remote_run_detail(run_id, window, cx)
         } else if let Some(detail) = self.remote_detail.clone() {
-            self.render_remote_detail(&detail, cx)
+            self.render_remote_detail(&detail, window, cx)
         } else {
-            self.render_remote_overview(cx)
+            self.render_remote_overview(window, cx)
         };
 
         if self.remote_show_logs {
@@ -1571,7 +1582,11 @@ impl ElRunsPanel {
 
     /// The overview: pipelines as a striped table (click a row for its
     /// detail view), recent runs below.
-    fn render_remote_overview(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_remote_overview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
         let colors = &colors;
         let head = |width: f32, text: &'static str| {
@@ -1739,13 +1754,19 @@ impl ElRunsPanel {
                 )
             })
             .child(
-                v_flex()
-                    .id("el-remote-pipelines-pane")
+                div()
                     .h(px(self.remote_split))
                     .flex_shrink_0()
-                    .overflow_y_scroll()
-                    .child(pipeline_header)
-                    .child(pipelines),
+                    .child(
+                        v_flex()
+                            .id("el-remote-pipelines-pane")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.remote_pipelines_scroll)
+                            .child(pipeline_header)
+                            .child(pipelines),
+                    )
+                    .custom_scrollbars(super::scrollbar(&self.remote_pipelines_scroll), window, cx),
             )
             .child(
                 // The splitter: drag to trade space between the tables.
@@ -1779,7 +1800,7 @@ impl ElRunsPanel {
                         .color(Color::Muted),
                 ),
             )
-            .child(self.render_runs_table(None, cx))
+            .child(self.render_runs_table(None, window, cx))
             .into_any_element()
     }
 
@@ -1787,6 +1808,7 @@ impl ElRunsPanel {
     fn render_remote_detail(
         &mut self,
         name: &SharedString,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
@@ -1880,7 +1902,7 @@ impl ElRunsPanel {
                         .color(Color::Muted),
                 ),
             )
-            .child(self.render_runs_table(Some(name.as_ref()), cx))
+            .child(self.render_runs_table(Some(name.as_ref()), window, cx))
             .into_any_element()
     }
 
@@ -1889,6 +1911,7 @@ impl ElRunsPanel {
     fn render_remote_run_detail(
         &mut self,
         run_id: u64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
@@ -1982,16 +2005,22 @@ impl ElRunsPanel {
                 .border_color(colors.border)
                 .child(
                     div()
-                        .id("el-run-detail-error")
                         .flex_1()
                         .min_w_0()
-                        .max_h(px(96.))
-                        .overflow_y_scroll()
                         .child(
-                            Label::new(error.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error),
-                        ),
+                            div()
+                                .id("el-run-detail-error")
+                                .max_h(px(96.))
+                                .pr_3()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.run_error_scroll)
+                                .child(
+                                    Label::new(error.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error),
+                                ),
+                        )
+                        .custom_scrollbars(super::scrollbar(&self.run_error_scroll), window, cx),
                 )
                 .child(
                     ui::CopyButton::new("el-run-detail-copy-error", error)
@@ -2026,9 +2055,9 @@ impl ElRunsPanel {
             );
         let mut rows = v_flex()
             .id("el-run-streams")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.run_streams_scroll)
             .px_1();
         if order.is_empty() {
             rows = rows.child(
@@ -2160,7 +2189,11 @@ impl ElRunsPanel {
             .child(header)
             .children(error_block)
             .child(stream_header)
-            .child(rows)
+            .child(div().flex_1().min_h_0().child(rows).custom_scrollbars(
+                super::scrollbar(&self.run_streams_scroll),
+                window,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -2168,6 +2201,7 @@ impl ElRunsPanel {
     fn render_runs_table(
         &mut self,
         filter: Option<&str>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
@@ -2208,9 +2242,9 @@ impl ElRunsPanel {
 
         let mut runs = v_flex()
             .id("el-remote-runs")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.remote_runs_scroll)
             .px_1();
         let mut shown = 0usize;
         for run in &self.remote_runs {
@@ -2359,7 +2393,11 @@ impl ElRunsPanel {
             .flex_1()
             .min_h_0()
             .child(header)
-            .child(runs)
+            .child(div().flex_1().min_h_0().child(runs).custom_scrollbars(
+                super::scrollbar(&self.remote_runs_scroll),
+                window,
+                cx,
+            ))
             .into_any_element()
     }
 }
@@ -2508,11 +2546,15 @@ impl ElRunsPanel {
         };
         let id = slot.id();
         let colors = cx.theme().colors();
+        // The scrollbar track is opaque and always painted, so the bars are
+        // always on screen. A bar mixes its thumb into the track's color but
+        // keeps the track's alpha, and every bundled theme's own track color
+        // is transparent — which left the thumbs invisible.
         let (border, surface, hover, track) = (
             colors.border,
             colors.elevated_surface_background,
             colors.element_hover,
-            colors.scrollbar_track_background,
+            colors.editor_background,
         );
         // Zebra striping for row scanning, as faint as the dbt grid's.
         let mut stripe = colors.text;
@@ -2617,8 +2659,9 @@ impl ElRunsPanel {
                                                     original + 1,
                                                     value.clone(),
                                                 ));
-                                                cx.notify();
                                             }
+                                            this.detail_scroll.set_offset(gpui::Point::default());
+                                            cx.notify();
                                         })
                                         .ok();
                                 })
@@ -2742,6 +2785,7 @@ impl ElRunsPanel {
                                     .flex_1()
                                     .min_h_0()
                                     .w_full()
+                                    .bg(track)
                                     .child(div())
                                     .custom_scrollbars(
                                         ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
@@ -2765,6 +2809,7 @@ impl ElRunsPanel {
                             .flex_1()
                             .min_w_0()
                             .h_full()
+                            .bg(track)
                             .child(div())
                             .custom_scrollbars(
                                 ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
@@ -2775,14 +2820,18 @@ impl ElRunsPanel {
                                 cx,
                             ),
                     )
-                    .child(div().w(px(GUTTER)).h_full().flex_none()),
+                    .child(div().w(px(GUTTER)).h_full().flex_none().bg(track)),
             )
             .into_any_element()
     }
 
     /// The clicked cell, whole, over the console — the dbt results grid's
     /// card: its column and row, the value wrapped and scrollable, and Copy.
-    fn render_cell_detail(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_cell_detail(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let slot = match (&self.preview, self.surface) {
             (Some(_), _) => GridSlot::Preview,
             (None, Surface::Query) => GridSlot::Result,
@@ -2795,7 +2844,7 @@ impl ElRunsPanel {
                 cx.notify();
             }
         };
-        let colors = cx.theme().colors();
+        let colors = cx.theme().colors().clone();
         Some(
             div()
                 .id("el-cell-detail-backdrop")
@@ -2860,13 +2909,29 @@ impl ElRunsPanel {
                                 ),
                         )
                         .child(
-                            div()
-                                .id("el-cell-detail-value")
+                            v_flex()
                                 .flex_1()
                                 .min_h_0()
                                 .max_h(px(360.))
-                                .overflow_y_scroll()
-                                .child(Label::new(value).size(LabelSize::Small).buffer_font(cx)),
+                                .child(
+                                    div()
+                                        .id("el-cell-detail-value")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .pr_3()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.detail_scroll)
+                                        .child(
+                                            Label::new(value)
+                                                .size(LabelSize::Small)
+                                                .buffer_font(cx),
+                                        ),
+                                )
+                                .custom_scrollbars(
+                                    super::scrollbar(&self.detail_scroll),
+                                    window,
+                                    cx,
+                                ),
                         ),
                 )
                 .into_any_element(),
@@ -3014,7 +3079,7 @@ impl Render for ElRunsPanel {
             .key_context("ElRunsPanel")
             .bg(colors.panel_background)
             .child(body)
-            .children(self.render_cell_detail(cx))
+            .children(self.render_cell_detail(window, cx))
     }
 }
 

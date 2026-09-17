@@ -11,10 +11,10 @@ use std::time::SystemTime;
 use anyhow::Result;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseButton, PathBuilder, Pixels,
-    Point, SharedString, Task, WeakEntity, Window, canvas, point, px,
+    Point, ScrollHandle, SharedString, Task, WeakEntity, Window, canvas, point, px,
 };
 use project::Project;
-use ui::{Tooltip, prelude::*};
+use ui::{Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{
     Workspace,
     item::{Item, TabContentParams},
@@ -59,6 +59,7 @@ pub struct ElPipelineCanvas {
     drag_moved: bool,
     project: Entity<Project>,
     mapping: Option<MappingEditorState>,
+    mapping_scroll: ScrollHandle,
     /// A clean sidebar re-opened by render after the spec reloaded (editors
     /// need the window, which the reload task doesn't have).
     pending_reopen: Option<usize>,
@@ -129,6 +130,7 @@ impl ElPipelineCanvas {
             drag_moved: false,
             project,
             mapping: None,
+            mapping_scroll: ScrollHandle::new(),
             pending_reopen: None,
             builder: None,
             type_menu: None,
@@ -1458,8 +1460,12 @@ impl ElPipelineCanvas {
         cx.notify();
     }
 
-    fn render_mapping_sidebar(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().colors();
+    fn render_mapping_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
         let Some(state) = &self.mapping else {
             return div().into_any_element();
         };
@@ -1472,9 +1478,9 @@ impl ElPipelineCanvas {
 
         let mut rows = v_flex()
             .id("el-map-rows")
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.mapping_scroll)
             .gap_0p5()
             .p_1();
         for (draft_ix, draft) in state.drafts.iter().enumerate() {
@@ -1783,7 +1789,11 @@ impl ElPipelineCanvas {
                         .color(Color::Warning),
                 )
             }))
-            .child(rows)
+            .child(div().flex_1().min_h_0().child(rows).custom_scrollbars(
+                super::scrollbar(&self.mapping_scroll),
+                window,
+                cx,
+            ))
             .child(
                 h_flex()
                     .w_full()
@@ -2411,7 +2421,7 @@ impl Render for ElPipelineCanvas {
                     .min_h_0()
                     .items_stretch()
                     .child(div().flex().flex_1().min_w_0().child(canvas))
-                    .child(self.render_mapping_sidebar(cx))
+                    .child(self.render_mapping_sidebar(window, cx))
                     .into_any_element()
             } else {
                 canvas

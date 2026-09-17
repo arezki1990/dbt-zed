@@ -1234,7 +1234,7 @@ impl Render for ElPanel {
                         .h(px(pipelines_h))
                         .flex_shrink_0()
                         .child(upper.size_full())
-                        .vertical_scrollbar_for(&self.scroll, window, cx),
+                        .custom_scrollbars(super::scrollbar(&self.scroll), window, cx),
                 )
                 .child(splitter(0, dragging, cx))
                 .child(
@@ -1242,7 +1242,7 @@ impl Render for ElPanel {
                         .h(px(connections_h))
                         .flex_shrink_0()
                         .child(middle.size_full())
-                        .vertical_scrollbar_for(&self.scroll_lower, window, cx),
+                        .custom_scrollbars(super::scrollbar(&self.scroll_lower), window, cx),
                 )
                 .child(splitter(1, dragging, cx))
                 .child(
@@ -1250,7 +1250,7 @@ impl Render for ElPanel {
                         .flex_1()
                         .min_h_0()
                         .child(bottom.size_full())
-                        .vertical_scrollbar_for(&self.scroll_remotes, window, cx),
+                        .custom_scrollbars(super::scrollbar(&self.scroll_remotes), window, cx),
                 )
                 .into_any_element()
         };

@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use anyhow::{Result, bail};
 use editor::Editor;
 use gpui::{
-    App, Context, Entity, FocusHandle, Focusable as _, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window,
+    App, Context, Entity, FocusHandle, Focusable as _, ScrollHandle, ScrollStrategy, SharedString,
+    Subscription, UniformListScrollHandle, Window,
 };
 use indexmap::IndexMap;
-use ui::{Checkbox, HighlightedLabel, Tooltip, prelude::*};
+use ui::{Checkbox, HighlightedLabel, Tooltip, WithScrollbar as _, prelude::*};
 
 use el_engine::spec::{
     Connection, Connections, DbConn, DuckdbConn, FileFormat, OracleConn, Pipeline, SnowflakeAuth,
@@ -124,6 +124,7 @@ pub struct BuilderForm {
     /// rows shown: ⌘⏎ checks it, and ⏎ adds it when nothing is checked.
     highlighted: Option<usize>,
     tables_scroll: UniformListScrollHandle,
+    body_scroll: ScrollHandle,
     /// Tables the pipeline already streams; they can't be added twice.
     existing: HashSet<String>,
     _search_edits: Subscription,
@@ -299,6 +300,7 @@ impl BuilderForm {
             matches: Vec::new(),
             highlighted: None,
             tables_scroll: UniformListScrollHandle::new(),
+            body_scroll: ScrollHandle::new(),
             existing: pipeline
                 .map(|pipeline| {
                     pipeline
@@ -770,7 +772,11 @@ impl BuilderForm {
         }
     }
 
-    pub fn render(&self, window: &Window, cx: &mut Context<ElPipelineCanvas>) -> gpui::AnyElement {
+    pub fn render(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<ElPipelineCanvas>,
+    ) -> gpui::AnyElement {
         let (title, detail): (&str, Option<SharedString>) = match self.kind {
             BuilderKind::Source => (
                 "Add source stream",
@@ -893,12 +899,19 @@ impl BuilderForm {
                 cx,
             ))
             .child(
-                div()
-                    .id("el-builder-body")
+                v_flex()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(body),
+                    .child(
+                        div()
+                            .id("el-builder-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.body_scroll)
+                            .child(body),
+                    )
+                    .custom_scrollbars(super::scrollbar(&self.body_scroll), window, cx),
             )
             .child(dialog::footer(
                 hints,
@@ -920,7 +933,7 @@ impl BuilderForm {
     /// virtualized list — or why there isn't one.
     fn render_tables(
         &self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<ElPipelineCanvas>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
@@ -928,8 +941,8 @@ impl BuilderForm {
             .picked_connection
             .clone()
             .unwrap_or_else(|| "the source".into());
-        let search_box = |cx: &mut Context<ElPipelineCanvas>| {
-            let focused = self.search.focus_handle(cx).is_focused(window);
+        let focused = self.search.focus_handle(cx).is_focused(window);
+        let search_box = || {
             h_flex()
                 .w_full()
                 .px_2()
@@ -977,7 +990,7 @@ impl BuilderForm {
             TablesPick::Loading => v_flex()
                 .w_full()
                 .gap_2()
-                .child(search_box(cx))
+                .child(search_box())
                 .child(dialog::loading(format!(
                     "Listing the tables in {connection}…"
                 )))
@@ -1097,25 +1110,30 @@ impl BuilderForm {
                         .into_any_element()
                 } else {
                     let entity = cx.entity();
-                    gpui::uniform_list("el-builder-tables", shown, move |range, _, cx| {
-                        entity.update(cx, |canvas, cx| {
-                            let Some(form) = canvas.builder() else {
-                                return Vec::new();
-                            };
-                            range
-                                .filter_map(|position| form.render_table_row(position, cx))
-                                .collect()
+                    let list =
+                        gpui::uniform_list("el-builder-tables", shown, move |range, _, cx| {
+                            entity.update(cx, |canvas, cx| {
+                                let Some(form) = canvas.builder() else {
+                                    return Vec::new();
+                                };
+                                range
+                                    .filter_map(|position| form.render_table_row(position, cx))
+                                    .collect()
+                            })
                         })
-                    })
-                    .track_scroll(&self.tables_scroll)
-                    .w_full()
-                    .h(px(TABLE_ROW_HEIGHT * shown.min(TABLE_ROWS_VISIBLE) as f32))
-                    .into_any_element()
+                        .track_scroll(&self.tables_scroll)
+                        .w_full()
+                        .h(px(TABLE_ROW_HEIGHT * shown.min(TABLE_ROWS_VISIBLE) as f32));
+                    div()
+                        .w_full()
+                        .child(list)
+                        .custom_scrollbars(super::scrollbar(&self.tables_scroll), window, cx)
+                        .into_any_element()
                 };
                 v_flex()
                     .w_full()
                     .gap_2()
-                    .child(search_box(cx))
+                    .child(search_box())
                     .child(toolbar)
                     .child(
                         div()

@@ -52,6 +52,14 @@ pub(crate) fn extractable(kind: &str) -> bool {
     matches!(kind, "duckdb" | "postgres" | "oracle")
 }
 
+/// The vertical scrollbar of an EL scroll area: always on screen rather
+/// than fading out, reading the handle the area scrolls with. Put it on a
+/// box around the scrolling element, never on that element itself, or the
+/// bar scrolls away with the content.
+pub(crate) fn scrollbar<T: ui::ScrollableHandle>(handle: &T) -> ui::Scrollbars<T> {
+    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(handle)
+}
+
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or
 /// standalone: EL projects need no dbt project at all.
 pub fn el_dir(project_root: &Path) -> PathBuf {

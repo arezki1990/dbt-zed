@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use editor::Editor;
 use gpui::{
-    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
-    WeakEntity, Window,
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
+    SharedString, WeakEntity, Window,
 };
 use indexmap::IndexMap;
 use project::Project;
-use ui::{Tooltip, prelude::*};
+use ui::{Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{
@@ -73,6 +73,7 @@ pub struct ElConnectionModal {
     delete_armed: bool,
     /// A write is in flight: buttons disabled, dismissal held.
     writing: bool,
+    body_scroll: ScrollHandle,
     error: Option<SharedString>,
 }
 
@@ -350,6 +351,7 @@ impl ElConnectionModal {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
+            body_scroll: ScrollHandle::new(),
             workspace,
             panel,
             project,
@@ -1367,12 +1369,19 @@ impl Render for ElConnectionModal {
         });
         frame
             .child(
-                div()
-                    .id("el-conn-body")
+                v_flex()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .child(body),
+                    .child(
+                        div()
+                            .id("el-conn-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.body_scroll)
+                            .child(body),
+                    )
+                    .custom_scrollbars(super::scrollbar(&self.body_scroll), window, cx),
             )
             .child(dialog::footer(
                 delete.into_iter().chain(open_yaml),

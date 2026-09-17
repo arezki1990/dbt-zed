@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::{FutureExt as _, StreamExt as _};
-use gpui::{Context, SharedString, Task, WeakEntity, Window};
-use ui::{CopyButton, Tooltip, prelude::*};
+use gpui::{Context, ScrollHandle, SharedString, Task, WeakEntity, Window};
+use ui::{CopyButton, Tooltip, WithScrollbar as _, prelude::*};
 use workspace::Workspace;
 
 use el_engine::progress::{CancelFlag, Phase, ProgressEvent};
@@ -45,6 +45,8 @@ struct ActiveRun {
 pub struct ElRunView {
     workspace: WeakEntity<Workspace>,
     run: Option<ActiveRun>,
+    /// The stream rows scroll under a fixed header.
+    scroll: ScrollHandle,
     _run: Task<()>,
 }
 
@@ -53,6 +55,7 @@ impl ElRunView {
         Self {
             workspace,
             run: None,
+            scroll: ScrollHandle::new(),
             _run: Task::ready(()),
         }
     }
@@ -405,7 +408,7 @@ impl ElRunView {
 }
 
 impl Render for ElRunView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let Some(run) = &self.run else {
             return v_flex()
@@ -432,7 +435,7 @@ impl Render for ElRunView {
         };
         let running = run.finished.is_none() && run.fatal.is_none();
 
-        let mut body = v_flex().size_full().bg(colors.panel_background).child(
+        let body = v_flex().size_full().bg(colors.panel_background).child(
             h_flex()
                 .w_full()
                 .p_1()
@@ -489,6 +492,11 @@ impl Render for ElRunView {
                 }),
         );
 
+        let mut streams = v_flex()
+            .id("el-run-stream-rows")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll);
         for (ix, row) in run.streams.iter().enumerate() {
             let phase_chip: Option<SharedString> = row
                 .phase
@@ -597,9 +605,14 @@ impl Render for ElRunView {
                             })),
                     );
             }
-            body = body.child(line);
+            streams = streams.child(line);
         }
         let _ = &self.workspace;
-        body.into_any_element()
+        body.child(div().flex_1().min_h_0().child(streams).custom_scrollbars(
+            super::scrollbar(&self.scroll),
+            window,
+            cx,
+        ))
+        .into_any_element()
     }
 }
