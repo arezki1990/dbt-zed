@@ -470,6 +470,14 @@ impl ElPipelineCanvas {
             .drag_over::<super::DraggedTable>(|style, _, _, cx| {
                 style.bg(cx.theme().colors().drop_target_background)
             })
+            .on_drop(
+                cx.listener(|this, dragged: &super::DraggedTables, window, cx| {
+                    this.drop_tables(dragged.clone(), window, cx);
+                }),
+            )
+            .drag_over::<super::DraggedTables>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
@@ -1191,6 +1199,150 @@ impl ElPipelineCanvas {
             extra: Default::default(),
         });
         self.write_pipeline(pipeline, window, cx);
+    }
+
+    /// A schema, or a whole connection, dropped from the EL panel: each of
+    /// its tables becomes a stream. More than a handful asks first — one
+    /// careless drop could otherwise write thousands of streams.
+    fn drop_tables(
+        &mut self,
+        dragged: super::DraggedTables,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const CONFIRM_ABOVE: usize = 25;
+        let what = dragged
+            .schema
+            .clone()
+            .unwrap_or_else(|| dragged.connection.to_string());
+        let tables = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<super::ElPanel>(cx))
+            .and_then(|panel| {
+                panel
+                    .read(cx)
+                    .listed_tables(&dragged.connection, dragged.schema.as_deref())
+            });
+        let Some(tables) = tables else {
+            self.toast_error(
+                format!("List {what}'s tables in the EL panel first, then drag it again."),
+                cx,
+            );
+            return;
+        };
+        let count = tables.len();
+        if count <= CONFIRM_ABOVE {
+            self.add_table_streams(dragged.connection, tables, what, window, cx);
+            return;
+        }
+        let add = format!("Add {} streams", super::thousands(count));
+        let answer = window.prompt(
+            gpui::PromptLevel::Info,
+            &format!("Add {} streams from {what}?", super::thousands(count)),
+            Some(
+                "Each table becomes a stream named after it; tables already in the \
+                 pipeline are skipped.",
+            ),
+            &[add.as_str(), "Cancel"],
+            cx,
+        );
+        let connection = dragged.connection;
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.add_table_streams(connection, tables, what, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// One stream per table, under the same rule as a single table's drop:
+    /// they must come from the pipeline's source, unless it has no streams
+    /// yet. `what` names where they came from, for the toast.
+    fn add_table_streams(
+        &mut self,
+        connection: SharedString,
+        tables: Vec<(String, String)>,
+        what: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = &self.loaded else {
+            self.toast_error("Fix the pipeline's errors first.".into(), cx);
+            return;
+        };
+        let mut pipeline = (*loaded.pipeline).clone();
+        if pipeline.source != connection.as_ref() {
+            if pipeline.streams.is_empty() {
+                pipeline.source = connection.to_string();
+            } else {
+                self.toast_error(
+                    format!(
+                        "This pipeline reads from {} — drop its own tables, or start an \
+                         empty pipeline for {connection}.",
+                        pipeline.source
+                    ),
+                    cx,
+                );
+                return;
+            }
+        }
+        let mut names: std::collections::HashSet<String> = pipeline
+            .streams
+            .iter()
+            .map(|stream| stream.name.clone())
+            .collect();
+        let offered = tables.len();
+        for (schema, table) in tables {
+            // A stream is named after its table, so a name already taken —
+            // by an existing stream or a same-named table in another
+            // schema — is skipped rather than overwritten.
+            if !names.insert(table.clone()) {
+                continue;
+            }
+            pipeline.streams.push(el_engine::spec::StreamSpec {
+                name: table.clone(),
+                source: el_engine::spec::SourceObject::Table {
+                    schema: Some(schema),
+                    table,
+                },
+                mode: None,
+                primary_key: vec![],
+                update_key: None,
+                target_table: None,
+                select: None,
+                columns: vec![],
+                extra: Default::default(),
+            });
+        }
+        let added = pipeline.streams.len() - loaded.pipeline.streams.len();
+        if added == 0 {
+            self.toast(
+                format!("Every table of {what} is already in the pipeline."),
+                cx,
+            );
+            return;
+        }
+        let skipped = offered - added;
+        self.write_pipeline_then(pipeline, window, cx, move |this, cx| {
+            let mut message = format!(
+                "Added {} {} from {what}",
+                super::thousands(added),
+                if added == 1 { "stream" } else { "streams" }
+            );
+            if skipped > 0 {
+                message.push_str(&format!(
+                    " ({} skipped: the name was already taken)",
+                    super::thousands(skipped)
+                ));
+            }
+            message.push('.');
+            this.toast(message, cx);
+        });
     }
 
     /// The right-click menu on a stream's row: rename, remove, reorder.

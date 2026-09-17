@@ -39,6 +39,16 @@ pub struct DraggedTable {
     pub table: String,
 }
 
+/// A whole schema — or, with none, every table of a connection — dragged
+/// out of the EL panel: dropped on a pipeline canvas, each table becomes a
+/// stream. The canvas asks the panel for the tables when it lands.
+#[derive(Clone)]
+pub struct DraggedTables {
+    pub connection: SharedString,
+    pub schema: Option<String>,
+    pub count: usize,
+}
+
 /// Kinds the explorer can browse — the worker's list/query support. The
 /// panel lists their tables and queries them.
 pub(crate) fn browsable(kind: &str) -> bool {
@@ -189,19 +199,17 @@ pub fn list_schema_tables(
     schema: &str,
 ) -> anyhow::Result<Vec<String>> {
     let (worker, connection, env) = level_worker(project_root, connection)?;
-    Ok(
-        el_engine::explore::list_schema_tables(
-            &worker,
-            project_root,
-            &connection,
-            &env,
-            database,
-            schema,
-        )?
-        .into_iter()
-        .map(|(_, table)| table)
-        .collect(),
-    )
+    Ok(el_engine::explore::list_schema_tables(
+        &worker,
+        project_root,
+        &connection,
+        &env,
+        database,
+        schema,
+    )?
+    .into_iter()
+    .map(|(_, table)| table)
+    .collect())
 }
 
 /// Runs an ad-hoc query on the checkout's database worker. Blocking.

@@ -388,9 +388,11 @@ impl ElPanel {
                             self.missing_env.insert(name.clone(), missing);
                         }
                         if let el_engine::spec::Connection::Snowflake(snowflake) = connection {
-                            if let Some(database) = snowflake.database.as_deref().and_then(|template| {
-                                el_engine::env::resolve_templates(template, &env).ok()
-                            }) {
+                            if let Some(database) =
+                                snowflake.database.as_deref().and_then(|template| {
+                                    el_engine::env::resolve_templates(template, &env).ok()
+                                })
+                            {
                                 let database = database.expose().trim().to_owned();
                                 if !database.is_empty() {
                                     self.pinned_databases.insert(name.clone(), database);
@@ -615,7 +617,12 @@ impl ElPanel {
     }
 
     /// The search's matches, a page at a time.
-    fn push_search_rows(&self, rows: &mut Vec<Row>, name: &SharedString, tables: &[(String, String)]) {
+    fn push_search_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        name: &SharedString,
+        tables: &[(String, String)],
+    ) {
         let Some(browser) = self.browsers.get(name) else {
             return;
         };
@@ -704,8 +711,10 @@ impl ElPanel {
             } else {
                 1
             };
-            let in_database: Vec<&(String, String, Range<usize>)> =
-                groups.iter().filter(|(owner, _, _)| owner == database).collect();
+            let in_database: Vec<&(String, String, Range<usize>)> = groups
+                .iter()
+                .filter(|(owner, _, _)| owner == database)
+                .collect();
             for (database, schema, range) in &in_database {
                 let key = (database.clone(), schema.clone());
                 let open = (in_database.len() == 1)
@@ -719,13 +728,24 @@ impl ElPanel {
                     depth: schema_depth,
                 });
                 if open {
-                    let page = tree.and_then(|tree| tree.pages.get(&key)).copied().unwrap_or(0);
+                    let page = tree
+                        .and_then(|tree| tree.pages.get(&key))
+                        .copied()
+                        .unwrap_or(0);
                     let names: Vec<String> = tables[range.clone()]
                         .iter()
                         .map(|(_, table)| table.clone())
                         .collect();
                     let qualified = tables[range.start].0.clone();
-                    self.push_schema_tables(rows, name, &key, &qualified, &names, page, schema_depth + 1);
+                    self.push_schema_tables(
+                        rows,
+                        name,
+                        &key,
+                        &qualified,
+                        &names,
+                        page,
+                        schema_depth + 1,
+                    );
                 }
             }
         }
@@ -753,7 +773,12 @@ impl ElPanel {
             Some(Listing::Loaded(databases)) => databases,
         };
         if databases.is_empty() {
-            rows.push(note("No databases this role can see.".into(), Color::Muted, 1, false));
+            rows.push(note(
+                "No databases this role can see.".into(),
+                Color::Muted,
+                1,
+                false,
+            ));
             return;
         }
         let Some(tree) = tree else {
@@ -1230,6 +1255,30 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         );
     }
 
+    /// The (schema, table) pairs of a connection's listing, narrowed to one
+    /// schema — what a dragged schema or connection stands for. None until
+    /// the connection has been listed.
+    pub fn listed_tables(
+        &self,
+        connection: &str,
+        schema: Option<&str>,
+    ) -> Option<Vec<(String, String)>> {
+        let (_, TablesState::Loaded { tables, .. }) = self
+            .tables
+            .iter()
+            .find(|(name, _)| name.as_ref() == connection)?
+        else {
+            return None;
+        };
+        Some(
+            tables
+                .iter()
+                .filter(|(owner, _)| schema.is_none_or(|schema| owner == schema))
+                .cloned()
+                .collect(),
+        )
+    }
+
     fn connection_lists_by_level(&self, name: &SharedString) -> bool {
         self.connections
             .iter()
@@ -1331,7 +1380,11 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                     tree.schemas.insert(database.clone(), listing);
                     let missing: Vec<String> = open
                         .into_iter()
-                        .filter(|schema| !tree.tables.contains_key(&(database.clone(), schema.clone())))
+                        .filter(|schema| {
+                            !tree
+                                .tables
+                                .contains_key(&(database.clone(), schema.clone()))
+                        })
                         .collect();
                     for schema in missing {
                         this.load_schema_tables(name.clone(), database.clone(), schema, cx);
@@ -2156,6 +2209,31 @@ impl ElPanel {
                         }))
                 })
                 .when(!can_browse, |row| row.tooltip(Tooltip::text(kind_hint)))
+                .when_some(
+                    match self.tables.get(name) {
+                        Some(TablesState::Loaded { tables, .. })
+                            if super::extractable(kind) && !tables.is_empty() =>
+                        {
+                            Some(tables.len())
+                        }
+                        _ => None,
+                    },
+                    |row, count| {
+                        let label: SharedString =
+                            format!("{name} · {} tables", super::thousands(count)).into();
+                        row.on_drag(
+                            super::DraggedTables {
+                                connection: name.clone(),
+                                schema: None,
+                                count,
+                            },
+                            move |_, _, _, cx| {
+                                let label = label.clone();
+                                cx.new(|_| DraggedTablePreview(label))
+                            },
+                        )
+                    },
+                )
                 .child(
                     Icon::new(IconName::DatabaseZap)
                         .size(IconSize::Small)
@@ -2209,11 +2287,19 @@ impl ElPanel {
                         .color(Color::Muted),
                     )
                     .child(
-                        Icon::new(if open { IconName::BoxOpen } else { IconName::Box })
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                        Icon::new(if open {
+                            IconName::BoxOpen
+                        } else {
+                            IconName::Box
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
                     )
-                    .child(Label::new(database.clone()).size(LabelSize::Small).truncate())
+                    .child(
+                        Label::new(database.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_database(
                             toggle_connection.clone(),
@@ -2261,6 +2347,36 @@ impl ElPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                     }))
+                    // A schema a pipeline can extract from drags as a whole:
+                    // every table in it becomes a stream.
+                    .when_some(
+                        tables.filter(|count| {
+                            *count > 0
+                                && self
+                                    .connections
+                                    .iter()
+                                    .find(|(name, _, _)| name == connection)
+                                    .is_some_and(|(_, kind, _)| super::extractable(kind))
+                        }),
+                        |row, count| {
+                            let label: SharedString =
+                                format!("{schema} · {} tables", super::thousands(count)).into();
+                            row.tooltip(Tooltip::text(
+                                "Drag onto a pipeline canvas to add every table as a stream",
+                            ))
+                            .on_drag(
+                                super::DraggedTables {
+                                    connection: connection.clone(),
+                                    schema: Some(schema.clone()),
+                                    count,
+                                },
+                                move |_, _, _, cx| {
+                                    let label = label.clone();
+                                    cx.new(|_| DraggedTablePreview(label))
+                                },
+                            )
+                        },
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_schema(
                             toggle_connection.clone(),
