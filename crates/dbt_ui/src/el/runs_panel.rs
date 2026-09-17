@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Task,
-    UniformListScrollHandle, WeakEntity, Window,
+    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
+    Task, UniformListScrollHandle, WeakEntity, Window,
 };
-use ui::prelude::*;
+use ui::{WithScrollbar as _, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -39,6 +39,7 @@ pub struct ElRunsPanel {
     /// current surface until Back.
     preview: Option<PreviewTable>,
     preview_scroll: UniformListScrollHandle,
+    preview_h_scroll: ScrollHandle,
     // Query surface state.
     sql: Entity<Editor>,
     /// (name, kind) — names only, credential posture as everywhere.
@@ -48,6 +49,7 @@ pub struct ElRunsPanel {
     running: bool,
     result: Option<PreviewTable>,
     result_scroll: UniformListScrollHandle,
+    result_h_scroll: ScrollHandle,
     elapsed: Option<Duration>,
     query_error: Option<SharedString>,
     _query: Task<()>,
@@ -460,6 +462,7 @@ impl ElRunsPanel {
                 surface: Surface::Runs,
                 preview: None,
                 preview_scroll: UniformListScrollHandle::new(),
+                preview_h_scroll: ScrollHandle::new(),
                 sql,
                 connections: Vec::new(),
                 selected: None,
@@ -467,6 +470,7 @@ impl ElRunsPanel {
                 running: false,
                 result: None,
                 result_scroll: UniformListScrollHandle::new(),
+                result_h_scroll: ScrollHandle::new(),
                 elapsed: None,
                 query_error: None,
                 _query: Task::ready(()),
@@ -1142,7 +1146,7 @@ impl ElRunsPanel {
         });
     }
 
-    fn render_query(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_query(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         // The connection comes from the EL panel (expand one, or click a
         // table); here it is only stated, not chosen.
@@ -1248,11 +1252,15 @@ impl ElRunsPanel {
                 )
                 .into_any_element()
         } else if let Some(result) = &self.result {
+            let stripe = cx.theme().colors().element_background;
             render_grid(
                 result,
                 &self.result_scroll,
+                &self.result_h_scroll,
                 "el-query-grid",
-                cx.theme().colors().element_background,
+                stripe,
+                window,
+                cx,
             )
         } else if self.connections.is_empty() {
             v_flex()
@@ -2339,8 +2347,11 @@ fn tip_cell(
 fn render_grid(
     table: &PreviewTable,
     scroll: &UniformListScrollHandle,
+    h_scroll: &ScrollHandle,
     list_id: &'static str,
     stripe: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     const COL_WIDTH: f32 = 170.;
     let columns = table.columns.clone();
@@ -2383,11 +2394,39 @@ fn render_grid(
         .track_scroll(scroll);
 
     div()
-        .id(gpui::SharedString::from(format!("{list_id}-scroll")))
+        .id(gpui::SharedString::from(format!("{list_id}-grid")))
+        .relative()
         .flex_1()
         .min_h_0()
-        .overflow_x_scroll()
-        .child(v_flex().w(total).h_full().child(header).child(list))
+        .min_w_0()
+        .overflow_hidden()
+        .child(
+            div()
+                .id(gpui::SharedString::from(format!("{list_id}-scroll")))
+                .size_full()
+                .overflow_x_scroll()
+                // Sideways wheel motion only; vertical goes to the rows'
+                // list so the two axes don't fight.
+                .restrict_scroll_to_axis()
+                .track_scroll(h_scroll)
+                .child(v_flex().w(total).h_full().child(header).child(list)),
+        )
+        // Overlays on the unscrolled frame, as in the dbt results grid:
+        // inside the sideways-scrolling content, the vertical bar would sit
+        // at the far right of every column rather than at the visible edge.
+        .child(div().absolute().inset_0().child(div()).custom_scrollbars(
+            ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(scroll),
+            window,
+            cx,
+        ))
+        .child(
+            div().absolute().inset_0().child(div()).custom_scrollbars(
+                ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
+                    .tracked_scroll_handle(h_scroll),
+                window,
+                cx,
+            ),
+        )
         .into_any_element()
 }
 
@@ -2477,8 +2516,11 @@ impl Render for ElRunsPanel {
                     .child(render_grid(
                         preview,
                         &self.preview_scroll,
+                        &self.preview_h_scroll,
                         "el-preview-rows",
                         colors.element_background,
+                        window,
+                        cx,
                     ))
                     .into_any_element()
             }
@@ -2519,7 +2561,7 @@ impl Render for ElRunsPanel {
                     );
                 let content: gpui::AnyElement = match self.surface {
                     Surface::Runs => self.run_view.clone().into_any_element(),
-                    Surface::Query => self.render_query(cx),
+                    Surface::Query => self.render_query(window, cx),
                     Surface::Remote => self.render_remote(window, cx),
                 };
                 v_flex()
