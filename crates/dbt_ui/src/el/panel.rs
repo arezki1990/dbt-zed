@@ -1665,7 +1665,9 @@ impl ElPanel {
                             cx.new(|_| DraggedTablePreview(drag_label))
                         })
                     })
-                    .when(!extractable, |row| row.tooltip(Tooltip::text("Click to query it")))
+                    .when(!extractable, |row| {
+                        row.tooltip(Tooltip::text("Click to query it"))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.query_table(
                             connection.clone(),

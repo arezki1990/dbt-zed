@@ -813,7 +813,10 @@ streams:
             snowflake.contains("\"RAW\".information_schema.columns"),
             "{snowflake}"
         );
-        assert!(snowflake.contains("table_schema = 'LANDING'"), "{snowflake}");
+        assert!(
+            snowflake.contains("table_schema = 'LANDING'"),
+            "{snowflake}"
+        );
         assert!(columns_sql("snowflake", "LANDING", "ORDERS").is_err());
         assert!(columns_sql("mysql", "a", "b").is_err());
     }
