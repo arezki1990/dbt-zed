@@ -23,7 +23,7 @@ use workspace::{
 use super::builder::{BuilderForm, BuilderKind};
 use super::layout::{ElLayout, ElNode, ElNodeKind, build_layout};
 use super::mapping_editor::{MappingEditorState, SNOWFLAKE_TYPES};
-use el_engine::spec::{Connections, Pipeline, SpecIssue};
+use el_engine::spec::{Connections, Pipeline, SourceObject, SpecIssue};
 
 const MIN_ZOOM: f32 = 0.4;
 const MAX_ZOOM: f32 = 2.0;
@@ -337,7 +337,7 @@ impl ElPipelineCanvas {
                 }
                 match this.layout.nodes.get(ix).map(|node| node.kind.clone()) {
                     Some(ElNodeKind::Stream { stream_ix }) => {
-                        this.preview_to_grid(stream_ix, false, window, cx);
+                        this.query_source_table(stream_ix, window, cx);
                     }
                     Some(ElNodeKind::Map { stream_ix }) => {
                         let same = this.mapping_stream_ix() == Some(stream_ix);
@@ -346,7 +346,7 @@ impl ElPipelineCanvas {
                         }
                     }
                     Some(ElNodeKind::TargetTable { stream_ix }) => {
-                        this.preview_target_table(stream_ix, window, cx);
+                        this.query_target_table(stream_ix, window, cx);
                     }
                     None => {}
                 }
@@ -1069,7 +1069,35 @@ impl ElPipelineCanvas {
 
     /// Shows what the warehouse holds for one stream: opens the Query view
     /// on the target connection with `SELECT * … LIMIT 200`.
-    fn preview_target_table(
+    /// The source node opens the stream's source table in the console's
+    /// Query tab, the way its target node opens the target table: both
+    /// ends of a stream read the same way. A file source has no table to
+    /// select from, and neither has a source the worker cannot query, so
+    /// those fall back to the stream preview. The cast-and-map preview of
+    /// what a stream produces lives on the mapping editor's Preview.
+    fn query_source_table(
+        &mut self,
+        stream_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = &self.loaded else { return };
+        let queryable = loaded.source_kind.is_some_and(super::browsable);
+        let pipeline = loaded.pipeline.clone();
+        let Some(stream) = pipeline.streams.get(stream_ix) else {
+            return;
+        };
+        match &stream.source {
+            SourceObject::Table { schema, table } if queryable => {
+                let connection: SharedString = pipeline.source.clone().into();
+                let (schema, table) = (schema.clone(), table.clone());
+                self.query_table(connection, schema, table, window, cx);
+            }
+            _ => self.preview_to_grid(stream_ix, false, window, cx),
+        }
+    }
+
+    fn query_target_table(
         &mut self,
         stream_ix: usize,
         window: &mut Window,
@@ -1083,6 +1111,18 @@ impl ElPipelineCanvas {
         let connection: SharedString = pipeline.target.connection.clone().into();
         let schema = pipeline.target.schema.clone();
         let table = stream.target_table(&pipeline.target);
+        self.query_table(connection, Some(schema), table, window, cx);
+    }
+
+    /// Opens a table in the console's Query tab: SELECT * from it, run.
+    fn query_table(
+        &mut self,
+        connection: SharedString,
+        schema: Option<String>,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Separate leases: the console reads the workspace while refreshing.
         let console = self
             .workspace
@@ -1095,7 +1135,7 @@ impl ElPipelineCanvas {
             })
             .ok();
         console.update(cx, |panel, cx| {
-            panel.show_query_for_table(connection, &schema, &table, window, cx);
+            panel.show_query_for_table(connection, schema.as_deref(), &table, window, cx);
         });
     }
 

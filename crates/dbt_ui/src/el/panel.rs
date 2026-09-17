@@ -1027,7 +1027,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             })
             .ok();
         console.update(cx, |panel, cx| {
-            panel.show_query_for_table(connection, &schema, &table, window, cx);
+            panel.show_query_for_table(connection, Some(&schema), &table, window, cx);
         });
     }
 

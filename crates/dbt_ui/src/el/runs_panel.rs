@@ -741,7 +741,7 @@ impl ElRunsPanel {
     pub fn show_query_for_table(
         &mut self,
         connection: SharedString,
-        schema: &str,
+        schema: Option<&str>,
         table: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -754,28 +754,12 @@ impl ElRunsPanel {
             .iter()
             .position(|(name, _)| *name == connection)
             .or(self.selected);
-        let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
-        // Oracle has no LIMIT; ROWNUM works on every version (FETCH
-        // FIRST only from 12c, and the thick driver reaches 10g / 11g).
         let kind = self
             .selected
             .and_then(|ix| self.connections.get(ix))
             .map(|(_, kind)| kind.as_ref())
             .unwrap_or("");
-        let cap = if kind == "oracle" {
-            "WHERE ROWNUM <= 200"
-        } else {
-            "LIMIT 200"
-        };
-        // A Snowflake schema arrives as DATABASE.SCHEMA: each part is its own
-        // identifier.
-        let qualified = match schema.split_once('.') {
-            Some((database, schema)) if kind == "snowflake" => {
-                format!("{}.{}", quote(database), quote(schema))
-            }
-            _ => quote(schema),
-        };
-        let sql = format!("SELECT * FROM {qualified}.{} {cap}", quote(table));
+        let sql = select_sql(kind, schema, table);
         self.sql.update(cx, |editor, cx| {
             editor.set_text(sql, window, cx);
         });
@@ -2500,6 +2484,33 @@ fn tip_cell(
     tip_text(id, text, color).w(px(width)).flex_shrink_0()
 }
 
+/// The query a clicked table opens: its first rows, on the connection's
+/// own terms. Oracle has no LIMIT — ROWNUM works on every version (FETCH
+/// FIRST only from 12c, and the thick driver reaches 10g / 11g). A
+/// Snowflake schema arrives as DATABASE.SCHEMA, each part its own
+/// identifier, and a table with no schema is read by its bare name.
+fn select_sql(kind: &str, schema: Option<&str>, table: &str) -> String {
+    let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
+    let cap = if kind == "oracle" {
+        "WHERE ROWNUM <= 200"
+    } else {
+        "LIMIT 200"
+    };
+    let qualified = match schema.filter(|schema| !schema.is_empty()) {
+        None => quote(table),
+        Some(schema) => {
+            let schema = match schema.split_once('.') {
+                Some((database, schema)) if kind == "snowflake" => {
+                    format!("{}.{}", quote(database), quote(schema))
+                }
+                _ => quote(schema),
+            };
+            format!("{schema}.{}", quote(table))
+        }
+    };
+    format!("SELECT * FROM {qualified} {cap}")
+}
+
 /// A new table starts at its top-left corner.
 fn scroll_home(scroll: &UniformListScrollHandle, h_scroll: &ScrollHandle) {
     scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
@@ -3091,8 +3102,41 @@ mod tests {
 
     use super::{
         ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, fit_widths,
-        merge_log_tail, merge_run, one_line, place_run_event, sorted_rows, tooltip_text,
+        merge_log_tail, merge_run, one_line, place_run_event, select_sql, sorted_rows,
+        tooltip_text,
     };
+
+    #[test]
+    fn clicking_a_table_selects_its_first_rows_on_the_connections_own_terms() {
+        assert_eq!(
+            select_sql("postgres", Some("public"), "orders"),
+            "SELECT * FROM \"public\".\"orders\" LIMIT 200"
+        );
+        // Oracle reaches back to 10g, where LIMIT does not exist.
+        assert_eq!(
+            select_sql("oracle", Some("ART_REF"), "ZONE_TARIFAIRE"),
+            "SELECT * FROM \"ART_REF\".\"ZONE_TARIFAIRE\" WHERE ROWNUM <= 200"
+        );
+        // A Snowflake schema carries its database.
+        assert_eq!(
+            select_sql("snowflake", Some("DATALAKE.ACQ"), "ZONE_TARIFAIRE"),
+            "SELECT * FROM \"DATALAKE\".\"ACQ\".\"ZONE_TARIFAIRE\" LIMIT 200"
+        );
+        // Only Snowflake splits on the dot; elsewhere it is part of the name.
+        assert_eq!(
+            select_sql("postgres", Some("odd.schema"), "t"),
+            "SELECT * FROM \"odd.schema\".\"t\" LIMIT 200"
+        );
+        // A DuckDB table needs no schema, and a quote in a name is doubled.
+        assert_eq!(
+            select_sql("duckdb", None, "orders"),
+            "SELECT * FROM \"orders\" LIMIT 200"
+        );
+        assert_eq!(
+            select_sql("duckdb", Some(""), "we\"ird"),
+            "SELECT * FROM \"we\"\"ird\" LIMIT 200"
+        );
+    }
 
     fn table(rows: &[&[&str]]) -> Vec<Vec<SharedString>> {
         rows.iter()
