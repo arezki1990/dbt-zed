@@ -3,14 +3,16 @@
 //! never values), New pipeline, Initialize. Fully independent of the dbt
 //! panels; works in standalone EL projects with no dbt_project.yml.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use editor::Editor;
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Task,
-    UniformListScrollHandle, WeakEntity, Window,
+    App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
 };
-use ui::{Tooltip, WithScrollbar as _, prelude::*};
+use ui::{HighlightedLabel, SpinnerLabel, Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -48,6 +50,9 @@ pub struct ElPanel {
     /// Connections whose table list is unfolded in the explorer.
     expanded: std::collections::HashSet<SharedString>,
     tables: std::collections::HashMap<SharedString, TablesState>,
+    /// Each unfolded connection's table search and page, kept while folded
+    /// so reopening one finds its list as it was left.
+    browsers: std::collections::HashMap<SharedString, TableBrowser>,
     /// Bumped on profile/connection changes: in-flight table listings
     /// from the previous environment are dropped, not displayed.
     tables_epoch: u64,
@@ -68,10 +73,29 @@ const PROFILE_HINT: &str = "Which environment's connections this checkout uses; 
 the same. Your choice is saved in el/.zdbt/profile for you only — connections.yml does not \
 change.";
 
+/// Tables per page under an unfolded connection.
+const TABLES_PAGE: usize = 100;
+/// Longer table lists get a search field; shorter ones read at a glance.
+const TABLES_SEARCH_MIN: usize = 10;
+
 enum TablesState {
     Loading,
-    Loaded(Vec<(String, String)>),
+    Loaded {
+        tables: Vec<(String, String)>,
+        /// Each table as lowercase `schema.table`, folded once for search.
+        haystack: Vec<String>,
+    },
     Failed(SharedString),
+}
+
+struct TableBrowser {
+    search: Entity<Editor>,
+    /// The search field's words, lowercased; a table must contain them all.
+    terms: Vec<String>,
+    /// Indices into the loaded tables that contain every term.
+    matches: Vec<usize>,
+    page: usize,
+    _search_edits: Subscription,
 }
 
 /// The Remotes section's built-in `localhost` runner.
@@ -106,6 +130,19 @@ enum Row {
         table: String,
     },
     ConnNote(SharedString, Color),
+    /// A connection's tables are being listed; a 10g dictionary can take
+    /// several seconds, so it spins rather than sits still.
+    TablesLoading,
+    /// The search field over a connection's tables.
+    TableSearch(SharedString),
+    /// After a page of tables: which ones out of how many, with page
+    /// buttons when there is more than one page.
+    TablePager {
+        connection: SharedString,
+        shown: Range<usize>,
+        total: usize,
+        searching: bool,
+    },
     /// The built-in local runner (`localhost`), with its start/stop control.
     LocalRunner,
     /// A note about the local runner; the tooltip carries Docker's own words.
@@ -184,6 +221,7 @@ impl ElPanel {
             collapsed: Default::default(),
             expanded: Default::default(),
             tables: Default::default(),
+            browsers: Default::default(),
             tables_epoch: 0,
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
@@ -315,6 +353,7 @@ impl ElPanel {
         }
         self.tables.clear();
         self.expanded.clear();
+        self.browsers.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
         // The selection file is one voice among three — say what actually
@@ -422,23 +461,15 @@ impl ElPanel {
                     continue;
                 }
                 match self.tables.get(name) {
-                    None | Some(TablesState::Loading) => {
-                        rows.push(Row::ConnNote("Loading tables…".into(), Color::Muted));
-                    }
+                    None | Some(TablesState::Loading) => rows.push(Row::TablesLoading),
                     Some(TablesState::Failed(message)) => {
                         rows.push(Row::ConnNote(message.clone(), Color::Error));
                     }
-                    Some(TablesState::Loaded(tables)) if tables.is_empty() => {
+                    Some(TablesState::Loaded { tables, .. }) if tables.is_empty() => {
                         rows.push(Row::ConnNote("No tables.".into(), Color::Muted));
                     }
-                    Some(TablesState::Loaded(tables)) => {
-                        for (schema, table) in tables {
-                            rows.push(Row::Table {
-                                connection: name.clone(),
-                                schema: schema.clone(),
-                                table: table.clone(),
-                            });
-                        }
+                    Some(TablesState::Loaded { tables, .. }) => {
+                        self.push_table_rows(&mut rows, name, tables);
                     }
                 }
             }
@@ -446,6 +477,50 @@ impl ElPanel {
             rows.push(Row::ConnectionsHeader);
         }
         rows
+    }
+
+    /// One page of a connection's tables, narrowed by its search.
+    fn push_table_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        name: &SharedString,
+        tables: &[(String, String)],
+    ) {
+        let browser = self.browsers.get(name);
+        let searching = browser.is_some_and(|browser| !browser.terms.is_empty());
+        if tables.len() > TABLES_SEARCH_MIN || searching {
+            rows.push(Row::TableSearch(name.clone()));
+        }
+        let total = match browser {
+            Some(browser) if searching => browser.matches.len(),
+            _ => tables.len(),
+        };
+        if total == 0 {
+            rows.push(Row::ConnNote("No tables match.".into(), Color::Muted));
+            return;
+        }
+        let shown = page_range(total, browser.map_or(0, |browser| browser.page));
+        for position in shown.clone() {
+            let index = match browser {
+                Some(browser) if searching => browser.matches.get(position).copied(),
+                _ => Some(position),
+            };
+            if let Some((schema, table)) = index.and_then(|index| tables.get(index)) {
+                rows.push(Row::Table {
+                    connection: name.clone(),
+                    schema: schema.clone(),
+                    table: table.clone(),
+                });
+            }
+        }
+        if searching || total > TABLES_PAGE {
+            rows.push(Row::TablePager {
+                connection: name.clone(),
+                shown,
+                total,
+                searching,
+            });
+        }
     }
 
     /// The built-in runner, or what stands in its way. Only a licensed
@@ -742,11 +817,20 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             .ok();
     }
 
-    fn toggle_connection(&mut self, name: SharedString, cx: &mut Context<Self>) {
+    fn toggle_connection(
+        &mut self,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.expanded.contains(&name) {
             self.expanded.remove(&name);
         } else {
             self.expanded.insert(name.clone());
+            if !self.browsers.contains_key(&name) {
+                let browser = self.table_browser(name.clone(), window, cx);
+                self.browsers.insert(name.clone(), browser);
+            }
             if !self.tables.contains_key(&name) {
                 self.load_tables(name.clone(), cx);
             }
@@ -765,7 +849,15 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         self.tables.insert(name.clone(), TablesState::Loading);
         let epoch = self.tables_epoch;
         let connection_name = name.to_string();
-        let task = cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
+        let task = cx.background_spawn(async move {
+            super::list_tables(&root, &connection_name).map(|tables| {
+                let haystack = tables
+                    .iter()
+                    .map(|(schema, table)| format!("{schema}.{table}").to_lowercase())
+                    .collect();
+                (tables, haystack)
+            })
+        });
         let key = name.clone();
         self._list_tasks.insert(
             key,
@@ -776,10 +868,12 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                         return; // a different environment answered
                     }
                     let state = match result {
-                        Ok(tables) => TablesState::Loaded(tables),
+                        Ok((tables, haystack)) => TablesState::Loaded { tables, haystack },
                         Err(error) => TablesState::Failed(format!("{error:#}").into()),
                     };
                     this.tables.insert(name.clone(), state);
+                    // A search typed before a Refresh applies to the new list.
+                    this.match_tables(&name);
                     cx.notify();
                 })
                 .ok();
@@ -787,11 +881,110 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         );
     }
 
+    fn table_browser(
+        &mut self,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TableBrowser {
+        let search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search tables…", window, cx);
+            editor
+        });
+        let search_edits =
+            cx.subscribe(&search, move |this, _, event: &editor::EditorEvent, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    this.search_tables(&name, cx);
+                }
+            });
+        TableBrowser {
+            search,
+            terms: Vec::new(),
+            matches: Vec::new(),
+            page: 0,
+            _search_edits: search_edits,
+        }
+    }
+
+    fn search_tables(&mut self, name: &SharedString, cx: &mut Context<Self>) {
+        let Some(browser) = self.browsers.get_mut(name) else {
+            return;
+        };
+        browser.terms = search_terms(&browser.search.read(cx).text(cx));
+        browser.page = 0;
+        self.match_tables(name);
+        cx.notify();
+    }
+
+    /// Recomputes a connection's matches against its loaded tables and
+    /// keeps its page in range.
+    fn match_tables(&mut self, name: &SharedString) {
+        let (Some(browser), Some(TablesState::Loaded { haystack, .. })) =
+            (self.browsers.get_mut(name), self.tables.get(name))
+        else {
+            return;
+        };
+        let total = if browser.terms.is_empty() {
+            browser.matches.clear();
+            haystack.len()
+        } else {
+            browser.matches = matching_tables(haystack, &browser.terms);
+            browser.matches.len()
+        };
+        browser.page = page_range(total, browser.page).start / TABLES_PAGE;
+    }
+
+    /// Empties a connection's search field; false when there was nothing
+    /// to empty.
+    fn clear_table_search(
+        &mut self,
+        name: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(search) = self
+            .browsers
+            .get(name)
+            .map(|browser| browser.search.clone())
+        else {
+            return false;
+        };
+        if search.read(cx).text(cx).is_empty() {
+            return false;
+        }
+        search.update(cx, |editor, cx| editor.set_text("", window, cx));
+        true
+    }
+
+    fn show_table_page(&mut self, name: &SharedString, page: usize, cx: &mut Context<Self>) {
+        let Some(browser) = self.browsers.get_mut(name) else {
+            return;
+        };
+        let total = match self.tables.get(name) {
+            Some(TablesState::Loaded { tables, .. }) if browser.terms.is_empty() => tables.len(),
+            Some(TablesState::Loaded { .. }) => browser.matches.len(),
+            _ => 0,
+        };
+        browser.page = page_range(total, page).start / TABLES_PAGE;
+        // A new page starts at its first table, not wherever the previous
+        // page was scrolled to.
+        if let Some(ix) = self
+            .connection_rows()
+            .iter()
+            .position(|row| matches!(row, Row::Connection(connection, ..) if connection == name))
+        {
+            self.scroll_lower.scroll_to_item(ix, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
     /// Called by the connection modal after a successful write: drops
     /// stale table caches (names may have changed) and re-reads the spec.
     pub fn connections_changed(&mut self, cx: &mut Context<Self>) {
         self.tables.clear();
         self.expanded.clear();
+        self.browsers.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
     }
@@ -1376,8 +1569,8 @@ impl ElPanel {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_connection(toggle_name.clone(), cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_connection(toggle_name.clone(), window, cx);
                         }))
                 })
                 .when(!can_browse, |row| row.tooltip(Tooltip::text(kind_hint)))
@@ -1430,6 +1623,22 @@ impl ElPanel {
                     table: table.clone(),
                 };
                 let drag_label: SharedString = label.clone().into();
+                let highlights = self
+                    .browsers
+                    .get(&connection)
+                    .map(|browser| highlight_ranges(&label, &browser.terms))
+                    .unwrap_or_default();
+                let name: gpui::AnyElement = if highlights.is_empty() {
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .truncate()
+                        .into_any_element()
+                } else {
+                    HighlightedLabel::from_ranges(label, highlights)
+                        .size(LabelSize::Small)
+                        .truncate()
+                        .into_any_element()
+                };
                 base.cursor_pointer()
                     .pl_6()
                     .child(
@@ -1437,7 +1646,7 @@ impl ElPanel {
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .child(Label::new(label).size(LabelSize::Small).truncate())
+                    .child(name)
                     .tooltip(|_, cx| {
                         Tooltip::with_meta(
                             "Drag onto a pipeline canvas to add it as a stream",
@@ -1558,6 +1767,141 @@ impl ElPanel {
                         .color(*color),
                 )
                 .into_any_element(),
+            Row::TablesLoading => base
+                .pl_6()
+                .child(
+                    SpinnerLabel::new()
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Loading tables…")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            Row::TableSearch(connection) => {
+                let Some(browser) = self.browsers.get(connection) else {
+                    return base.into_any_element();
+                };
+                let searching = !browser.terms.is_empty();
+                let clear = connection.clone();
+                let cancel = connection.clone();
+                h_flex()
+                    .id(ix)
+                    .h(px(24.))
+                    .w_full()
+                    .pl_6()
+                    .pr_2()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(browser.search.clone()),
+                    )
+                    .when(searching, |row| {
+                        row.child(
+                            IconButton::new(("el-table-search-clear", ix), IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Clear search"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.clear_table_search(&clear, window, cx);
+                                })),
+                        )
+                    })
+                    // Escape empties the search; with nothing to empty it
+                    // goes on to whatever else handles Escape.
+                    .on_action(
+                        cx.listener(move |this, _: &editor::actions::Cancel, window, cx| {
+                            if !this.clear_table_search(&cancel, window, cx) {
+                                cx.propagate();
+                            }
+                        }),
+                    )
+                    .into_any_element()
+            }
+            Row::TablePager {
+                connection,
+                shown,
+                total,
+                searching,
+            } => {
+                let pages = total.div_ceil(TABLES_PAGE);
+                let page = shown.start / TABLES_PAGE;
+                let noun = match (*searching, *total) {
+                    (true, 1) => "match",
+                    (true, _) => "matches",
+                    (false, 1) => "table",
+                    (false, _) => "tables",
+                };
+                let status = if pages > 1 {
+                    format!(
+                        "{}–{} of {} {noun}",
+                        thousands(shown.start + 1),
+                        thousands(shown.end),
+                        thousands(*total)
+                    )
+                } else {
+                    format!("{} {noun}", thousands(*total))
+                };
+                let previous = connection.clone();
+                let next = connection.clone();
+                h_flex()
+                    .id(ix)
+                    .h(px(24.))
+                    .w_full()
+                    .pl_6()
+                    .pr_2()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new(status)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .child(div().flex_1())
+                    .when(pages > 1, |row| {
+                        row.child(
+                            IconButton::new(("el-tables-previous", ix), IconName::ChevronLeft)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .disabled(page == 0)
+                                .tooltip(Tooltip::text("Previous page"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.show_table_page(&previous, page.saturating_sub(1), cx);
+                                })),
+                        )
+                        .child(
+                            Label::new(format!("{} / {}", page + 1, pages))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            IconButton::new(("el-tables-next", ix), IconName::ChevronRight)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .disabled(page + 1 >= pages)
+                                .tooltip(Tooltip::text("Next page"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.show_table_page(&next, page + 1, cx);
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            }
             Row::EnvHint(vars) => {
                 // The row is narrow and the names are the whole point, so
                 // the tooltip repeats them rather than the explanation alone.
@@ -1617,5 +1961,126 @@ impl ElPanel {
                 .on_click(cx.listener(|this, _, window, cx| this.initialize(window, cx)))
                 .into_any_element(),
         }
+    }
+}
+
+fn search_terms(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_lowercase).collect()
+}
+
+fn matching_tables(haystack: &[String], terms: &[String]) -> Vec<usize> {
+    haystack
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| terms.iter().all(|term| name.contains(term.as_str())))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The rows page `page` shows out of `total`, clamped to the last page.
+fn page_range(total: usize, page: usize) -> Range<usize> {
+    let last_page = total.saturating_sub(1) / TABLES_PAGE;
+    let start = page.min(last_page) * TABLES_PAGE;
+    start..(start + TABLES_PAGE).min(total)
+}
+
+/// Where each search term first appears in `label`, merged where they
+/// overlap. Folding only ASCII case keeps the byte offsets valid for the
+/// label itself; a term that matched through wider Unicode folding just
+/// goes unhighlighted.
+fn highlight_ranges(label: &str, terms: &[String]) -> Vec<Range<usize>> {
+    let folded = label.to_ascii_lowercase();
+    let mut ranges: Vec<Range<usize>> = terms
+        .iter()
+        .filter_map(|term| {
+            let start = folded.find(term.as_str())?;
+            let end = start + term.len();
+            (label.is_char_boundary(start) && label.is_char_boundary(end)).then_some(start..end)
+        })
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+fn thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_needs_every_term_in_any_case() {
+        let haystack: Vec<String> = [
+            "adm_dba.dba_nb_process",
+            "art_ref.article_zone_tarif",
+            "art_ref.article",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("ART zone")),
+            vec![1]
+        );
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("article")),
+            vec![1, 2]
+        );
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("  ")),
+            vec![0, 1, 2]
+        );
+        assert!(matching_tables(&haystack, &search_terms("orders")).is_empty());
+    }
+
+    #[test]
+    fn pages_stay_within_the_list() {
+        assert_eq!(page_range(9_331, 0), 0..100);
+        assert_eq!(page_range(9_331, 93), 9_300..9_331);
+        assert_eq!(page_range(9_331, 500), 9_300..9_331);
+        assert_eq!(page_range(100, 1), 0..100);
+        assert_eq!(page_range(0, 3), 0..0);
+    }
+
+    #[test]
+    fn highlights_merge_and_keep_to_char_boundaries() {
+        assert_eq!(
+            highlight_ranges("ART_REF.ARTICLE", &search_terms("art ref")),
+            vec![0..3, 4..7]
+        );
+        assert_eq!(
+            highlight_ranges("ART_REF.ARTICLE", &search_terms("art_r rt_ref")),
+            vec![0..7]
+        );
+        assert!(highlight_ranges("CAFÉ.MENU", &search_terms("é")).is_empty());
+        assert_eq!(
+            highlight_ranges("café.menu", &search_terms("é menu")),
+            vec![3..5, 6..10]
+        );
+    }
+
+    #[test]
+    fn counts_are_grouped_by_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(100), "100");
+        assert_eq!(thousands(9_331), "9,331");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }
