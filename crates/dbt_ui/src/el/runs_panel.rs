@@ -2340,6 +2340,19 @@ fn tip_text(
         )
 }
 
+/// A cell's value on one line, since grid rows are one line tall: runs of
+/// whitespace — the newlines of a JSON VARIANT or a CLOB — become single
+/// spaces, and a very long value is cut. The cell's tooltip keeps it whole.
+fn one_line(value: &str) -> SharedString {
+    const MAX_CHARS: usize = 300;
+    let folded = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.chars().count() > MAX_CHARS {
+        format!("{}…", folded.chars().take(MAX_CHARS).collect::<String>()).into()
+    } else {
+        folded.into()
+    }
+}
+
 /// [`tip_text`] at a fixed column width.
 fn tip_cell(
     id: impl Into<gpui::ElementId>,
@@ -2388,10 +2401,21 @@ fn render_grid(
                             .h(px(24.))
                             .flex_shrink_0()
                             .when(ix % 2 == 1, |row| row.bg(stripe))
-                            .children(row.iter().map(|cell| {
-                                div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
-                                    Label::new(cell.clone()).size(LabelSize::XSmall).truncate(),
-                                )
+                            .children(row.iter().enumerate().map(|(column, cell)| {
+                                let folded = one_line(cell);
+                                let whole = folded.as_ref() != cell.as_str();
+                                div()
+                                    .id((list_id, ix * 4_096 + column))
+                                    .w(px(COL_WIDTH))
+                                    .px_1()
+                                    .flex_shrink_0()
+                                    .child(Label::new(folded).size(LabelSize::XSmall).truncate())
+                                    .when(whole, |cell_div| {
+                                        let tooltip = tooltip_text(cell);
+                                        cell_div.tooltip(move |_, cx| {
+                                            ui::Tooltip::simple(tooltip.clone(), cx)
+                                        })
+                                    })
                             }))
                             .into_any_element()
                     })
@@ -2593,9 +2617,19 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, merge_log_tail, merge_run, place_run_event,
-        tooltip_text,
+        REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, merge_log_tail, merge_run, one_line,
+        place_run_event, tooltip_text,
     };
+
+    #[test]
+    fn grid_cells_fold_onto_one_line() {
+        assert_eq!(
+            one_line("{\n  \"brand\": \"bzb\",\n  \"amount\": \"-80\"\n}").as_ref(),
+            "{ \"brand\": \"bzb\", \"amount\": \"-80\" }"
+        );
+        assert_eq!(one_line("plain").as_ref(), "plain");
+        assert_eq!(one_line(&"x".repeat(400)).chars().count(), 301);
+    }
 
     fn run(id: u64, status: &str) -> el_engine::server::RemoteRun {
         el_engine::server::RemoteRun {
