@@ -2,9 +2,12 @@
 //! serving the open project at `http://127.0.0.1:7431` as the `localhost`
 //! remote.
 //!
-//! Reading the image is the licence. The provider grants read access on the
-//! registry per customer, so the whole check is whether Docker can read the
-//! image's manifest — no layers are pulled to find out.
+//! An image already in the local Docker runs as it is: Docker would not ask
+//! the registry before running it either, and an expired sign-in must not
+//! stop a runner that needs no network. Only a machine without the image
+//! asks the registry, and there reading it is the licence: the provider
+//! grants that read per customer, so the check is whether Docker can read
+//! the image's manifest, with no layers pulled to find out.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -78,9 +81,12 @@ pub fn container_name(project_root: &Path) -> String {
     format!("el-runner-{}", slug.trim_matches('-'))
 }
 
-/// Asks the registry, through Docker's own credentials, whether this machine
-/// may read the image. Reads the manifest only.
+/// Whether this machine may run the image: it is already in the local
+/// Docker, or the registry lets Docker's own credentials read its manifest.
 pub async fn check_access(image: &str) -> Access {
+    if image_is_local(image).await {
+        return Access::Licensed;
+    }
     let mut command = docker_command();
     command
         .args(["manifest", "inspect", image])
@@ -95,6 +101,18 @@ pub async fn check_access(image: &str) -> Access {
         }
         Err(error) => Access::Unavailable(error.to_string()),
     }
+}
+
+/// Whether Docker already holds the image under this exact reference. Any
+/// failure — absent, or Docker not usable — sends the check on to the
+/// registry, whose answer says which it was.
+async fn image_is_local(image: &str) -> bool {
+    docker_command()
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Sorts `docker manifest inspect`'s answer. Sign-in problems are told apart
@@ -573,6 +591,8 @@ mod tests {
             std::fs::write(el.join("connections.yml"), "version: 1\nconnections: {}\n").unwrap();
 
             let image = image(root);
+            // With the image already pulled this holds without any registry
+            // sign-in: the local copy is checked first.
             assert_eq!(check_access(&image).await, Access::Licensed, "{image}");
             assert_eq!(container(root).await.unwrap(), Container::Missing);
 
