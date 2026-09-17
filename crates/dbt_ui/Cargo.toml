@@ -37,6 +37,7 @@ sqlparser.workspace = true
 task.workspace = true
 ui.workspace = true
 util.workspace = true
+url.workspace = true
 workspace.workspace = true
 log.workspace = true
 zed_actions.workspace = true

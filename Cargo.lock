@@ -5223,6 +5223,7 @@ dependencies = [
  "task",
  "tempfile",
  "ui",
+ "url",
  "util",
  "workspace",
  "zed_actions",

@@ -24,8 +24,12 @@ pub const DEFAULT_IMAGE: &str =
 /// Environment or `.env` variable overriding the image: another tag, or a
 /// provider's other registry.
 pub const IMAGE_VAR: &str = "EL_RUNNER_IMAGE";
-/// `.env` variable holding the token the container and the remote share.
+/// `.env` variable holding the token the container and the remote share, when
+/// the project does not already declare a server at the runner's address.
 pub const TOKEN_VAR: &str = "EL_RUNNER_TOKEN";
+/// Environment or `.env` variable naming a Linux Oracle Instant Client on this
+/// machine. Oracle 10g / 11g sources need it, and it can't ship in the image.
+pub const ORACLE_CLIENT_VAR: &str = "EL_RUNNER_ORACLE_CLIENT_DIR";
 
 /// What the registry says about running the image on this machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,12 +191,22 @@ pub fn parse_container(ps_output: &str, name: &str) -> Container {
         })
 }
 
-/// Starts (or restarts) the project's runner: makes sure the token exists
-/// and the `localhost` remote is declared, then runs the image with the
-/// project mounted and the port published on loopback only.
+/// Starts (or restarts) the project's runner with the project mounted and the
+/// port published on loopback only. The token and the server entry are worked
+/// out first but written only once the container runs, so a start that fails
+/// (a taken port, a missing image) leaves the project as it was.
 pub async fn start(project_root: &Path, image: &str) -> Result<()> {
-    let token = ensure_token(project_root).await?;
-    ensure_remote(project_root)?;
+    let remote = runner_remote(project_root)?;
+    let existing = el_engine::env::EnvMap::load(project_root, None)
+        .get(&remote.token_var)
+        .filter(|token| !token.trim().is_empty());
+    // A tracked .env is refused before anything runs, not after.
+    let exclude = match existing {
+        Some(_) => None,
+        None => dotenv_exclusion(project_root).await?,
+    };
+    let token = existing.clone().unwrap_or_else(new_token);
+    let oracle = oracle_client_args(project_root)?;
 
     let name = container_name(project_root);
     // A previous container for this project (stopped, or on an old image)
@@ -208,28 +222,27 @@ pub async fn start(project_root: &Path, image: &str) -> Result<()> {
         "type=bind,source={},target=/project",
         project_root.display()
     );
-    let output = docker_command()
-        .args([
-            "run",
-            "--detach",
-            "--name",
-            &name,
-            "--restart",
-            "unless-stopped",
-            "--publish",
-            &publish,
-            "--mount",
-            &mount,
-            // Passed by name: the value comes from this process's
-            // environment, so the token never appears in `ps`.
-            "--env",
-            "ZDBT_EL_TOKEN",
-            image,
-        ])
-        .env("ZDBT_EL_TOKEN", &token)
-        .output()
-        .await
-        .context("running docker")?;
+    let mut run = docker_command();
+    run.args([
+        "run",
+        "--detach",
+        "--name",
+        &name,
+        "--restart",
+        "unless-stopped",
+        "--publish",
+        &publish,
+        "--mount",
+        &mount,
+        // Passed by name: the value comes from this process's environment,
+        // so the token never appears in `ps`.
+        "--env",
+        "ZDBT_EL_TOKEN",
+    ])
+    .args(&oracle)
+    .arg(image)
+    .env("ZDBT_EL_TOKEN", &token);
+    let output = run.output().await.context("running docker")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // `docker run` leaves a created, never-started container behind when
@@ -247,7 +260,14 @@ pub async fn start(project_root: &Path, image: &str) -> Result<()> {
         }
         bail!("{}", first_line(&stderr));
     }
-    Ok(())
+
+    if existing.is_none() {
+        if let Some(exclude) = exclude {
+            append_line(&exclude, ".env").context("excluding .env from git")?;
+        }
+        append_dotenv(project_root, &remote.token_var, &token)?;
+    }
+    declare_remote(project_root, &remote)
 }
 
 /// Removes the project's runner container. Already gone is fine.
@@ -264,38 +284,124 @@ pub async fn stop(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Registers the runner in `el/remotes.yml` as `localhost`, so deploys, the
-/// console and connections' `workspace: localhost` reach it like any other
-/// server. The token is a `${VAR}` reference; its value lives in `.env`. An
-/// existing `localhost` entry is the user's and is left alone.
-pub fn ensure_remote(project_root: &Path) -> Result<()> {
-    let path = super::el_dir(project_root).join("remotes.yml");
-    let mut remotes = match el_engine::spec::load_remotes(&path) {
-        Ok(remotes) => remotes,
+/// The server the runner is reached through in `el/remotes.yml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerRemote {
+    /// A server already declared at the runner's address keeps its name;
+    /// otherwise `localhost`.
+    pub name: String,
+    /// The variable holding the token the container is started with.
+    pub token_var: String,
+    change: RemoteChange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RemoteChange {
+    /// Declared already, with a `${VAR}` token.
+    None,
+    /// Declared at the address without a token: it gets one.
+    Token,
+    /// Not declared: `localhost` is added.
+    Entry,
+}
+
+/// Whether a declared URL is the runner's own address: plain http on
+/// loopback, at the runner's port.
+pub fn is_runner_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    url.scheme() == "http"
+        && loopback
+        && url.port() == Some(PORT)
+        && url.path().trim_matches('/').is_empty()
+}
+
+/// How the runner is declared, worked out without writing anything. A server
+/// already at the runner's address is adopted, name and token variable both,
+/// so a project keeps one entry per daemon; otherwise it becomes `localhost`.
+pub fn runner_remote(project_root: &Path) -> Result<RunnerRemote> {
+    let remotes = load_remotes(project_root)?;
+    let adopted = remotes
+        .remotes
+        .iter()
+        .find(|(_, remote)| is_runner_url(&remote.url));
+    Ok(match adopted {
+        Some((name, remote)) => match remote.token.as_deref() {
+            Some(template) => {
+                let mut refs = Vec::new();
+                el_engine::env::collect_var_refs(template, &mut refs);
+                let Some(token_var) = refs.into_iter().next() else {
+                    bail!("the {name:?} server's token must be a ${{VAR}} reference");
+                };
+                RunnerRemote {
+                    name: name.clone(),
+                    token_var,
+                    change: RemoteChange::None,
+                }
+            }
+            None => RunnerRemote {
+                name: name.clone(),
+                token_var: TOKEN_VAR.to_owned(),
+                change: RemoteChange::Token,
+            },
+        },
+        None => RunnerRemote {
+            name: REMOTE_NAME.to_owned(),
+            token_var: TOKEN_VAR.to_owned(),
+            change: RemoteChange::Entry,
+        },
+    })
+}
+
+fn load_remotes(project_root: &Path) -> Result<el_engine::spec::Remotes> {
+    match el_engine::spec::load_remotes(&super::el_dir(project_root).join("remotes.yml")) {
+        Ok(remotes) => Ok(remotes),
         Err(el_engine::spec::SpecError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            el_engine::spec::Remotes {
+            Ok(el_engine::spec::Remotes {
                 version: 1,
                 remotes: Default::default(),
                 extra: Default::default(),
-            }
+            })
         }
         // A broken file is not an empty one: rewriting it would lose the
         // servers it declares.
         Err(error) => bail!("remotes.yml could not be read: {error} — fix the file first"),
-    };
-    if remotes.remotes.contains_key(REMOTE_NAME) {
-        return Ok(());
     }
-    remotes.remotes.insert(
-        REMOTE_NAME.to_owned(),
-        el_engine::spec::RemoteSpec {
-            url: format!("http://127.0.0.1:{PORT}"),
-            token: Some(format!("${{{TOKEN_VAR}}}")),
-            extra: Default::default(),
-        },
-    );
+}
+
+/// Writes what `runner_remote` found missing, so deploys, the console and
+/// connections' `workspace:` reach the runner like any other server.
+fn declare_remote(project_root: &Path, remote: &RunnerRemote) -> Result<()> {
+    let template = format!("${{{}}}", remote.token_var);
+    let mut remotes = load_remotes(project_root)?;
+    match remote.change {
+        RemoteChange::None => return Ok(()),
+        RemoteChange::Token => {
+            if let Some(entry) = remotes.remotes.get_mut(&remote.name) {
+                entry.token = Some(template);
+            }
+        }
+        RemoteChange::Entry => {
+            remotes.remotes.insert(
+                remote.name.clone(),
+                el_engine::spec::RemoteSpec {
+                    url: format!("http://127.0.0.1:{PORT}"),
+                    token: Some(template),
+                    extra: Default::default(),
+                },
+            );
+        }
+    }
+    let path = super::el_dir(project_root).join("remotes.yml");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("creating el/")?;
     }
@@ -303,27 +409,63 @@ pub fn ensure_remote(project_root: &Path) -> Result<()> {
         .context("writing el/remotes.yml")
 }
 
-/// The runner token: the one already set in the environment or `.env`, or a
-/// new one written to `.env` once the file is safe from a commit.
-async fn ensure_token(project_root: &Path) -> Result<String> {
-    if let Some(token) = el_engine::env::EnvMap::load(project_root, None)
-        .get(TOKEN_VAR)
-        .filter(|token| !token.trim().is_empty())
-    {
-        return Ok(token);
-    }
-    protect_dotenv(project_root).await?;
+fn new_token() -> String {
     let bytes: [u8; 32] = rand::random();
-    let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    append_dotenv(project_root, TOKEN_VAR, &token)?;
-    Ok(token)
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Keeps `.env` out of git before a token goes into it. A tracked `.env` is
-/// refused; an unignored one is added to `.git/info/exclude`, which stays
-/// local to this clone rather than changing the team's `.gitignore`. Outside
-/// a git checkout there is nothing to protect against.
-async fn protect_dotenv(project_root: &Path) -> Result<()> {
+/// Oracle 10g / 11g sources go through the thick driver, which needs a Linux
+/// Instant Client beside the worker. When `EL_RUNNER_ORACLE_CLIENT_DIR` names
+/// one, it is mounted with a sqlnet.ora allowing the old logon protocol 10g
+/// still speaks (kept in the IDE's data directory, never in the project).
+fn oracle_client_args(project_root: &Path) -> Result<Vec<String>> {
+    let Some(dir) = el_engine::env::EnvMap::load(project_root, None)
+        .get(ORACLE_CLIENT_VAR)
+        .map(|dir| dir.trim().to_owned())
+        .filter(|dir| !dir.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let client = PathBuf::from(&dir);
+    if !client.join("libclntsh.so").exists() {
+        bail!(
+            "{ORACLE_CLIENT_VAR} is {dir:?}, which holds no Linux Instant Client \
+             (libclntsh.so) — point it at the unzipped instantclient_19_* directory"
+        );
+    }
+    let admin = paths::data_dir().join("el-runner").join("network-admin");
+    std::fs::create_dir_all(&admin).context("creating the runner's sqlnet.ora directory")?;
+    std::fs::write(
+        admin.join("sqlnet.ora"),
+        "SQLNET.ALLOWED_LOGON_VERSION_CLIENT=8\nSQLNET.ALLOWED_LOGON_VERSION_SERVER=8\n",
+    )
+    .context("writing the runner's sqlnet.ora")?;
+    Ok(vec![
+        "--mount".to_owned(),
+        format!(
+            "type=bind,source={},target=/opt/oracle/instantclient,readonly",
+            client.display()
+        ),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,source={},target=/opt/oracle/network/admin,readonly",
+            admin.display()
+        ),
+        "--env".to_owned(),
+        "ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient".to_owned(),
+        "--env".to_owned(),
+        "LD_LIBRARY_PATH=/opt/oracle/instantclient".to_owned(),
+        "--env".to_owned(),
+        "TNS_ADMIN=/opt/oracle/network/admin".to_owned(),
+    ])
+}
+
+/// Checks `.env` can safely hold a token, before one is written. A tracked
+/// `.env` is refused. An unignored one is to be added to `.git/info/exclude`
+/// — local to this clone rather than the team's `.gitignore` — and that path
+/// is returned for the caller to write once the runner is up. Outside a git
+/// checkout there is nothing to protect against.
+async fn dotenv_exclusion(project_root: &Path) -> Result<Option<PathBuf>> {
     let git = |args: &[&str]| {
         let mut command = util::command::new_command("git");
         command.arg("-C").arg(project_root).args(args);
@@ -333,10 +475,10 @@ async fn protect_dotenv(project_root: &Path) -> Result<()> {
         .output()
         .await
     else {
-        return Ok(());
+        return Ok(None);
     };
     if !exclude.status.success() {
-        return Ok(());
+        return Ok(None);
     }
     let tracked = git(&["ls-files", "--error-unmatch", ".env"])
         .output()
@@ -345,18 +487,14 @@ async fn protect_dotenv(project_root: &Path) -> Result<()> {
     if tracked {
         bail!(
             ".env is tracked by git, so the runner token can't be written there — \
-             set {TOKEN_VAR} in your environment instead"
+             set the token in your environment instead"
         );
     }
     let ignored = git(&["check-ignore", "--quiet", ".env"])
         .output()
         .await
         .is_ok_and(|output| output.status.success());
-    if !ignored {
-        let exclude = project_root.join(String::from_utf8_lossy(&exclude.stdout).trim());
-        append_line(&exclude, ".env").context("excluding .env from git")?;
-    }
-    Ok(())
+    Ok((!ignored).then(|| project_root.join(String::from_utf8_lossy(&exclude.stdout).trim())))
 }
 
 fn append_dotenv(project_root: &Path, key: &str, value: &str) -> Result<()> {
@@ -519,45 +657,116 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_localhost_remote_is_added_once_and_keeps_other_servers() {
-        let dir = tempfile::tempdir().unwrap();
-        let remotes_path = super::super::el_dir(dir.path()).join("remotes.yml");
+    fn remotes_file(root: &Path, yaml: &str) -> PathBuf {
+        let path = super::super::el_dir(root).join("remotes.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, yaml).unwrap();
+        path
+    }
 
-        ensure_remote(dir.path()).unwrap();
-        let first = std::fs::read_to_string(&remotes_path).unwrap();
-        let parsed = el_engine::spec::load_remotes(&remotes_path).unwrap();
+    #[test]
+    fn the_runner_address_is_recognised_however_it_is_spelled() {
+        assert!(is_runner_url("http://127.0.0.1:7431"));
+        assert!(is_runner_url("http://localhost:7431/"));
+        assert!(is_runner_url("  HTTP://LOCALHOST:7431 "));
+        assert!(is_runner_url("http://[::1]:7431"));
+        assert!(!is_runner_url("http://127.0.0.1:7432"));
+        assert!(!is_runner_url("https://127.0.0.1:7431"));
+        assert!(!is_runner_url("http://10.0.0.5:7431"));
+        assert!(!is_runner_url("http://127.0.0.1:7431/api"));
+    }
+
+    #[test]
+    fn a_new_project_gets_a_localhost_server_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let remote = runner_remote(root).unwrap();
+        assert_eq!(
+            (remote.name.as_str(), remote.token_var.as_str()),
+            (REMOTE_NAME, TOKEN_VAR)
+        );
+        declare_remote(root, &remote).unwrap();
+
+        let path = super::super::el_dir(root).join("remotes.yml");
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed = el_engine::spec::load_remotes(&path).unwrap();
         let local = &parsed.remotes[REMOTE_NAME];
         assert_eq!(local.url, "http://127.0.0.1:7431");
         assert_eq!(local.token.as_deref(), Some("${EL_RUNNER_TOKEN}"));
         // The loopback URL is one the remote client accepts over plain http.
         el_engine::server::check_remote_url(&local.url).unwrap();
 
-        ensure_remote(dir.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(&remotes_path).unwrap(), first);
+        // Declared now, so it is adopted and nothing more is written.
+        let again = runner_remote(root).unwrap();
+        assert_eq!(again.change, RemoteChange::None);
+        declare_remote(root, &again).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+    }
 
-        std::fs::write(
-            &remotes_path,
-            "version: 1\nremotes:\n  vm:\n    url: http://127.0.0.1:17431\n",
-        )
-        .unwrap();
-        ensure_remote(dir.path()).unwrap();
-        let parsed = el_engine::spec::load_remotes(&remotes_path).unwrap();
-        assert!(parsed.remotes.contains_key("vm"));
-        assert!(parsed.remotes.contains_key(REMOTE_NAME));
+    /// The user's own daemon entry at the runner's address is the runner: no
+    /// second name for the same port, and its token variable is the one the
+    /// container gets.
+    #[test]
+    fn a_server_already_at_the_runner_address_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ZDBT_EL_TOKEN}\n  docker_test:\n    url: http://127.0.0.1:7432\n    token: ${ZDBT_EL_TOKEN_DOCKER_TEST}\n";
+        let path = remotes_file(dir.path(), yaml);
+
+        let remote = runner_remote(dir.path()).unwrap();
+        assert_eq!(remote.name, "local_daemon");
+        assert_eq!(remote.token_var, "ZDBT_EL_TOKEN");
+        declare_remote(dir.path(), &remote).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn a_server_at_the_address_without_a_token_is_given_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = remotes_file(
+            dir.path(),
+            "version: 1\nremotes:\n  mine:\n    url: http://localhost:7431\n",
+        );
+        let remote = runner_remote(dir.path()).unwrap();
+        assert_eq!(
+            (remote.name.as_str(), remote.token_var.as_str()),
+            ("mine", TOKEN_VAR)
+        );
+        declare_remote(dir.path(), &remote).unwrap();
+        let parsed = el_engine::spec::load_remotes(&path).unwrap();
+        assert_eq!(parsed.remotes.len(), 1);
+        assert_eq!(
+            parsed.remotes["mine"].token.as_deref(),
+            Some("${EL_RUNNER_TOKEN}")
+        );
     }
 
     #[test]
     fn a_broken_remotes_file_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
-        let remotes_path = super::super::el_dir(dir.path()).join("remotes.yml");
-        std::fs::create_dir_all(remotes_path.parent().unwrap()).unwrap();
-        std::fs::write(&remotes_path, "remotes: [this is: not valid").unwrap();
-        assert!(ensure_remote(dir.path()).is_err());
+        let path = remotes_file(dir.path(), "remotes: [this is: not valid");
+        assert!(runner_remote(dir.path()).is_err());
         assert_eq!(
-            std::fs::read_to_string(&remotes_path).unwrap(),
+            std::fs::read_to_string(&path).unwrap(),
             "remotes: [this is: not valid"
         );
+    }
+
+    #[test]
+    fn an_oracle_client_is_mounted_only_when_named_and_real() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(oracle_client_args(dir.path()).unwrap().is_empty());
+
+        // Named, but not an Instant Client: said plainly rather than mounted.
+        let not_a_client = dir.path().join("empty");
+        std::fs::create_dir_all(&not_a_client).unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            format!("{ORACLE_CLIENT_VAR}={}\n", not_a_client.display()),
+        )
+        .unwrap();
+        let error = oracle_client_args(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("libclntsh.so"), "{error:#}");
     }
 
     #[test]
@@ -612,6 +821,13 @@ mod tests {
                     "{refused:#}"
                 );
                 assert_eq!(container(other.path()).await?, Container::Missing);
+                // Nothing is written for a runner that never ran.
+                assert!(!other.path().join(".env").exists());
+                assert!(
+                    !super::super::el_dir(other.path())
+                        .join("remotes.yml")
+                        .exists()
+                );
 
                 let client = el_engine::server::RemoteClient::connect(root, REMOTE_NAME)?;
                 let mut health = client.health();

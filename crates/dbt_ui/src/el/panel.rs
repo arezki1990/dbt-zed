@@ -85,6 +85,9 @@ struct RunnerState {
     error: Option<SharedString>,
     /// The project the last check ran for; another project checks again.
     checked_root: Option<PathBuf>,
+    /// The server the runner answers as: one the project already declares at
+    /// the runner's address, else `localhost`.
+    remote_name: SharedString,
     _check: Task<()>,
     _action: Task<()>,
 }
@@ -174,6 +177,7 @@ impl ElPanel {
                 busy: None,
                 error: None,
                 checked_root: None,
+                remote_name: local_runner::REMOTE_NAME.into(),
                 _check: Task::ready(()),
                 _action: Task::ready(()),
             },
@@ -215,6 +219,9 @@ impl ElPanel {
         // Real env + project .env: only ever probed for a NAME's presence.
         let env = el_engine::env::EnvMap::load(&root, None);
         self.remotes_missing_token.clear();
+        self.runner.remote_name = local_runner::runner_remote(&root)
+            .map(|remote| remote.name.into())
+            .unwrap_or_else(|_| local_runner::REMOTE_NAME.into());
         self.remotes = el_engine::spec::load_remotes(&el.join("remotes.yml"))
             .map(|remotes| {
                 remotes
@@ -583,7 +590,7 @@ impl ElPanel {
         }
         for (name, host) in &self.remotes {
             // The runner row already stands for `localhost`.
-            if runner_offered && name.as_ref() == local_runner::REMOTE_NAME {
+            if runner_offered && *name == self.runner.remote_name {
                 continue;
             }
             rows.push(Row::Remote(name.clone(), host.clone()));
@@ -1492,7 +1499,7 @@ impl ElPanel {
                         .size(IconSize::Small)
                         .color(Color::Muted),
                 )
-                .child(Label::new(local_runner::REMOTE_NAME).size(LabelSize::Small))
+                .child(Label::new(self.runner.remote_name.clone()).size(LabelSize::Small))
                 .child(div().flex_1())
                 .child(
                     Label::new(status)
@@ -1505,20 +1512,26 @@ impl ElPanel {
                         .truncate(),
                 )
                 .child(control)
-                .tooltip(|_, cx| {
-                    Tooltip::with_meta(
-                        "Local runner",
-                        None,
-                        "The EL daemon in this machine's Docker, serving this project at \
-                         http://127.0.0.1:7431 as the `localhost` server in el/remotes.yml. \
-                         Point a connection at it with `workspace: localhost`.",
-                        cx,
-                    )
+                .tooltip({
+                    let name = self.runner.remote_name.clone();
+                    move |_, cx| {
+                        Tooltip::with_meta(
+                            "Local runner",
+                            None,
+                            format!(
+                                "The EL daemon in this machine's Docker, serving this project at \
+                                 http://127.0.0.1:7431 as the `{name}` server in el/remotes.yml. \
+                                 Point a connection at it with `workspace: {name}`."
+                            ),
+                            cx,
+                        )
+                    }
                 })
                 .when(running, |row| {
+                    let name = self.runner.remote_name.clone();
                     row.cursor_pointer()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_remote(local_runner::REMOTE_NAME.into(), window, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.show_remote(name.clone(), window, cx);
                         }))
                 })
                 .into_any_element()
