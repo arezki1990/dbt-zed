@@ -66,7 +66,7 @@ fn tool_descriptors() -> Value {
         },
         {
             "name": "el_list_tables",
-            "description": "List the tables and views of a database connection (duckdb, postgres, oracle) as SCHEMA.TABLE, through its worker. Large catalogs page: pass `search` (every word must appear, any case), `offset`, and `limit`; the answer says how many match and the next offset.",
+            "description": "List the tables and views of a database connection (duckdb, postgres, oracle, snowflake) as SCHEMA.TABLE — DATABASE.SCHEMA.TABLE on Snowflake — through its worker. Large catalogs page: pass `search` (every word must appear, any case), `offset`, and `limit`; the answer says how many match and the next offset.",
             "inputSchema": { "type": "object", "properties": {
                 "project_root": root,
                 "connection": connection,
@@ -77,7 +77,7 @@ fn tool_descriptors() -> Value {
         },
         {
             "name": "el_table_columns",
-            "description": "The columns of one table on a database connection, from the database's own catalog: name, data type, nullability (and length, precision, scale on Oracle).",
+            "description": "The columns of one table on a database connection, from the database's own catalog: name, data type, nullability (and length, precision, scale on Oracle). On Snowflake pass the schema as DATABASE.SCHEMA, as el_list_tables shows it; reading its catalog needs a warehouse.",
             "inputSchema": { "type": "object", "properties": {
                 "project_root": root,
                 "connection": connection,
@@ -404,7 +404,7 @@ fn browsable_connection(root: &Path, name: &str) -> Result<&'static str> {
         .kind();
     anyhow::ensure!(
         super::browsable(kind),
-        "{name} is a {kind} connection — only duckdb, postgres and oracle can be browsed"
+        "{name} is a {kind} connection — only duckdb, postgres, oracle and snowflake can be browsed"
     );
     Ok(kind)
 }
@@ -442,21 +442,38 @@ fn list_tables(
     }))
 }
 
-/// The catalog query for one table's columns, quoted for a literal.
+/// The catalog query for one table's columns, its names quoted as literals.
 fn columns_sql(kind: &str, schema: &str, table: &str) -> Result<String> {
-    let schema = schema.replace('\'', "''");
-    let table = table.replace('\'', "''");
+    let literal = |text: &str| text.replace('\'', "''");
+    let table_literal = literal(table);
     Ok(match kind {
         "duckdb" | "postgres" => format!(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-             WHERE table_schema = '{schema}' AND table_name = '{table}' \
-             ORDER BY ordinal_position"
+             WHERE table_schema = '{}' AND table_name = '{table_literal}' \
+             ORDER BY ordinal_position",
+            literal(schema)
         ),
         "oracle" => format!(
             "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable \
-             FROM all_tab_columns WHERE owner = '{schema}' AND table_name = '{table}' \
-             ORDER BY column_id"
+             FROM all_tab_columns WHERE owner = '{}' AND table_name = '{table_literal}' \
+             ORDER BY column_id",
+            literal(schema)
         ),
+        // Snowflake keeps a catalog per database, so the schema arrives as
+        // DATABASE.SCHEMA and the database becomes an identifier.
+        "snowflake" => {
+            let Some((database, schema)) = schema.split_once('.') else {
+                bail!("pass a Snowflake schema as DATABASE.SCHEMA, as el_list_tables shows it");
+            };
+            format!(
+                "SELECT column_name, data_type, is_nullable \
+                 FROM \"{}\".information_schema.columns \
+                 WHERE table_schema = '{}' AND table_name = '{table_literal}' \
+                 ORDER BY ordinal_position",
+                database.replace('"', "\"\""),
+                literal(schema)
+            )
+        }
         other => bail!("{other} connections have no catalog to read"),
     })
 }
@@ -791,7 +808,14 @@ streams:
                 .expect("postgres")
                 .contains("information_schema.columns")
         );
-        assert!(columns_sql("snowflake", "a", "b").is_err());
+        let snowflake = columns_sql("snowflake", "RAW.LANDING", "ORDERS").expect("snowflake");
+        assert!(
+            snowflake.contains("\"RAW\".information_schema.columns"),
+            "{snowflake}"
+        );
+        assert!(snowflake.contains("table_schema = 'LANDING'"), "{snowflake}");
+        assert!(columns_sql("snowflake", "LANDING", "ORDERS").is_err());
+        assert!(columns_sql("mysql", "a", "b").is_err());
     }
 
     #[test]

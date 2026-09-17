@@ -649,7 +649,15 @@ impl ElRunsPanel {
         } else {
             "LIMIT 200"
         };
-        let sql = format!("SELECT * FROM {}.{} {cap}", quote(schema), quote(table));
+        // A Snowflake schema arrives as DATABASE.SCHEMA: each part is its own
+        // identifier.
+        let qualified = match schema.split_once('.') {
+            Some((database, schema)) if kind == "snowflake" => {
+                format!("{}.{}", quote(database), quote(schema))
+            }
+            _ => quote(schema),
+        };
+        let sql = format!("SELECT * FROM {qualified}.{} {cap}", quote(table));
         self.sql.update(cx, |editor, cx| {
             editor.set_text(sql, window, cx);
         });

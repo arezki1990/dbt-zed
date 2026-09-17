@@ -40,8 +40,15 @@ pub struct DraggedTable {
 }
 
 /// Kinds the explorer can browse — the worker's list/query support. The
-/// panel lists their tables; the canvas invites a drag from them.
+/// panel lists their tables and queries them.
 pub(crate) fn browsable(kind: &str) -> bool {
+    matches!(kind, "duckdb" | "postgres" | "oracle" | "snowflake")
+}
+
+/// Kinds a pipeline extracts from, so their tables can become streams: the
+/// canvas invites a drag from these. Snowflake is browsable but only ever a
+/// destination.
+pub(crate) fn extractable(kind: &str) -> bool {
     matches!(kind, "duckdb" | "postgres" | "oracle")
 }
 

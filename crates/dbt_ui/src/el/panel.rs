@@ -424,7 +424,7 @@ impl ElPanel {
                 if self
                     .connections
                     .iter()
-                    .any(|(_, kind, _)| super::browsable(kind))
+                    .any(|(_, kind, _)| super::extractable(kind))
                 {
                     rows.push(Row::ConnNote(
                         "Then drag a table from Connections onto it.".into(),
@@ -1636,6 +1636,13 @@ impl ElPanel {
                         .truncate()
                         .into_any_element()
                 };
+                // Only a table a pipeline can extract from may become a
+                // stream; a Snowflake table is there to be looked at.
+                let extractable = self
+                    .connections
+                    .iter()
+                    .find(|(name, _, _)| *name == connection)
+                    .is_some_and(|(_, kind, _)| super::extractable(kind));
                 base.cursor_pointer()
                     .pl_6()
                     .child(
@@ -1644,19 +1651,21 @@ impl ElPanel {
                             .color(Color::Muted),
                     )
                     .child(name)
-                    .tooltip(|_, cx| {
-                        Tooltip::with_meta(
-                            "Drag onto a pipeline canvas to add it as a stream",
-                            None,
-                            "Click to query it",
-                            cx,
-                        )
+                    .when(extractable, |row| {
+                        row.tooltip(|_, cx| {
+                            Tooltip::with_meta(
+                                "Drag onto a pipeline canvas to add it as a stream",
+                                None,
+                                "Click to query it",
+                                cx,
+                            )
+                        })
+                        .on_drag(dragged, move |_, _, _, cx| {
+                            let drag_label = drag_label.clone();
+                            cx.new(|_| DraggedTablePreview(drag_label))
+                        })
                     })
-                    // Drag onto a pipeline canvas to add it as a stream.
-                    .on_drag(dragged, move |_, _, _, cx| {
-                        let drag_label = drag_label.clone();
-                        cx.new(|_| DraggedTablePreview(drag_label))
-                    })
+                    .when(!extractable, |row| row.tooltip(Tooltip::text("Click to query it")))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.query_table(
                             connection.clone(),

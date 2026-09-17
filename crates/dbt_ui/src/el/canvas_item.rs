@@ -530,7 +530,7 @@ impl ElPipelineCanvas {
         }
         let source = &loaded.pipeline.source;
         let (primary, secondary) = match loaded.source_kind {
-            Some(kind) if super::browsable(kind) => (
+            Some(kind) if super::extractable(kind) => (
                 "Drag a table from the EL panel to add a stream.".to_owned(),
                 format!(
                     "Expand {source} under Connections and drop a table here, or press + Source."
