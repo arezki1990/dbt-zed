@@ -37,7 +37,7 @@ pub struct ElRunsPanel {
     surface: Surface,
     /// A preview table (stream sample or failed casts) — overlays the
     /// current surface until Back.
-    preview: Option<PreviewTable>,
+    preview: Option<ConsoleGrid>,
     preview_scroll: UniformListScrollHandle,
     preview_h_scroll: ScrollHandle,
     // Query surface state.
@@ -47,7 +47,7 @@ pub struct ElRunsPanel {
     selected: Option<usize>,
     root: Option<PathBuf>,
     running: bool,
-    result: Option<PreviewTable>,
+    result: Option<ConsoleGrid>,
     result_scroll: UniformListScrollHandle,
     result_h_scroll: ScrollHandle,
     elapsed: Option<Duration>,
@@ -305,6 +305,112 @@ pub struct PreviewTable {
     pub rows: std::sync::Arc<Vec<Vec<SharedString>>>,
 }
 
+/// A table on screen in the console with what its grid keeps between
+/// frames — the same things the dbt results grid keeps: the header sort
+/// and the row order it gives, column widths (fitted to the data, then
+/// dragged), a column resize in progress, and the cell opened whole.
+struct ConsoleGrid {
+    table: PreviewTable,
+    /// (column, ascending).
+    sort: Option<(usize, bool)>,
+    /// Row indices in display order.
+    order: std::sync::Arc<Vec<usize>>,
+    widths: std::sync::Arc<Vec<f32>>,
+    /// (column, pointer x, width) when the drag started.
+    resize: Option<(usize, f32, f32)>,
+    /// (column, row number, value) of the clicked cell.
+    detail: Option<(SharedString, usize, SharedString)>,
+}
+
+impl ConsoleGrid {
+    fn new(table: PreviewTable) -> Self {
+        Self {
+            order: std::sync::Arc::new((0..table.rows.len()).collect()),
+            widths: std::sync::Arc::new(fit_widths(&table.columns, &table.rows)),
+            table,
+            sort: None,
+            resize: None,
+            detail: None,
+        }
+    }
+
+    /// A header click: ascending, then descending, then the table's own order.
+    fn cycle_sort(&mut self, column: usize) {
+        self.sort = match self.sort {
+            Some((sorted, true)) if sorted == column => Some((column, false)),
+            Some((sorted, false)) if sorted == column => None,
+            _ => Some((column, true)),
+        };
+        self.order = std::sync::Arc::new(sorted_rows(&self.table.rows, self.sort));
+    }
+}
+
+/// Which of the console's two grids an action is for.
+#[derive(Clone, Copy)]
+enum GridSlot {
+    Preview,
+    Result,
+}
+
+impl GridSlot {
+    fn id(self) -> &'static str {
+        match self {
+            GridSlot::Preview => "el-preview-grid",
+            GridSlot::Result => "el-query-grid",
+        }
+    }
+}
+
+/// Column widths fitted to the data, as the dbt results grid fits them: the
+/// longest of the header and the first rows' values, within bounds.
+fn fit_widths(columns: &[SharedString], rows: &[Vec<SharedString>]) -> Vec<f32> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(column, name)| {
+            let chars = rows
+                .iter()
+                .take(30)
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.chars().count())
+                .fold(name.chars().count(), usize::max);
+            (chars as f32 * 8.2 + 24.).clamp(90., 340.)
+        })
+        .collect()
+}
+
+/// The row order for a header sort: numbers by value, everything else as
+/// text. Numbers sort before text, so a column that mixes the two still
+/// has a total order (a sort may panic without one); ties keep the
+/// table's own order.
+fn sorted_rows(rows: &[Vec<SharedString>], sort: Option<(usize, bool)>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let Some((column, ascending)) = sort else {
+        return order;
+    };
+    let keys: Vec<(Option<f64>, &str)> = rows
+        .iter()
+        .map(|row| {
+            let cell = row.get(column).map_or("", |cell| cell.as_ref());
+            (cell.trim().parse::<f64>().ok(), cell)
+        })
+        .collect();
+    order.sort_by(|&a, &b| {
+        let ordering = match (keys[a], keys[b]) {
+            ((Some(x), _), (Some(y), _)) => x.total_cmp(&y),
+            ((Some(_), _), (None, _)) => std::cmp::Ordering::Less,
+            ((None, _), (Some(_), _)) => std::cmp::Ordering::Greater,
+            ((None, x), (None, y)) => x.cmp(y),
+        };
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+    order
+}
+
 /// The failing-columns grid: one row per column with its count and
 /// sample values. Shared by the mapping preview and the run badges so
 /// a failure looks the same wherever it is opened.
@@ -544,11 +650,12 @@ impl ElRunsPanel {
         rows: Vec<Vec<SharedString>>,
         cx: &mut Context<Self>,
     ) {
-        self.preview = Some(PreviewTable {
+        self.preview = Some(ConsoleGrid::new(PreviewTable {
             title,
             columns: std::sync::Arc::new(columns),
             rows: std::sync::Arc::new(rows),
-        });
+        }));
+        scroll_home(&self.preview_scroll, &self.preview_h_scroll);
         cx.notify();
     }
 
@@ -1132,7 +1239,7 @@ impl ElRunsPanel {
                 match outcome {
                     Ok((result, elapsed)) => {
                         this.elapsed = Some(elapsed);
-                        this.result = Some(PreviewTable {
+                        this.result = Some(ConsoleGrid::new(PreviewTable {
                             title: "query".into(),
                             columns: std::sync::Arc::new(
                                 result.columns.into_iter().map(Into::into).collect(),
@@ -1144,7 +1251,8 @@ impl ElRunsPanel {
                                     .map(|row| row.into_iter().map(Into::into).collect())
                                     .collect(),
                             ),
-                        });
+                        }));
+                        scroll_home(&this.result_scroll, &this.result_h_scroll);
                     }
                     Err(error) => this.query_error = Some(format!("{error:#}").into()),
                 }
@@ -1183,7 +1291,7 @@ impl ElRunsPanel {
         let status: Option<SharedString> = if self.running {
             Some("Running…".into())
         } else if let (Some(result), Some(elapsed)) = (&self.result, self.elapsed) {
-            let count = result.rows.len();
+            let count = result.table.rows.len();
             let capped = if count >= QUERY_ROW_CAP {
                 format!(" (first {QUERY_ROW_CAP})")
             } else {
@@ -1259,17 +1367,8 @@ impl ElRunsPanel {
                         .color(Color::Error),
                 )
                 .into_any_element()
-        } else if let Some(result) = &self.result {
-            let stripe = cx.theme().colors().element_background;
-            render_grid(
-                result,
-                &self.result_scroll,
-                &self.result_h_scroll,
-                "el-query-grid",
-                stripe,
-                window,
-                cx,
-            )
+        } else if self.result.is_some() {
+            self.render_grid(GridSlot::Result, window, cx)
         } else if self.connections.is_empty() {
             v_flex()
                 .flex_1()
@@ -2342,7 +2441,7 @@ fn tip_text(
 
 /// A cell's value on one line, since grid rows are one line tall: runs of
 /// whitespace — the newlines of a JSON VARIANT or a CLOB — become single
-/// spaces, and a very long value is cut. The cell's tooltip keeps it whole.
+/// spaces, and a very long value is cut. A click on the cell shows it whole.
 fn one_line(value: &str) -> SharedString {
     const MAX_CHARS: usize = 300;
     let folded = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2363,148 +2462,416 @@ fn tip_cell(
     tip_text(id, text, color).w(px(width)).flex_shrink_0()
 }
 
-/// The shared results grid: fixed-width columns, accent header, uniform
-/// rows. Used by mapping previews and query results alike.
-fn render_grid(
-    table: &PreviewTable,
-    scroll: &UniformListScrollHandle,
-    h_scroll: &ScrollHandle,
-    list_id: &'static str,
-    stripe: gpui::Hsla,
-    window: &mut Window,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    const COL_WIDTH: f32 = 170.;
-    const HEADER_HEIGHT: f32 = 24.;
-    /// A regular scrollbar's thickness with its padding.
-    const GUTTER: f32 = 14.;
-    let columns = table.columns.clone();
-    let rows = table.rows.clone();
-    let total = px(columns.len() as f32 * COL_WIDTH);
-    let header = h_flex()
-        .w(total)
-        .h(px(HEADER_HEIGHT))
-        .items_center()
-        .flex_shrink_0()
-        .children(columns.iter().map(|column| {
-            div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
-                Label::new(column.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Accent)
-                    .truncate(),
-            )
-        }));
-    let count = rows.len();
-    let list = gpui::uniform_list(list_id, count, {
-        move |range, _, _| {
-            range
-                .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
-                .map(|(ix, row)| {
-                    h_flex()
-                        .w(total)
-                        .h(px(24.))
-                        .flex_shrink_0()
-                        .when(ix % 2 == 1, |row| row.bg(stripe))
-                        .children(row.iter().enumerate().map(|(column, cell)| {
-                            let folded = one_line(cell);
-                            let whole = folded.as_ref() != cell.as_str();
-                            div()
-                                .id((list_id, ix * 4_096 + column))
-                                .w(px(COL_WIDTH))
-                                .px_1()
-                                .flex_shrink_0()
-                                .child(Label::new(folded).size(LabelSize::XSmall).truncate())
-                                .when(whole, |cell_div| {
-                                    let tooltip = tooltip_text(cell);
-                                    cell_div.tooltip(move |_, cx| {
-                                        ui::Tooltip::simple(tooltip.clone(), cx)
-                                    })
-                                })
-                        }))
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>()
-        }
-    })
-    .flex_1()
-    .track_scroll(scroll);
+/// A new table starts at its top-left corner.
+fn scroll_home(scroll: &UniformListScrollHandle, h_scroll: &ScrollHandle) {
+    scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+    h_scroll.set_offset(gpui::Point::default());
+}
 
-    // Each scrollbar lives in a gutter of its own at the grid's edge — the
-    // vertical one beside the rows and below the header, the horizontal one
-    // under the rows — so neither ever covers a cell. A bar draws along its
-    // gutter from the handle it reads, and each gutter is exactly as long as
-    // what its handle scrolls.
-    let track = cx.theme().colors().scrollbar_track_background;
-    v_flex()
-        .id(gpui::SharedString::from(format!("{list_id}-grid")))
+impl ElRunsPanel {
+    fn grid(&self, slot: GridSlot) -> Option<&ConsoleGrid> {
+        match slot {
+            GridSlot::Preview => self.preview.as_ref(),
+            GridSlot::Result => self.result.as_ref(),
+        }
+    }
+
+    fn grid_mut(&mut self, slot: GridSlot) -> Option<&mut ConsoleGrid> {
+        match slot {
+            GridSlot::Preview => self.preview.as_mut(),
+            GridSlot::Result => self.result.as_mut(),
+        }
+    }
+
+    /// The console's grid, built like the dbt results grid: a row-number
+    /// column, a header on the raised surface whose labels sort and whose
+    /// edges resize, striped rows that light up under the pointer, and
+    /// cells that open whole on a click. Mapping previews and query
+    /// results share it.
+    fn render_grid(
+        &self,
+        slot: GridSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        const ROW_NUMBER_WIDTH: f32 = 56.;
+        const HEADER_HEIGHT: f32 = 30.;
+        const ROW_HEIGHT: f32 = 26.;
+        /// A regular scrollbar's thickness with its padding.
+        const GUTTER: f32 = 14.;
+        let Some(grid) = self.grid(slot) else {
+            return div().into_any_element();
+        };
+        let (scroll, h_scroll) = match slot {
+            GridSlot::Preview => (&self.preview_scroll, &self.preview_h_scroll),
+            GridSlot::Result => (&self.result_scroll, &self.result_h_scroll),
+        };
+        let id = slot.id();
+        let colors = cx.theme().colors();
+        let (border, surface, hover, track) = (
+            colors.border,
+            colors.elevated_surface_background,
+            colors.element_hover,
+            colors.scrollbar_track_background,
+        );
+        // Zebra striping for row scanning, as faint as the dbt grid's.
+        let mut stripe = colors.text;
+        stripe.a = 0.03;
+        let columns = grid.table.columns.clone();
+        let widths = grid.widths.clone();
+        let total = px(ROW_NUMBER_WIDTH + widths.iter().sum::<f32>());
+
+        let header = h_flex()
+            .h(px(HEADER_HEIGHT))
+            .flex_none()
+            .bg(surface)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .w(px(ROW_NUMBER_WIDTH))
+                    .flex_none()
+                    .px_2()
+                    .child(Label::new("#").size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .children(columns.iter().enumerate().map(|(column, name)| {
+                let arrow = match grid.sort {
+                    Some((sorted, true)) if sorted == column => Some("▲"),
+                    Some((sorted, false)) if sorted == column => Some("▼"),
+                    _ => None,
+                };
+                div()
+                    .w(px(widths[column]))
+                    .flex_none()
+                    .h_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .id(("sort", column))
+                            .size_full()
+                            .px_2()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                            .children(arrow.map(|arrow| Label::new(arrow).size(LabelSize::Small)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(grid) = this.grid_mut(slot) {
+                                    grid.cycle_sort(column);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("resize", column))
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(5.))
+                            .h_full()
+                            .cursor(gpui::CursorStyle::ResizeColumn)
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(grid) = this.grid_mut(slot) {
+                                        let width = grid.widths[column];
+                                        grid.resize =
+                                            Some((column, f32::from(event.position.x), width));
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                    )
+            }));
+
+        let rows = grid.table.rows.clone();
+        let order = grid.order.clone();
+        let panel = cx.entity().downgrade();
+        let list = gpui::uniform_list(SharedString::from(format!("{id}-rows")), order.len(), {
+            move |range, _, _| {
+                range
+                    .filter_map(|position| {
+                        let original = *order.get(position)?;
+                        let row = rows.get(original)?;
+                        let cells = row.iter().enumerate().map(|(column, cell)| {
+                            let panel = panel.clone();
+                            let name = columns.get(column).cloned().unwrap_or_default();
+                            let value = cell.clone();
+                            h_flex()
+                                .id(column)
+                                .w(px(widths.get(column).copied().unwrap_or(90.)))
+                                .h_full()
+                                .flex_none()
+                                .px_2()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .child(Label::new(one_line(cell)).size(LabelSize::Small).truncate())
+                                .on_click(move |_, _, cx| {
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            if let Some(grid) = this.grid_mut(slot) {
+                                                grid.detail = Some((
+                                                    name.clone(),
+                                                    original + 1,
+                                                    value.clone(),
+                                                ));
+                                                cx.notify();
+                                            }
+                                        })
+                                        .ok();
+                                })
+                        });
+                        Some(
+                            h_flex()
+                                .id(original)
+                                .w_full()
+                                .h(px(ROW_HEIGHT))
+                                .overflow_hidden()
+                                .when(position % 2 == 1, |row| row.bg(stripe))
+                                .hover(|row| row.bg(hover))
+                                .child(
+                                    div().w(px(ROW_NUMBER_WIDTH)).flex_none().px_2().child(
+                                        Label::new((original + 1).to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                                )
+                                .children(cells)
+                                .into_any_element(),
+                        )
+                    })
+                    .collect()
+            }
+        })
         .flex_1()
-        .min_h_0()
-        .min_w_0()
-        .overflow_hidden()
-        .child(
-            h_flex()
-                .w_full()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .id(gpui::SharedString::from(format!("{list_id}-scroll")))
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .overflow_x_scroll()
-                        // Sideways wheel motion only; vertical goes to the rows'
-                        // list so the two axes don't fight.
-                        .restrict_scroll_to_axis()
-                        .track_scroll(h_scroll)
-                        .child(v_flex().w(total).h_full().child(header).child(list)),
+        .track_scroll(scroll);
+
+        // Each scrollbar lives in a gutter of its own at the grid's edge — the
+        // vertical one beside the rows and below the header, the horizontal one
+        // under the rows — so neither ever covers a cell. A bar draws along its
+        // gutter from the handle it reads, and each gutter is exactly as long as
+        // what its handle scrolls. A bar keeps the handle it first read under
+        // its id, so each grid's bars carry ids of their own: sharing one would
+        // leave the preview's bars reading the query grid's scroll.
+        let resizing = grid.resize.is_some();
+        v_flex()
+            .id(id)
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .when(resizing, |grid| {
+                grid.on_mouse_move(
+                    cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                        let Some(grid) = this.grid_mut(slot) else {
+                            return;
+                        };
+                        if let Some((column, start_x, start_width)) = grid.resize {
+                            let width = (start_width + f32::from(event.position.x) - start_x)
+                                .clamp(60., 900.);
+                            std::sync::Arc::make_mut(&mut grid.widths)[column] = width;
+                            cx.notify();
+                        }
+                    }),
                 )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(grid) = this.grid_mut(slot) {
+                            grid.resize = None;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(grid) = this.grid_mut(slot) {
+                            grid.resize = None;
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{id}-scroll")))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_x_scroll()
+                            // Sideways wheel motion only; vertical goes to the rows'
+                            // list so the two axes don't fight.
+                            .restrict_scroll_to_axis()
+                            .track_scroll(h_scroll)
+                            // At least as wide as the grid, so the header band and
+                            // the stripes reach its edge when the columns don't.
+                            .child(
+                                v_flex()
+                                    .min_w_full()
+                                    .w(total)
+                                    .h_full()
+                                    .child(header)
+                                    .child(list),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .w(px(GUTTER))
+                            .h_full()
+                            .flex_none()
+                            // The header band runs on over the gutter.
+                            .child(
+                                div()
+                                    .h(px(HEADER_HEIGHT))
+                                    .flex_none()
+                                    .bg(surface)
+                                    .border_b_1()
+                                    .border_color(border),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .child(div())
+                                    .custom_scrollbars(
+                                        ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
+                                            .id(SharedString::from(format!("{id}-vertical-bar")))
+                                            .tracked_scroll_handle(scroll)
+                                            .with_track_along(ui::ScrollAxes::Vertical, track),
+                                        window,
+                                        cx,
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(GUTTER))
+                    .flex_none()
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(div())
+                            .custom_scrollbars(
+                                ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
+                                    .id(SharedString::from(format!("{id}-horizontal-bar")))
+                                    .tracked_scroll_handle(h_scroll)
+                                    .with_track_along(ui::ScrollAxes::Horizontal, track),
+                                window,
+                                cx,
+                            ),
+                    )
+                    .child(div().w(px(GUTTER)).h_full().flex_none()),
+            )
+            .into_any_element()
+    }
+
+    /// The clicked cell, whole, over the console — the dbt results grid's
+    /// card: its column and row, the value wrapped and scrollable, and Copy.
+    fn render_cell_detail(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let slot = match (&self.preview, self.surface) {
+            (Some(_), _) => GridSlot::Preview,
+            (None, Surface::Query) => GridSlot::Result,
+            (None, _) => return None,
+        };
+        let (column, row, value) = self.grid(slot)?.detail.clone()?;
+        let close = move |this: &mut Self, cx: &mut Context<Self>| {
+            if let Some(grid) = this.grid_mut(slot) {
+                grid.detail = None;
+                cx.notify();
+            }
+        };
+        let colors = cx.theme().colors();
+        Some(
+            div()
+                .id("el-cell-detail-backdrop")
+                .absolute()
+                .inset_0()
+                .p_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0., 0., 0., 0.45))
+                .on_click(cx.listener(move |this, _, _, cx| close(this, cx)))
                 .child(
                     v_flex()
-                        .w(px(GUTTER))
-                        .h_full()
-                        .flex_none()
-                        .child(div().h(px(HEADER_HEIGHT)).flex_none())
+                        .id("el-cell-detail-card")
+                        .w(px(560.))
+                        .max_w_full()
+                        .max_h_full()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .shadow_lg()
+                        .p_3()
+                        .gap_2()
+                        .occlude()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    Label::new(format!("{column} · row {row}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent)
+                                        .truncate(),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_none()
+                                        .child(
+                                            Button::new("el-cell-copy", "Copy")
+                                                .label_size(LabelSize::Small)
+                                                .on_click({
+                                                    let value = value.clone();
+                                                    move |_, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            gpui::ClipboardItem::new_string(
+                                                                value.to_string(),
+                                                            ),
+                                                        );
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new("el-cell-close", "✕")
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    close(this, cx)
+                                                })),
+                                        ),
+                                ),
+                        )
                         .child(
                             div()
-                                .relative()
+                                .id("el-cell-detail-value")
                                 .flex_1()
                                 .min_h_0()
-                                .w_full()
-                                .child(div())
-                                .custom_scrollbars(
-                                    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
-                                        .tracked_scroll_handle(scroll)
-                                        .with_track_along(ui::ScrollAxes::Vertical, track),
-                                    window,
-                                    cx,
-                                ),
-                        ),
-                ),
-        )
-        .child(
-            h_flex()
-                .w_full()
-                .h(px(GUTTER))
-                .flex_none()
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(div())
-                        .custom_scrollbars(
-                            ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
-                                .tracked_scroll_handle(h_scroll)
-                                .with_track_along(ui::ScrollAxes::Horizontal, track),
-                            window,
-                            cx,
+                                .max_h(px(360.))
+                                .overflow_y_scroll()
+                                .child(Label::new(value).size(LabelSize::Small).buffer_font(cx)),
                         ),
                 )
-                .child(div().w(px(GUTTER)).h_full().flex_none()),
+                .into_any_element(),
         )
-        .into_any_element()
+    }
 }
 
 impl EventEmitter<PanelEvent> for ElRunsPanel {}
@@ -2566,7 +2933,7 @@ impl Render for ElRunsPanel {
         let colors = cx.theme().colors().clone();
         let body: gpui::AnyElement = match &self.preview {
             Some(preview) => {
-                let count = preview.rows.len();
+                let count = preview.table.rows.len();
                 v_flex()
                     .size_full()
                     .child(
@@ -2583,22 +2950,14 @@ impl Render for ElRunsPanel {
                                     .tooltip(ui::Tooltip::text("Back"))
                                     .on_click(cx.listener(|this, _, _, cx| this.show_runs(cx))),
                             )
-                            .child(Label::new(preview.title.clone()).size(LabelSize::Default))
+                            .child(Label::new(preview.table.title.clone()).size(LabelSize::Default))
                             .child(
                                 Label::new(format!("{count} rows"))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(render_grid(
-                        preview,
-                        &self.preview_scroll,
-                        &self.preview_h_scroll,
-                        "el-preview-rows",
-                        colors.element_background,
-                        window,
-                        cx,
-                    ))
+                    .child(self.render_grid(GridSlot::Preview, window, cx))
                     .into_any_element()
             }
             None => {
@@ -2649,11 +3008,13 @@ impl Render for ElRunsPanel {
             }
         };
         div()
+            .relative()
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("ElRunsPanel")
             .bg(colors.panel_background)
             .child(body)
+            .children(self.render_cell_detail(cx))
     }
 }
 
@@ -2661,10 +3022,75 @@ impl Render for ElRunsPanel {
 mod tests {
     use std::collections::HashMap;
 
+    use gpui::SharedString;
+
     use super::{
-        REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, merge_log_tail, merge_run, one_line,
-        place_run_event, tooltip_text,
+        ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, fit_widths,
+        merge_log_tail, merge_run, one_line, place_run_event, sorted_rows, tooltip_text,
     };
+
+    fn table(rows: &[&[&str]]) -> Vec<Vec<SharedString>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| SharedString::from(cell.to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_header_sort_orders_numbers_by_value_and_puts_text_after_them() {
+        let rows = table(&[&["10"], &["9"], &[""], &["1a"], &["-2.5"], &["9"]]);
+        assert_eq!(sorted_rows(&rows, None), [0, 1, 2, 3, 4, 5]);
+        // Ties (the two 9s) keep the table's order both ways.
+        assert_eq!(sorted_rows(&rows, Some((0, true))), [4, 1, 5, 0, 2, 3]);
+        assert_eq!(sorted_rows(&rows, Some((0, false))), [3, 2, 0, 1, 5, 4]);
+        // A column past a short row reads as empty rather than panicking.
+        assert_eq!(sorted_rows(&rows, Some((3, true))), [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn header_clicks_cycle_ascending_descending_and_back_to_the_table_order() {
+        let rows = table(&[&["b", "2"], &["a", "10"], &["c", "1"]]);
+        let mut grid = ConsoleGrid::new(PreviewTable {
+            title: "t".into(),
+            columns: std::sync::Arc::new(vec!["name".into(), "n".into()]),
+            rows: std::sync::Arc::new(rows),
+        });
+        grid.cycle_sort(1);
+        assert_eq!(
+            (grid.sort, grid.order.as_slice()),
+            (Some((1, true)), &[2, 0, 1][..])
+        );
+        grid.cycle_sort(1);
+        assert_eq!(
+            (grid.sort, grid.order.as_slice()),
+            (Some((1, false)), &[1, 0, 2][..])
+        );
+        grid.cycle_sort(1);
+        assert_eq!((grid.sort, grid.order.as_slice()), (None, &[0, 1, 2][..]));
+        grid.cycle_sort(1);
+        grid.cycle_sort(0);
+        assert_eq!(
+            (grid.sort, grid.order.as_slice()),
+            (Some((0, true)), &[1, 0, 2][..])
+        );
+    }
+
+    #[test]
+    fn columns_fit_their_longest_value_within_bounds() {
+        let columns = vec![
+            SharedString::from("id"),
+            SharedString::from("a_rather_long_column_name"),
+            SharedString::from("payload"),
+        ];
+        let rows = table(&[&["1", "x", &"y".repeat(500)]]);
+        let widths = fit_widths(&columns, &rows);
+        assert_eq!(widths[0], 90.);
+        assert_eq!(widths[1], 25. * 8.2 + 24.);
+        assert_eq!(widths[2], 340.);
+    }
 
     #[test]
     fn grid_cells_fold_onto_one_line() {
