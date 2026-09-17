@@ -2375,11 +2375,16 @@ fn render_grid(
     cx: &mut App,
 ) -> gpui::AnyElement {
     const COL_WIDTH: f32 = 170.;
+    const HEADER_HEIGHT: f32 = 24.;
+    /// A regular scrollbar's thickness with its padding.
+    const GUTTER: f32 = 14.;
     let columns = table.columns.clone();
     let rows = table.rows.clone();
     let total = px(columns.len() as f32 * COL_WIDTH);
     let header = h_flex()
         .w(total)
+        .h(px(HEADER_HEIGHT))
+        .items_center()
         .flex_shrink_0()
         .children(columns.iter().map(|column| {
             div().w(px(COL_WIDTH)).px_1().flex_shrink_0().child(
@@ -2390,74 +2395,114 @@ fn render_grid(
             )
         }));
     let count = rows.len();
-    let list =
-        gpui::uniform_list(list_id, count, {
-            move |range, _, _| {
-                range
-                    .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
-                    .map(|(ix, row)| {
-                        h_flex()
-                            .w(total)
-                            .h(px(24.))
-                            .flex_shrink_0()
-                            .when(ix % 2 == 1, |row| row.bg(stripe))
-                            .children(row.iter().enumerate().map(|(column, cell)| {
-                                let folded = one_line(cell);
-                                let whole = folded.as_ref() != cell.as_str();
-                                div()
-                                    .id((list_id, ix * 4_096 + column))
-                                    .w(px(COL_WIDTH))
-                                    .px_1()
-                                    .flex_shrink_0()
-                                    .child(Label::new(folded).size(LabelSize::XSmall).truncate())
-                                    .when(whole, |cell_div| {
-                                        let tooltip = tooltip_text(cell);
-                                        cell_div.tooltip(move |_, cx| {
-                                            ui::Tooltip::simple(tooltip.clone(), cx)
-                                        })
+    let list = gpui::uniform_list(list_id, count, {
+        move |range, _, _| {
+            range
+                .filter_map(|ix| rows.get(ix).map(|row| (ix, row)))
+                .map(|(ix, row)| {
+                    h_flex()
+                        .w(total)
+                        .h(px(24.))
+                        .flex_shrink_0()
+                        .when(ix % 2 == 1, |row| row.bg(stripe))
+                        .children(row.iter().enumerate().map(|(column, cell)| {
+                            let folded = one_line(cell);
+                            let whole = folded.as_ref() != cell.as_str();
+                            div()
+                                .id((list_id, ix * 4_096 + column))
+                                .w(px(COL_WIDTH))
+                                .px_1()
+                                .flex_shrink_0()
+                                .child(Label::new(folded).size(LabelSize::XSmall).truncate())
+                                .when(whole, |cell_div| {
+                                    let tooltip = tooltip_text(cell);
+                                    cell_div.tooltip(move |_, cx| {
+                                        ui::Tooltip::simple(tooltip.clone(), cx)
                                     })
-                            }))
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>()
-            }
-        })
-        .flex_1()
-        .track_scroll(scroll);
+                                })
+                        }))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        }
+    })
+    .flex_1()
+    .track_scroll(scroll);
 
-    div()
+    // Each scrollbar lives in a gutter of its own at the grid's edge — the
+    // vertical one beside the rows and below the header, the horizontal one
+    // under the rows — so neither ever covers a cell. A bar draws along its
+    // gutter from the handle it reads, and each gutter is exactly as long as
+    // what its handle scrolls.
+    let track = cx.theme().colors().scrollbar_track_background;
+    v_flex()
         .id(gpui::SharedString::from(format!("{list_id}-grid")))
-        .relative()
         .flex_1()
         .min_h_0()
         .min_w_0()
         .overflow_hidden()
         .child(
-            div()
-                .id(gpui::SharedString::from(format!("{list_id}-scroll")))
-                .size_full()
-                .overflow_x_scroll()
-                // Sideways wheel motion only; vertical goes to the rows'
-                // list so the two axes don't fight.
-                .restrict_scroll_to_axis()
-                .track_scroll(h_scroll)
-                .child(v_flex().w(total).h_full().child(header).child(list)),
+            h_flex()
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .id(gpui::SharedString::from(format!("{list_id}-scroll")))
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_x_scroll()
+                        // Sideways wheel motion only; vertical goes to the rows'
+                        // list so the two axes don't fight.
+                        .restrict_scroll_to_axis()
+                        .track_scroll(h_scroll)
+                        .child(v_flex().w(total).h_full().child(header).child(list)),
+                )
+                .child(
+                    v_flex()
+                        .w(px(GUTTER))
+                        .h_full()
+                        .flex_none()
+                        .child(div().h(px(HEADER_HEIGHT)).flex_none())
+                        .child(
+                            div()
+                                .relative()
+                                .flex_1()
+                                .min_h_0()
+                                .w_full()
+                                .child(div())
+                                .custom_scrollbars(
+                                    ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical)
+                                        .tracked_scroll_handle(scroll)
+                                        .with_track_along(ui::ScrollAxes::Vertical, track),
+                                    window,
+                                    cx,
+                                ),
+                        ),
+                ),
         )
-        // Overlays on the unscrolled frame, as in the dbt results grid:
-        // inside the sideways-scrolling content, the vertical bar would sit
-        // at the far right of every column rather than at the visible edge.
-        .child(div().absolute().inset_0().child(div()).custom_scrollbars(
-            ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(scroll),
-            window,
-            cx,
-        ))
         .child(
-            div().absolute().inset_0().child(div()).custom_scrollbars(
-                ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
-                    .tracked_scroll_handle(h_scroll),
-                window,
-                cx,
-            ),
+            h_flex()
+                .w_full()
+                .h(px(GUTTER))
+                .flex_none()
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(div())
+                        .custom_scrollbars(
+                            ui::Scrollbars::always_visible(ui::ScrollAxes::Horizontal)
+                                .tracked_scroll_handle(h_scroll)
+                                .with_track_along(ui::ScrollAxes::Horizontal, track),
+                            window,
+                            cx,
+                        ),
+                )
+                .child(div().w(px(GUTTER)).h_full().flex_none()),
         )
         .into_any_element()
 }
