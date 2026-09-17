@@ -14,6 +14,7 @@ use ui::prelude::*;
 use workspace::{ModalView, Workspace};
 
 use super::canvas_item::ElPipelineCanvas;
+use super::dialog;
 use el_engine::spec::{Mode, Pipeline};
 
 pub struct ElRenameStreamModal {
@@ -22,7 +23,6 @@ pub struct ElRenameStreamModal {
     pipeline: Arc<Pipeline>,
     original: String,
     editor: Entity<Editor>,
-    error: Option<SharedString>,
     _edits: Subscription,
 }
 
@@ -43,10 +43,9 @@ impl ElRenameStreamModal {
                 editor.select_all(&Default::default(), window, cx);
                 editor
             });
-            // Typing clears a stale error and refreshes the table note.
-            let edits = cx.subscribe(&editor, |this: &mut Self, _, event: &EditorEvent, cx| {
+            // Typing re-checks the name and refreshes the table note.
+            let edits = cx.subscribe(&editor, |_: &mut Self, _, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::BufferEdited) {
-                    this.error = None;
                     cx.notify();
                 }
             });
@@ -55,7 +54,6 @@ impl ElRenameStreamModal {
                 pipeline,
                 original: name,
                 editor,
-                error: None,
                 _edits: edits,
             }
         });
@@ -72,43 +70,49 @@ impl ElRenameStreamModal {
         self.editor.read(cx).text(cx).trim().to_owned()
     }
 
-    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Why the typed name can't be used, or None. Checked as you type, so
+    /// the button is never pressable for a name that would be refused.
+    fn problem(&self, cx: &App) -> Option<SharedString> {
         let to = self.typed(cx);
         if to.is_empty() {
-            self.error = Some("Enter a name.".into());
-            cx.notify();
-            return;
+            return Some("Enter a name.".into());
         }
+        if to == self.original {
+            return None;
+        }
+        if self.pipeline.streams.iter().any(|stream| stream.name == to) {
+            return Some(format!("{to} already exists in this pipeline.").into());
+        }
+        // The derived table follows the name, so a new name can land on a
+        // table another stream already loads — they'd overwrite each other.
+        let stream = self.stream()?;
+        let mut renamed = stream.clone();
+        renamed.name = to.clone();
+        let table = renamed.target_table(&self.pipeline.target).to_uppercase();
+        self.pipeline
+            .streams
+            .iter()
+            .find(|other| {
+                other.name != self.original
+                    && other.target_table(&self.pipeline.target).to_uppercase() == table
+            })
+            .map(|other| {
+                format!(
+                    "{to} would load the same table as {} — pick another name.",
+                    other.name
+                )
+                .into()
+            })
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.typed(cx);
         if to == self.original {
             cx.emit(DismissEvent);
             return;
         }
-        if self.pipeline.streams.iter().any(|stream| stream.name == to) {
-            self.error = Some(format!("{to} already exists in this pipeline.").into());
-            cx.notify();
+        if self.problem(cx).is_some() {
             return;
-        }
-        // The derived table follows the name, so a new name can land on a
-        // table another stream already loads — they'd overwrite each other.
-        if let Some(stream) = self.stream() {
-            let mut renamed = stream.clone();
-            renamed.name = to.clone();
-            let table = renamed.target_table(&self.pipeline.target).to_uppercase();
-            let clash = self.pipeline.streams.iter().find(|other| {
-                other.name != self.original
-                    && other.target_table(&self.pipeline.target).to_uppercase() == table
-            });
-            if let Some(other) = clash {
-                self.error = Some(
-                    format!(
-                        "{to} would load the same table as {} — pick another name.",
-                        other.name
-                    )
-                    .into(),
-                );
-                cx.notify();
-                return;
-            }
         }
         let from = self.original.clone();
         self.canvas
@@ -128,8 +132,7 @@ impl Focusable for ElRenameStreamModal {
 }
 
 impl Render for ElRenameStreamModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let typed = self.typed(cx);
         let incremental = self.stream().is_some_and(|stream| {
             stream.mode(self.pipeline.defaults.as_ref()) == Mode::Incremental
@@ -154,87 +157,50 @@ impl Render for ElRenameStreamModal {
                     format!("The target table follows the name: {old} becomes {new}.").into()
                 }
             });
+        let problem = self.problem(cx);
+        let focus = self.focus_handle(cx);
 
-        let mut card = v_flex()
+        dialog::frame(dialog::NARROW, cx)
             .key_context("ElRenameStreamModal")
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
-            .w(px(440.))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.elevated_surface_background)
-            .shadow_lg()
+            .child(dialog::header(
+                "Rename stream",
+                Some(self.original.clone().into()),
+                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx,
+            ))
             .child(
-                h_flex()
-                    .w_full()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new(format!("Rename {}", self.original)).size(LabelSize::Small))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("el-rename-close", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                dialog::body()
+                    .child(dialog::field("New name", &self.editor, None, window, cx))
+                    .when(incremental, |body| {
+                        body.child(dialog::notice(
+                            Severity::Warning,
+                            "Renaming resets this stream's incremental cursor — the next run \
+                             re-extracts every row.",
+                        ))
+                    })
+                    .children(table_note.map(|note| dialog::notice(Severity::Info, note)))
+                    // An empty field is the one problem not worth shouting about.
+                    .children(
+                        problem
+                            .clone()
+                            .filter(|_| !typed.is_empty())
+                            .map(|problem| dialog::notice(Severity::Error, problem)),
                     ),
             )
-            .child(
-                div().w_full().p_2().child(
-                    div()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.editor_background)
-                        .child(self.editor.clone()),
-                ),
-            );
-
-        let mut notes = v_flex().w_full().px_2().pb_2().gap_1();
-        if incremental {
-            notes = notes.child(
-                Label::new(
-                    "Renaming resets this stream's incremental cursor — the next run \
-                     re-extracts every row.",
-                )
-                .size(LabelSize::XSmall)
-                .color(Color::Warning),
-            );
-        }
-        if let Some(note) = table_note {
-            notes = notes.child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted));
-        }
-        if let Some(error) = &self.error {
-            notes = notes.child(
-                Label::new(error.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error),
-            );
-        }
-        card = card.child(notes);
-
-        card.child(
-            h_flex()
-                .w_full()
-                .p_2()
-                .gap_1()
-                .border_t_1()
-                .border_color(colors.border)
-                .child(div().flex_1())
-                .child(
-                    Button::new("el-rename-cancel", "Cancel")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                )
-                .child(
-                    Button::new("el-rename-confirm", "Rename stream")
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Filled)
-                        .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
-                ),
-        )
+            .child(dialog::footer(
+                [],
+                [
+                    dialog::cancel_button("el-rename-cancel", &focus, cx)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+                        .into_any_element(),
+                    dialog::primary_button("el-rename-confirm", "Rename stream", &focus, cx)
+                        .disabled(problem.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx)))
+                        .into_any_element(),
+                ],
+                cx,
+            ))
     }
 }

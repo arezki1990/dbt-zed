@@ -13,11 +13,12 @@ use gpui::{
 };
 use indexmap::IndexMap;
 use project::Project;
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{RemoteSpec, Remotes, SpecError};
 
+use super::dialog;
 use super::panel::ElPanel;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -57,6 +58,8 @@ pub struct ElRemoteModal {
     /// A token generated here for an existing daemon: (variable, value).
     /// Written to .env; the value is only ever copied, never displayed.
     generated: Option<(String, String)>,
+    /// The generated token went to the clipboard; the button says so.
+    copied: bool,
     delete_armed: bool,
     writing: bool,
     error: Option<SharedString>,
@@ -176,6 +179,7 @@ impl ElRemoteModal {
             step: Step::Details,
             mode: Mode::Existing,
             generated: None,
+            copied: false,
             delete_armed: false,
             writing: false,
             error,
@@ -331,6 +335,7 @@ impl ElRemoteModal {
         self.token_var
             .update(cx, |editor, cx| editor.set_text(var.clone(), window, cx));
         self.generated = Some((var, value));
+        self.copied = false;
         cx.notify();
     }
 
@@ -559,36 +564,101 @@ impl Focusable for ElRemoteModal {
     }
 }
 
+impl ElRemoteModal {
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.writing {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    /// The editors the current step shows, in the order Tab walks them.
+    fn step_editors(&self) -> Vec<Entity<Editor>> {
+        match (self.editing.is_some(), self.step, self.mode) {
+            (true, _, _) | (false, Step::Details, Mode::Existing) => {
+                vec![self.name.clone(), self.url.clone(), self.token_var.clone()]
+            }
+            (false, Step::Details, Mode::Install) => vec![self.name.clone(), self.url.clone()],
+            (false, Step::Install, _) => vec![
+                self.ssh_host.clone(),
+                self.ssh_project.clone(),
+                self.ssh_profile.clone(),
+            ],
+            (false, Step::Review, _) => Vec::new(),
+        }
+    }
+
+    fn step_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields: Vec<FocusHandle> = self
+            .step_editors()
+            .iter()
+            .map(|editor| editor.focus_handle(cx))
+            .collect();
+        dialog::cycle_focus(&fields, forward, window, cx);
+    }
+
+    /// Lands focus on a step's first field — or, on Review, on the dialog
+    /// itself, so ⏎ and esc still reach it.
+    fn focus_step(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.step_editors().first() {
+            Some(editor) => window.focus(&editor.focus_handle(cx), cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+    }
+
+    /// Next, Add, Install, or Save — whatever the footer's primary button
+    /// says right now; ⏎ presses it.
+    fn primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.writing {
+            return;
+        }
+        if self.editing.is_some() {
+            return self.save(window, cx);
+        }
+        match self.step {
+            Step::Details => {
+                if self.details_valid(cx) {
+                    self.step = if self.mode == Mode::Install {
+                        Step::Install
+                    } else {
+                        Step::Review
+                    };
+                    self.focus_step(window, cx);
+                }
+            }
+            Step::Install => {
+                let host = self.ssh_host.read(cx).text(cx).trim().to_owned();
+                if host.is_empty() || !host.contains('@') {
+                    self.fail("give the server as user@host".into(), cx);
+                    return;
+                }
+                self.error = None;
+                self.step = Step::Review;
+                self.focus_step(window, cx);
+            }
+            Step::Review => match self.mode {
+                Mode::Existing => self.save(window, cx),
+                Mode::Install => self.install_over_ssh(window, cx),
+            },
+        }
+        cx.notify();
+    }
+
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step = match (self.step, self.mode) {
+            (Step::Review, Mode::Install) => Step::Install,
+            _ => Step::Details,
+        };
+        self.error = None;
+        self.focus_step(window, cx);
+        cx.notify();
+    }
+}
+
 impl Render for ElRemoteModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let editing = self.editing.is_some();
-        let input_bg = colors.editor_background;
-        let input_border = colors.border;
-        let field_row = move |label: &'static str, editor: Entity<Editor>| {
-            h_flex()
-                .w_full()
-                .gap_3()
-                .items_center()
-                .child(
-                    div().w(px(150.)).flex_shrink_0().child(
-                        Label::new(label)
-                            .size(LabelSize::Default)
-                            .color(Color::Muted),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(input_border)
-                        .bg(input_bg)
-                        .child(editor),
-                )
-        };
+        let focus = self.focus_handle(cx);
         let steps: &[(Step, &str)] = if self.mode == Mode::Install {
             &[
                 (Step::Details, "Server"),
@@ -598,107 +668,168 @@ impl Render for ElRemoteModal {
         } else {
             &[(Step::Details, "Server"), (Step::Review, "Review")]
         };
-        let title: SharedString = if editing {
-            "Edit server".into()
+        let position = steps
+            .iter()
+            .position(|(step, _)| *step == self.step)
+            .unwrap_or(0);
+        let (title, detail): (&str, SharedString) = if editing {
+            (
+                "Edit server",
+                self.editing.clone().unwrap_or_default().into(),
+            )
         } else {
-            let position = steps
-                .iter()
-                .position(|(step, _)| *step == self.step)
-                .unwrap_or(0);
-            format!("Add server — step {} of {}", position + 1, steps.len()).into()
+            (
+                "Add server",
+                format!(
+                    "Step {} of {} · {}",
+                    position + 1,
+                    steps.len(),
+                    steps.get(position).map_or("", |(_, label)| *label)
+                )
+                .into(),
+            )
         };
 
-        let mut card = v_flex()
-            .key_context("ElRemoteModal")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(680.))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.elevated_surface_background)
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .w_full()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new(title).size(LabelSize::Large))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("el-remote-close", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    ),
-            );
+        let mut body = dialog::body();
 
-        // Step trail (add mode).
+        // Step trail (add mode): done steps carry a check, the current one
+        // is filled.
         if !editing {
-            let mut trail = h_flex().w_full().px_4().pt_3().gap_2();
-            for (ix, (step, label)) in steps.iter().enumerate() {
-                let active = *step == self.step;
+            let mut trail = h_flex().w_full().gap_2().items_center();
+            for (ix, (_, label)) in steps.iter().enumerate() {
+                let (marker, color): (AnyElement, Color) = if ix < position {
+                    (
+                        Icon::new(IconName::Check)
+                            .size(IconSize::XSmall)
+                            .color(Color::Success)
+                            .into_any_element(),
+                        Color::Muted,
+                    )
+                } else {
+                    (
+                        Label::new(format!("{}", ix + 1))
+                            .size(LabelSize::XSmall)
+                            .color(if ix == position {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .into_any_element(),
+                        if ix == position {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        },
+                    )
+                };
                 trail = trail.child(
-                    Label::new(format!("{}. {label}", ix + 1))
-                        .size(LabelSize::Default)
-                        .color(if active { Color::Accent } else { Color::Muted }),
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .size_5()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if ix == position {
+                                    colors.border_focused
+                                } else {
+                                    colors.border_variant
+                                })
+                                .child(marker),
+                        )
+                        .child(Label::new(*label).size(LabelSize::Small).color(color)),
                 );
                 if ix + 1 < steps.len() {
-                    trail =
-                        trail.child(Label::new("›").size(LabelSize::Default).color(Color::Muted));
+                    trail = trail.child(div().w(px(24.)).h(px(1.)).bg(colors.border_variant));
                 }
             }
-            card = card.child(trail);
+            body = body.child(trail);
         }
 
-        let body = match (editing, self.step) {
+        body = match (editing, self.step) {
             (true, _) | (false, Step::Details) => {
-                let mut fields = v_flex().w_full().px_4().py_3().gap_2();
                 if !editing {
-                    fields = fields.child(
-                        h_flex()
+                    body = body.child(dialog::labeled(
+                        "Setup",
+                        v_flex()
                             .w_full()
                             .gap_1()
-                            .pb_1()
-                            .child(
-                                Button::new("el-remote-mode-existing", "Existing daemon")
-                                    .label_size(LabelSize::Default)
-                                    .toggle_state(self.mode == Mode::Existing)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                            .child(dialog::chips([
+                                dialog::chip(
+                                    "el-remote-mode-existing",
+                                    "Existing daemon",
+                                    self.mode == Mode::Existing,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.mode = Mode::Existing;
                                         cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("el-remote-mode-install", "New server over SSH")
-                                    .label_size(LabelSize::Default)
-                                    .toggle_state(self.mode == Mode::Install)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    },
+                                )),
+                                dialog::chip(
+                                    "el-remote-mode-install",
+                                    "New server over SSH",
+                                    self.mode == Mode::Install,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
                                         this.mode = Mode::Install;
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
+                            ]))
+                            .child(
+                                Label::new(if self.mode == Mode::Existing {
+                                    "Point at an el serve daemon that is already running."
+                                } else {
+                                    "Install the daemon on a Linux server through your own ssh."
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
                             ),
-                    );
+                    ));
                 }
-                fields = fields
-                    .child(field_row("name", self.name.clone()))
-                    .child(field_row("url", self.url.clone()));
+                body = body
+                    .child(dialog::field(
+                        "Name",
+                        &self.name,
+                        Some("Letters, digits, _ and -.".into()),
+                        window,
+                        cx,
+                    ))
+                    .child(dialog::field(
+                        "URL",
+                        &self.url,
+                        Some("https is required beyond localhost.".into()),
+                        window,
+                        cx,
+                    ));
                 if editing || self.mode == Mode::Existing {
-                    fields = fields.child(
+                    body = body.child(
                         h_flex()
                             .w_full()
                             .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .child(field_row("token variable", self.token_var.clone())),
-                            )
+                            .items_start()
+                            .child(div().flex_1().min_w_0().child(dialog::field(
+                                "Token variable",
+                                &self.token_var,
+                                Some(
+                                    "Only the variable's NAME goes in YAML; the token lives in \
+                                     .env."
+                                        .into(),
+                                ),
+                                window,
+                                cx,
+                            )))
                             .child(
                                 Button::new("el-remote-gen-token", "Generate")
-                                    .label_size(LabelSize::Default)
-                                    .tooltip(ui::Tooltip::text(
+                                    .label_size(LabelSize::Small)
+                                    .start_icon(Icon::new(IconName::Sparkle).size(IconSize::Small))
+                                    .tooltip(Tooltip::text(
                                         "Make a random token, store it in this project's .env \
                                          under the variable, and offer it for copying to the \
                                          server",
@@ -709,80 +840,86 @@ impl Render for ElRemoteModal {
                             ),
                     );
                     if let Some((var, value)) = self.generated.clone() {
-                        // Update the field to the variable we wrote.
-                        fields = fields.child(
-                            h_flex()
+                        body = body.child(
+                            v_flex()
                                 .w_full()
-                                .gap_2()
-                                .items_center()
+                                .gap_1()
+                                .child(dialog::notice(
+                                    Severity::Success,
+                                    format!(
+                                        "Token written to .env as {var}. Put the same value in \
+                                         the server's /etc/zdbt-el-serve/env."
+                                    ),
+                                ))
                                 .child(
-                                    Label::new(format!(
-                                        "Token written to .env as {var}. Put the same value \
-                                         in the server's /etc/zdbt-el-serve/env:"
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Success),
-                                )
-                                .child(
-                                    Button::new("el-remote-copy-token", "Copy token")
+                                    h_flex().pl_5().child(
+                                        Button::new(
+                                            "el-remote-copy-token",
+                                            if self.copied { "Copied" } else { "Copy token" },
+                                        )
                                         .label_size(LabelSize::Small)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                value.clone(),
-                                            ));
-                                        })),
+                                        .start_icon(
+                                            Icon::new(if self.copied {
+                                                IconName::Check
+                                            } else {
+                                                IconName::Copy
+                                            })
+                                            .size(IconSize::Small),
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(value.clone()),
+                                                );
+                                                this.copied = true;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
                                 ),
                         );
                     }
                 } else {
-                    fields = fields.child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div().w(px(150.)).flex_shrink_0().child(
-                                    Label::new("token variable")
-                                        .size(LabelSize::Default)
-                                        .color(Color::Muted),
-                                ),
-                            )
-                            .child(
-                                Label::new(format!(
-                                    "{} — generated for you",
-                                    self.generated_token_var(cx)
-                                ))
-                                .size(LabelSize::Default)
-                                .color(Color::Muted),
-                            ),
-                    );
+                    body = body.child(dialog::labeled(
+                        "Token variable",
+                        Label::new(format!(
+                            "{} — generated during the install",
+                            self.generated_token_var(cx)
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ));
                 }
-                fields.child(
-                    Label::new(
-                        "https is required beyond localhost. The token itself lives in .env \
-                         under that variable — only its name is stored in YAML.",
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
+                body
             }
-            (false, Step::Install) => v_flex()
-                .w_full()
-                .px_4()
-                .py_3()
-                .gap_2()
-                .child(field_row("ssh", self.ssh_host.clone()))
-                .child(field_row("project dir", self.ssh_project.clone()))
-                .child(field_row("profile", self.ssh_profile.clone()))
-                .child(
-                    Label::new(
-                        "Runs the zdbt-el installer on the server through your own ssh \
-                         (sudo needed): builds zdbt-el-serve, creates the service and a \
-                         systemd unit. The token is generated here and sent over stdin.",
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                ),
+            (false, Step::Install) => body
+                .child(dialog::field(
+                    "SSH",
+                    &self.ssh_host,
+                    Some("user@host, as you would type it after ssh.".into()),
+                    window,
+                    cx,
+                ))
+                .child(dialog::field(
+                    "Project directory",
+                    &self.ssh_project,
+                    Some("Where the project lives on the server.".into()),
+                    window,
+                    cx,
+                ))
+                .child(dialog::field(
+                    "Profile",
+                    &self.ssh_profile,
+                    Some("The connections profile the daemon runs.".into()),
+                    window,
+                    cx,
+                ))
+                .child(dialog::notice(
+                    Severity::Info,
+                    "Runs the zdbt-el installer on the server through your own ssh (sudo \
+                     needed): builds zdbt-el-serve, creates the service and a systemd unit. \
+                     The token is generated here and sent over stdin.",
+                )),
             (false, Step::Review) => {
                 let name = self.name.read(cx).text(cx).trim().to_owned();
                 let url = self.url.read(cx).text(cx).trim().to_owned();
@@ -802,30 +939,36 @@ impl Render for ElRemoteModal {
                 } else {
                     format!("# .env\n{token_var}=<your token — set it yourself>")
                 };
-                let mut review = v_flex().w_full().px_4().py_3().gap_2().child(
+                body = body.child(
                     Label::new("This is what gets written:")
-                        .size(LabelSize::Default)
+                        .size(LabelSize::Small)
                         .color(Color::Muted),
                 );
                 for block in [yaml, env_line] {
                     let mut pre = v_flex()
                         .w_full()
-                        .p_3()
+                        .px_3()
+                        .py_2()
                         .rounded_md()
                         .bg(colors.editor_background)
                         .border_1()
-                        .border_color(colors.border);
+                        .border_color(colors.border_variant);
                     for line in block.lines() {
-                        pre = pre.child(Label::new(line.to_owned()).size(LabelSize::Default));
+                        pre = pre.child(
+                            Label::new(line.to_owned())
+                                .size(LabelSize::Small)
+                                .buffer_font(cx),
+                        );
                     }
-                    review = review.child(pre);
+                    body = body.child(pre);
                 }
                 if self.mode == Mode::Install {
                     let host = self.ssh_host.read(cx).text(cx).trim().to_owned();
                     let dir = self.ssh_project.read(cx).text(cx).trim().to_owned();
                     let profile = self.ssh_profile.read(cx).text(cx).trim().to_owned();
-                    review = review.child(
-                        Label::new(format!(
+                    body = body.child(dialog::notice(
+                        Severity::Info,
+                        format!(
                             "Then installs the daemon on {host} under {} running profile {} \
                              (a terminal tab shows progress).",
                             if dir.is_empty() {
@@ -834,70 +977,37 @@ impl Render for ElRemoteModal {
                                 &dir
                             },
                             if profile.is_empty() { "prod" } else { &profile }
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    );
+                        ),
+                    ));
                 }
-                review
+                body
             }
         };
-        card = card.child(body);
 
         if let Some(error) = &self.error {
-            card = card.child(
-                div().px_4().pb_2().child(
-                    Label::new(error.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                ),
-            );
+            body = body.child(dialog::notice(Severity::Error, error.clone()));
         }
 
-        let mut footer = h_flex()
-            .w_full()
-            .px_4()
-            .py_3()
-            .gap_2()
-            .border_t_1()
-            .border_color(colors.border);
-        if editing {
-            footer = footer.child(
-                Button::new(
-                    "el-remote-delete",
-                    if self.delete_armed {
-                        "Confirm remove"
-                    } else {
-                        "Remove"
-                    },
-                )
-                .label_size(LabelSize::Default)
-                .color(Color::Error)
+        let remove = editing.then(|| {
+            dialog::danger_button(
+                "el-remote-delete",
+                if self.delete_armed {
+                    "Confirm remove"
+                } else {
+                    "Remove…"
+                },
+            )
+            .disabled(self.writing)
+            .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx)))
+            .into_any_element()
+        });
+        let back = (!editing && self.step != Step::Details).then(|| {
+            Button::new("el-remote-back", "Back")
+                .label_size(LabelSize::Small)
                 .disabled(self.writing)
-                .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
-            );
-        }
-        footer = footer.child(div().flex_1());
-        if !editing && self.step != Step::Details {
-            footer = footer.child(
-                Button::new("el-remote-back", "Back")
-                    .label_size(LabelSize::Default)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.step = match (this.step, this.mode) {
-                            (Step::Review, Mode::Install) => Step::Install,
-                            _ => Step::Details,
-                        };
-                        this.error = None;
-                        cx.notify();
-                    })),
-            );
-        }
-        footer = footer.child(
-            Button::new("el-remote-cancel", "Cancel")
-                .label_size(LabelSize::Default)
-                .disabled(self.writing)
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-        );
+                .on_click(cx.listener(|this, _, window, cx| this.back(window, cx)))
+                .into_any_element()
+        });
         let primary: SharedString = match (editing, self.step, self.mode) {
             (true, _, _) => if self.writing {
                 "Saving…"
@@ -914,43 +1024,38 @@ impl Render for ElRemoteModal {
             .into(),
             _ => "Next".into(),
         };
-        card.child(
-            footer.child(
-                Button::new("el-remote-primary", primary)
-                    .label_size(LabelSize::Default)
-                    .style(ButtonStyle::Filled)
-                    .disabled(self.writing)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if this.editing.is_some() {
-                            return this.save(window, cx);
-                        }
-                        match this.step {
-                            Step::Details => {
-                                if this.details_valid(cx) {
-                                    this.step = if this.mode == Mode::Install {
-                                        Step::Install
-                                    } else {
-                                        Step::Review
-                                    };
-                                }
-                            }
-                            Step::Install => {
-                                let host = this.ssh_host.read(cx).text(cx).trim().to_owned();
-                                if host.is_empty() || !host.contains('@') {
-                                    this.fail("give the server as user@host".into(), cx);
-                                    return;
-                                }
-                                this.error = None;
-                                this.step = Step::Review;
-                            }
-                            Step::Review => match this.mode {
-                                Mode::Existing => this.save(window, cx),
-                                Mode::Install => this.install_over_ssh(window, cx),
-                            },
-                        }
-                        cx.notify();
-                    })),
-            ),
-        )
+
+        dialog::frame(dialog::WIDE, cx)
+            .key_context("ElRemoteModal")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.primary(window, cx)))
+            .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                this.step_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .child(dialog::header(
+                title,
+                Some(detail),
+                cx.listener(|this, _, _, cx| this.cancel(cx)),
+                cx,
+            ))
+            .child(body)
+            .child(dialog::footer(
+                remove,
+                back.into_iter().chain([
+                    dialog::cancel_button("el-remote-cancel", &focus, cx)
+                        .disabled(self.writing)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                        .into_any_element(),
+                    dialog::primary_button("el-remote-primary", primary, &focus, cx)
+                        .disabled(self.writing)
+                        .on_click(cx.listener(|this, _, window, cx| this.primary(window, cx)))
+                        .into_any_element(),
+                ]),
+                cx,
+            ))
     }
 }

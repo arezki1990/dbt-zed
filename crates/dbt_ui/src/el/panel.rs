@@ -851,10 +851,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         let connection_name = name.to_string();
         let task = cx.background_spawn(async move {
             super::list_tables(&root, &connection_name).map(|tables| {
-                let haystack = tables
-                    .iter()
-                    .map(|(schema, table)| format!("{schema}.{table}").to_lowercase())
-                    .collect();
+                let haystack = super::fold_table_names(&tables);
                 (tables, haystack)
             })
         });
@@ -911,7 +908,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         let Some(browser) = self.browsers.get_mut(name) else {
             return;
         };
-        browser.terms = search_terms(&browser.search.read(cx).text(cx));
+        browser.terms = super::search_terms(&browser.search.read(cx).text(cx));
         browser.page = 0;
         self.match_tables(name);
         cx.notify();
@@ -929,7 +926,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             browser.matches.clear();
             haystack.len()
         } else {
-            browser.matches = matching_tables(haystack, &browser.terms);
+            browser.matches = super::matching_tables(haystack, &browser.terms);
             browser.matches.len()
         };
         browser.page = page_range(total, browser.page).start / TABLES_PAGE;
@@ -1626,7 +1623,7 @@ impl ElPanel {
                 let highlights = self
                     .browsers
                     .get(&connection)
-                    .map(|browser| highlight_ranges(&label, &browser.terms))
+                    .map(|browser| super::highlight_ranges(&label, &browser.terms))
                     .unwrap_or_default();
                 let name: gpui::AnyElement = if highlights.is_empty() {
                     Label::new(label)
@@ -1849,12 +1846,12 @@ impl ElPanel {
                 let status = if pages > 1 {
                     format!(
                         "{}–{} of {} {noun}",
-                        thousands(shown.start + 1),
-                        thousands(shown.end),
-                        thousands(*total)
+                        super::thousands(shown.start + 1),
+                        super::thousands(shown.end),
+                        super::thousands(*total)
                     )
                 } else {
-                    format!("{} {noun}", thousands(*total))
+                    format!("{} {noun}", super::thousands(*total))
                 };
                 let previous = connection.clone();
                 let next = connection.clone();
@@ -1964,19 +1961,6 @@ impl ElPanel {
     }
 }
 
-fn search_terms(text: &str) -> Vec<String> {
-    text.split_whitespace().map(str::to_lowercase).collect()
-}
-
-fn matching_tables(haystack: &[String], terms: &[String]) -> Vec<usize> {
-    haystack
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| terms.iter().all(|term| name.contains(term.as_str())))
-        .map(|(index, _)| index)
-        .collect()
-}
-
 /// The rows page `page` shows out of `total`, clamped to the last page.
 fn page_range(total: usize, page: usize) -> Range<usize> {
     let last_page = total.saturating_sub(1) / TABLES_PAGE;
@@ -1984,71 +1968,9 @@ fn page_range(total: usize, page: usize) -> Range<usize> {
     start..(start + TABLES_PAGE).min(total)
 }
 
-/// Where each search term first appears in `label`, merged where they
-/// overlap. Folding only ASCII case keeps the byte offsets valid for the
-/// label itself; a term that matched through wider Unicode folding just
-/// goes unhighlighted.
-fn highlight_ranges(label: &str, terms: &[String]) -> Vec<Range<usize>> {
-    let folded = label.to_ascii_lowercase();
-    let mut ranges: Vec<Range<usize>> = terms
-        .iter()
-        .filter_map(|term| {
-            let start = folded.find(term.as_str())?;
-            let end = start + term.len();
-            (label.is_char_boundary(start) && label.is_char_boundary(end)).then_some(start..end)
-        })
-        .collect();
-    ranges.sort_by_key(|range| range.start);
-    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        match merged.last_mut() {
-            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
-            _ => merged.push(range),
-        }
-    }
-    merged
-}
-
-fn thousands(count: usize) -> String {
-    let digits = count.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn search_needs_every_term_in_any_case() {
-        let haystack: Vec<String> = [
-            "adm_dba.dba_nb_process",
-            "art_ref.article_zone_tarif",
-            "art_ref.article",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        assert_eq!(
-            matching_tables(&haystack, &search_terms("ART zone")),
-            vec![1]
-        );
-        assert_eq!(
-            matching_tables(&haystack, &search_terms("article")),
-            vec![1, 2]
-        );
-        assert_eq!(
-            matching_tables(&haystack, &search_terms("  ")),
-            vec![0, 1, 2]
-        );
-        assert!(matching_tables(&haystack, &search_terms("orders")).is_empty());
-    }
 
     #[test]
     fn pages_stay_within_the_list() {
@@ -2057,30 +1979,5 @@ mod tests {
         assert_eq!(page_range(9_331, 500), 9_300..9_331);
         assert_eq!(page_range(100, 1), 0..100);
         assert_eq!(page_range(0, 3), 0..0);
-    }
-
-    #[test]
-    fn highlights_merge_and_keep_to_char_boundaries() {
-        assert_eq!(
-            highlight_ranges("ART_REF.ARTICLE", &search_terms("art ref")),
-            vec![0..3, 4..7]
-        );
-        assert_eq!(
-            highlight_ranges("ART_REF.ARTICLE", &search_terms("art_r rt_ref")),
-            vec![0..7]
-        );
-        assert!(highlight_ranges("CAFÉ.MENU", &search_terms("é")).is_empty());
-        assert_eq!(
-            highlight_ranges("café.menu", &search_terms("é menu")),
-            vec![3..5, 6..10]
-        );
-    }
-
-    #[test]
-    fn counts_are_grouped_by_thousands() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(100), "100");
-        assert_eq!(thousands(9_331), "9,331");
-        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }

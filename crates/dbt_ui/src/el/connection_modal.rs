@@ -17,7 +17,7 @@ use gpui::{
 };
 use indexmap::IndexMap;
 use project::Project;
-use ui::prelude::*;
+use ui::{Tooltip, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{
@@ -26,10 +26,10 @@ use el_engine::spec::{
 };
 
 use super::builder::ConnType;
+use super::dialog;
 use super::panel::ElPanel;
 
 struct Field {
-    label: &'static str,
     editor: Entity<Editor>,
 }
 
@@ -62,6 +62,9 @@ pub struct ElConnectionModal {
     conn_type: ConnType,
     /// Snowflake: password auth instead of key pair.
     auth_password: bool,
+    /// The optional settings are unfolded — from the start when one of
+    /// them already holds a value.
+    show_optional: bool,
     name: Entity<Editor>,
     fields: Vec<Field>,
     /// Pipelines referencing this connection at open time (display only —
@@ -72,6 +75,11 @@ pub struct ElConnectionModal {
     writing: bool,
     error: Option<SharedString>,
 }
+
+/// Field indices of the settings most connections leave unset: Snowflake's
+/// role, warehouse and database; Oracle's schema, wallet and TNS admin.
+const OPTIONAL_FIELDS: [usize; 6] = [3, 4, 5, 10, 11, 12];
+const ORACLE_DRIVER_FIELD: usize = 13;
 
 /// True for kinds the form can round-trip; others fall back to YAML.
 fn form_supported(kind: &str) -> bool {
@@ -223,8 +231,7 @@ impl ElConnectionModal {
             None
         });
 
-        let mut make = |label: &'static str, placeholder: &str, initial: &str| Field {
-            label,
+        let mut make = |placeholder: &str, initial: &str| Field {
             editor: {
                 let placeholder = placeholder.to_owned();
                 let initial = initial.to_owned();
@@ -312,30 +319,22 @@ impl ElConnectionModal {
         }
 
         let fields = vec![
-            make(
-                "url / path",
-                "${PG_PROD_URL}  ·  or  el/data.duckdb",
-                &url_or_path,
-            ),
-            make("account", "${SNOWFLAKE_ACCOUNT}", &account),
-            make("user", "${SNOWFLAKE_USER}", &user),
-            make("role", "LOADER (optional)", &role),
-            make("warehouse", "LOAD_WH (optional)", &warehouse),
-            make("database", "RAW (optional)", &database),
-            make("key path / password", "${SNOWFLAKE_PK_PATH}", &secret),
-            make("user", "${ORACLE_USER}", &oracle_user),
-            make("password", "${ORACLE_PASSWORD}", &oracle_password),
-            make("connect", "db.example.com:1521/ORCLPDB1", &oracle_connect),
-            make("schema", "ERP (optional)", &oracle_schema),
-            make("wallet dir", "el/wallet (optional)", &oracle_wallet),
-            make("tns admin", "el/tns (optional)", &oracle_tns),
-            make(
-                "driver",
-                "auto — thick for Oracle 10g/11g (optional)",
-                &oracle_driver,
-            ),
+            make("${PG_PROD_URL}  ·  or  el/data.duckdb", &url_or_path),
+            make("${SNOWFLAKE_ACCOUNT}", &account),
+            make("${SNOWFLAKE_USER}", &user),
+            make("LOADER (optional)", &role),
+            make("LOAD_WH (optional)", &warehouse),
+            make("RAW (optional)", &database),
+            make("${SNOWFLAKE_PK_PATH}", &secret),
+            make("${ORACLE_USER}", &oracle_user),
+            make("${ORACLE_PASSWORD}", &oracle_password),
+            make("db.example.com:1521/ORCLPDB1", &oracle_connect),
+            make("ERP (optional)", &oracle_schema),
+            make("el/wallet (optional)", &oracle_wallet),
+            make("el/tns (optional)", &oracle_tns),
+            make("auto — thick for Oracle 10g/11g (optional)", &oracle_driver),
         ];
-        let name = make("name", "pg_prod", editing.as_deref().unwrap_or("")).editor;
+        let name = make("pg_prod", editing.as_deref().unwrap_or("")).editor;
 
         // The workspaces this connection can name: every declared
         // remote, plus the local worker, which needs no remotes.yml entry.
@@ -349,7 +348,7 @@ impl ElConnectionModal {
             .and_then(|name| referencing_pipelines(&root, name).ok())
             .unwrap_or_default();
 
-        Self {
+        let mut this = Self {
             focus_handle: cx.focus_handle(),
             workspace,
             panel,
@@ -369,13 +368,18 @@ impl ElConnectionModal {
                 .unwrap_or(ConnType::Duckdb),
             editing,
             auth_password,
+            show_optional: false,
             name,
             fields,
             referencing,
             delete_armed: false,
             writing: false,
             error: open_error,
-        }
+        };
+        this.show_optional = OPTIONAL_FIELDS
+            .iter()
+            .any(|ix| !this.text(*ix, cx).is_empty());
+        this
     }
 
     fn form_supported(&self) -> bool {
@@ -933,332 +937,468 @@ impl Focusable for ElConnectionModal {
     }
 }
 
+impl ElConnectionModal {
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.writing {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    /// The editors on screen, top to bottom: the order Tab walks.
+    fn visible_editors(&self) -> Vec<Entity<Editor>> {
+        let mut editors = vec![self.name.clone()];
+        if self.broken || !self.form_supported() {
+            return editors;
+        }
+        let shown: &[usize] = match (self.conn_type, self.show_optional) {
+            (ConnType::Postgres | ConnType::Mysql | ConnType::Duckdb, _) => &[0],
+            (ConnType::Oracle, false) => &[7, 8, 9],
+            (ConnType::Oracle, true) => &[7, 8, 9, 10, 11, 12],
+            (ConnType::Snowflake, false) => &[1, 2, 6],
+            (ConnType::Snowflake, true) => &[1, 2, 6, 3, 4, 5],
+            (ConnType::Local, _) => &[],
+        };
+        editors.extend(
+            shown
+                .iter()
+                .filter_map(|ix| self.fields.get(*ix))
+                .map(|field| field.editor.clone()),
+        );
+        editors
+    }
+
+    fn step_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields: Vec<FocusHandle> = self
+            .visible_editors()
+            .iter()
+            .map(|editor| editor.focus_handle(cx))
+            .collect();
+        dialog::cycle_focus(&fields, forward, window, cx);
+    }
+
+    fn field_at(
+        &self,
+        ix: usize,
+        label: &'static str,
+        hint: Option<&'static str>,
+        window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        self.fields.get(ix).map(|field| {
+            dialog::field(
+                label,
+                &field.editor,
+                hint.map(SharedString::from),
+                window,
+                cx,
+            )
+        })
+    }
+}
+
 impl Render for ElConnectionModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editing = self.editing.is_some();
         let supported = self.form_supported();
-        let title: SharedString = match (editing, &self.scope) {
-            (true, Some(profile)) => format!("Edit connection · profile {profile}").into(),
-            (true, None) => "Edit connection".into(),
-            (false, _) => "Add connection".into(),
+        let focus = self.focus_handle(cx);
+        let detail: SharedString = match (&self.editing, &self.scope) {
+            (Some(name), Some(profile)) => format!("{name} · defined in profile {profile}").into(),
+            (Some(name), None) => format!("{name} · shared by every profile").into(),
+            (None, _) => "Saved to el/connections.yml; secrets stay in .env as ${VAR}.".into(),
         };
-
-        let mut card = v_flex()
+        let frame = dialog::frame(dialog::WIDE, cx)
             .key_context("ElConnectionModal")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(460.))
-            .max_h(px(560.))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.elevated_surface_background)
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .w_full()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new(title).size(LabelSize::Small))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("el-conn-close", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    ),
-            );
+            .max_h(px(680.))
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                if this.broken {
+                    this.open_yaml(window, cx);
+                } else {
+                    this.save(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                this.step_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .child(dialog::header(
+                if editing {
+                    "Edit connection"
+                } else {
+                    "Add connection"
+                },
+                Some(detail),
+                cx.listener(|this, _, _, cx| this.cancel(cx)),
+                cx,
+            ));
 
         if self.broken {
             // The file (or the connection) is unreadable: explain, offer
             // the YAML, change nothing.
-            if let Some(error) = &self.error {
-                card = card.child(
-                    div().p_2().child(
-                        Label::new(error.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
-                    ),
-                );
-            }
-            return card.child(
-                h_flex()
-                    .w_full()
-                    .p_2()
-                    .gap_1()
-                    .border_t_1()
-                    .border_color(colors.border)
-                    .child(
-                        Button::new("el-conn-open-yaml", "Open connections.yml")
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Filled)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_yaml(window, cx)),
-                            ),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("el-conn-cancel", "Cancel")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    ),
-            );
-        }
-
-        if !editing && !self.declared_profiles.is_empty() {
-            // Where the new connection goes: shared base, or one profile.
-            let mut scope_row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
-                Label::new("define in")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-            scope_row = scope_row.child(
-                Button::new("el-conn-scope-base", "base (all profiles)")
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(self.scope.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.scope = None;
-                        cx.notify();
-                    })),
-            );
-            for (ix, profile) in self.declared_profiles.iter().enumerate() {
-                let selected = self.scope.as_deref() == Some(profile);
-                let profile = profile.clone();
-                scope_row = scope_row.child(
-                    Button::new(("el-conn-scope", ix), SharedString::from(profile.clone()))
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(selected)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scope = Some(profile.clone());
-                            cx.notify();
-                        })),
-                );
-            }
-            card = card.child(scope_row);
-        }
-
-        {
-            // Which workspace answers this connection's tables, queries and
-            // previews. `local` is the default: it writes no key at all, so
-            // a connection belongs to this machine until it says otherwise.
-            let mut row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
-                Label::new("workspace")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-            row = row.child(
-                Button::new("el-conn-workspace-local", "local")
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(self.runs_on.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.runs_on = None;
-                        cx.notify();
-                    })),
-            );
-            for (ix, remote) in self.declared_remotes.iter().enumerate() {
-                let selected = self.runs_on.as_deref() == Some(remote);
-                let remote = remote.clone();
-                row = row.child(
-                    Button::new(
-                        ("el-conn-workspace", ix),
-                        SharedString::from(remote.clone()),
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(selected)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.runs_on = Some(remote.clone());
-                        cx.notify();
-                    })),
-                );
-            }
-            card = card.child(row);
-        }
-        if supported {
-            let mut picker = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap();
-            for conn_type in ConnType::ALL {
-                let conn_type = *conn_type;
-                picker = picker.child(
-                    Button::new(
-                        SharedString::from(format!("el-conn-type-{}", conn_type.label())),
-                        conn_type.label(),
-                    )
-                    .label_size(LabelSize::XSmall)
-                    .toggle_state(self.conn_type == conn_type)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.conn_type = conn_type;
-                        cx.notify();
-                    })),
-                );
-            }
-            card = card.child(picker);
-        }
-
-        let field_row = |label: &'static str, editor: Entity<Editor>| {
-            h_flex()
-                .w_full()
-                .gap_2()
-                .items_center()
+            return frame
                 .child(
-                    div().w(px(140.)).flex_shrink_0().child(
-                        Label::new(label)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                    dialog::body().children(
+                        self.error
+                            .clone()
+                            .map(|error| dialog::notice(Severity::Error, error)),
                     ),
                 )
-                .child(div().flex_1().child(editor))
-        };
+                .child(dialog::footer(
+                    [],
+                    [
+                        dialog::cancel_button("el-conn-cancel", &focus, cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                            .into_any_element(),
+                        dialog::primary_button(
+                            "el-conn-open-yaml",
+                            "Open connections.yml",
+                            &focus,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx)))
+                        .into_any_element(),
+                    ],
+                    cx,
+                ));
+        }
 
-        let mut fields = v_flex().w_full().p_2().gap_1();
-        fields = fields.child(field_row("name", self.name.clone()));
+        let mut body = dialog::body();
         if supported {
+            let chips = ConnType::ALL.iter().map(|conn_type| {
+                let conn_type = *conn_type;
+                dialog::chip(
+                    SharedString::from(format!("el-conn-type-{}", conn_type.label())),
+                    conn_type.label(),
+                    self.conn_type == conn_type,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.conn_type = conn_type;
+                    cx.notify();
+                }))
+            });
+            body = body.child(dialog::labeled("Type", dialog::chips(chips)));
+        }
+        body = body.child(dialog::field("Name", &self.name, None, window, cx));
+
+        let optional_toggle = |open: bool, cx: &mut Context<Self>| {
+            dialog::labeled(
+                "",
+                Button::new(
+                    "el-conn-optional",
+                    if open {
+                        "Hide optional settings"
+                    } else {
+                        "Optional settings"
+                    },
+                )
+                .label_size(LabelSize::Small)
+                .start_icon(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall),
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_optional = !this.show_optional;
+                    cx.notify();
+                })),
+            )
+        };
+        if supported {
+            let secret_hint = Some("A ${VAR} reference — the value itself stays in .env.");
             match self.conn_type {
-                ConnType::Postgres | ConnType::Mysql | ConnType::Duckdb => {
-                    fields = fields.child(field_row(
-                        self.fields[0].label,
-                        self.fields[0].editor.clone(),
+                ConnType::Postgres | ConnType::Mysql => {
+                    body = body.children(self.field_at(
+                        0,
+                        "URL",
+                        Some("A ${VAR} reference keeps the credentials in .env."),
+                        window,
+                        cx,
+                    ));
+                }
+                ConnType::Duckdb => {
+                    body = body.children(self.field_at(
+                        0,
+                        "Database file",
+                        Some("The .duckdb file, relative to the project root."),
+                        window,
+                        cx,
                     ));
                 }
                 ConnType::Oracle => {
-                    for field in &self.fields[7..13] {
-                        fields = fields.child(field_row(field.label, field.editor.clone()));
+                    let driver = OracleDriver::parse(&self.text(ORACLE_DRIVER_FIELD, cx));
+                    let driver_chips = [
+                        ("auto", OracleDriver::Auto),
+                        ("thin", OracleDriver::Thin),
+                        ("thick", OracleDriver::Thick),
+                    ]
+                    .into_iter()
+                    .map(|(label, choice)| {
+                        dialog::chip(
+                            SharedString::from(format!("el-conn-driver-{label}")),
+                            label,
+                            driver == Some(choice),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if let Some(field) = this.fields.get(ORACLE_DRIVER_FIELD) {
+                                    // auto is what an absent key means: write nothing.
+                                    let text = if choice == OracleDriver::Auto {
+                                        ""
+                                    } else {
+                                        label
+                                    };
+                                    field
+                                        .editor
+                                        .update(cx, |editor, cx| editor.set_text(text, window, cx));
+                                }
+                                cx.notify();
+                            },
+                        ))
+                    });
+                    let driver_hint = match driver {
+                        Some(OracleDriver::Thin) => "No client software; Oracle 12.1 and later.",
+                        Some(OracleDriver::Thick) => {
+                            "Oracle Instant Client; reaches 10g and 11g too."
+                        }
+                        _ => "Thin first; a server before 12.1 falls back to the thick client.",
+                    };
+                    body = body
+                        .children(self.field_at(7, "User", None, window, cx))
+                        .children(self.field_at(8, "Password", secret_hint, window, cx))
+                        .children(self.field_at(
+                            9,
+                            "Connect",
+                            Some("host:port/service_name, or a TNS alias."),
+                            window,
+                            cx,
+                        ))
+                        .child(dialog::labeled(
+                            "Driver",
+                            v_flex()
+                                .w_full()
+                                .gap_1()
+                                .child(dialog::chips(driver_chips))
+                                .child(
+                                    Label::new(driver_hint)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ))
+                        .child(optional_toggle(self.show_optional, cx));
+                    if self.show_optional {
+                        body = body
+                            .children(self.field_at(
+                                10,
+                                "Schema",
+                                Some("Defaults to the user's own schema."),
+                                window,
+                                cx,
+                            ))
+                            .children(self.field_at(11, "Wallet directory", None, window, cx))
+                            .children(self.field_at(12, "TNS admin", None, window, cx));
                     }
                 }
-                ConnType::Local => {}
+                ConnType::Local => {
+                    body = body.child(dialog::notice(
+                        Severity::Info,
+                        "Local files need no settings — each stream names its own path.",
+                    ));
+                }
                 ConnType::Snowflake => {
-                    let auth = h_flex()
-                        .w_full()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            div().w(px(140.)).flex_shrink_0().child(
-                                Label::new("auth")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(
-                            Button::new("el-conn-auth-key", "key pair")
-                                .label_size(LabelSize::XSmall)
-                                .toggle_state(!self.auth_password)
+                    let auth_chips =
+                        [
+                            dialog::chip("el-conn-auth-key", "key pair", !self.auth_password)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.auth_password = false;
                                     cx.notify();
                                 })),
-                        )
-                        .child(
-                            Button::new("el-conn-auth-pw", "password")
-                                .label_size(LabelSize::XSmall)
-                                .toggle_state(self.auth_password)
+                            dialog::chip("el-conn-auth-pw", "password", self.auth_password)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.auth_password = true;
                                     cx.notify();
                                 })),
-                        );
-                    for field in &self.fields[1..6] {
-                        fields = fields.child(field_row(field.label, field.editor.clone()));
+                        ];
+                    body = body
+                        .children(self.field_at(1, "Account", None, window, cx))
+                        .children(self.field_at(2, "User", None, window, cx))
+                        .child(dialog::labeled("Auth", dialog::chips(auth_chips)))
+                        .children(self.field_at(
+                            6,
+                            if self.auth_password {
+                                "Password"
+                            } else {
+                                "Private key path"
+                            },
+                            secret_hint,
+                            window,
+                            cx,
+                        ))
+                        .child(optional_toggle(self.show_optional, cx));
+                    if self.show_optional {
+                        body = body
+                            .children(self.field_at(3, "Role", None, window, cx))
+                            .children(self.field_at(4, "Warehouse", None, window, cx))
+                            .children(self.field_at(5, "Database", None, window, cx));
                     }
-                    fields = fields.child(auth).child(field_row(
-                        if self.auth_password {
-                            "password env"
-                        } else {
-                            "private key path"
-                        },
-                        self.fields[6].editor.clone(),
-                    ));
                 }
             }
         } else {
             let kind = self.original_kind.unwrap_or("this");
-            fields = fields.child(
-                Label::new(format!(
-                    "{kind} connections are edited in YAML for now — the name can still \
-                     be changed here."
-                ))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-            );
-        }
-        card = card.child(fields);
-
-        if editing {
-            let note: SharedString = if self.referencing.is_empty() {
-                "Used by no pipelines.".into()
-            } else {
-                format!("Used by: {}", self.referencing.join(", ")).into()
-            };
-            card = card.child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
-            );
-        }
-
-        if let Some(error) = &self.error {
-            card = card.child(
-                div().px_2().pb_1().child(
-                    Label::new(error.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
+            body = body.child(dialog::notice(
+                Severity::Info,
+                format!(
+                    "{kind} connections are edited in YAML for now — the name can still be \
+                     changed here."
                 ),
-            );
+            ));
         }
 
-        let mut footer = h_flex()
-            .w_full()
-            .p_2()
-            .gap_1()
-            .border_t_1()
-            .border_color(colors.border);
+        // Which workspace answers this connection's tables, queries and
+        // previews. `local` is the default: it writes no key at all, so a
+        // connection belongs to this machine until it says otherwise.
+        let mut runs_on = vec![
+            dialog::chip("el-conn-workspace-local", "local", self.runs_on.is_none()).on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.runs_on = None;
+                    cx.notify();
+                }),
+            ),
+        ];
+        for (ix, remote) in self.declared_remotes.iter().enumerate() {
+            let selected = self.runs_on.as_deref() == Some(remote);
+            let remote = remote.clone();
+            runs_on.push(
+                dialog::chip(
+                    ("el-conn-workspace", ix),
+                    SharedString::from(remote.clone()),
+                    selected,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.runs_on = Some(remote.clone());
+                    cx.notify();
+                })),
+            );
+        }
+        body = body.child(dialog::labeled(
+            "Runs on",
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(dialog::chips(runs_on))
+                .child(
+                    Label::new("The worker that lists its tables, previews and runs pipelines.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        ));
+
+        if !editing && !self.declared_profiles.is_empty() {
+            // Where the new connection goes: shared base, or one profile.
+            let mut scopes = vec![
+                dialog::chip("el-conn-scope-base", "every profile", self.scope.is_none()).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.scope = None;
+                        cx.notify();
+                    }),
+                ),
+            ];
+            for (ix, profile) in self.declared_profiles.iter().enumerate() {
+                let selected = self.scope.as_deref() == Some(profile);
+                let profile = profile.clone();
+                scopes.push(
+                    dialog::chip(
+                        ("el-conn-scope", ix),
+                        SharedString::from(profile.clone()),
+                        selected,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scope = Some(profile.clone());
+                        cx.notify();
+                    })),
+                );
+            }
+            body = body.child(dialog::labeled("Defined in", dialog::chips(scopes)));
+        }
+
         if editing {
-            footer = footer.child(
-                Button::new(
-                    "el-conn-delete",
-                    if self.delete_armed {
-                        "Confirm delete"
-                    } else {
-                        "Delete"
-                    },
-                )
-                .label_size(LabelSize::Small)
-                .color(Color::Error)
-                .disabled(self.writing)
-                .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
-            );
+            body = body.child(dialog::notice(
+                Severity::Info,
+                if self.referencing.is_empty() {
+                    "No pipeline uses this connection yet.".to_owned()
+                } else {
+                    format!("Used by {}.", self.referencing.join(", "))
+                },
+            ));
         }
-        if !supported {
-            footer = footer.child(
-                Button::new("el-conn-open-yaml", "Open connections.yml")
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx))),
-            );
+        if let Some(error) = &self.error {
+            body = body.child(dialog::notice(Severity::Error, error.clone()));
         }
-        footer = footer
-            .child(div().flex_1())
-            .child(
-                Button::new("el-conn-cancel", "Cancel")
-                    .label_size(LabelSize::Small)
-                    .disabled(self.writing)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+
+        let referenced = !self.referencing.is_empty();
+        let delete = editing.then(|| {
+            dialog::danger_button(
+                "el-conn-delete",
+                if self.delete_armed {
+                    "Confirm delete"
+                } else {
+                    "Delete…"
+                },
             )
-            .child(
-                Button::new(
-                    "el-conn-save",
-                    if self.writing {
-                        "Saving…"
-                    } else if editing {
-                        "Save changes"
-                    } else {
-                        "Add connection"
-                    },
-                )
+            .disabled(self.writing || referenced)
+            .when(referenced, |button| {
+                button.tooltip(Tooltip::text(
+                    "Pipelines still use this connection — point them elsewhere first",
+                ))
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx)))
+            .into_any_element()
+        });
+        let open_yaml = (!supported).then(|| {
+            Button::new("el-conn-open-yaml", "Open connections.yml")
                 .label_size(LabelSize::Small)
-                .style(ButtonStyle::Filled)
-                .disabled(self.writing)
-                .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
-            );
-        card.child(footer)
+                .on_click(cx.listener(|this, _, window, cx| this.open_yaml(window, cx)))
+                .into_any_element()
+        });
+        frame
+            .child(
+                div()
+                    .id("el-conn-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(dialog::footer(
+                delete.into_iter().chain(open_yaml),
+                [
+                    dialog::cancel_button("el-conn-cancel", &focus, cx)
+                        .disabled(self.writing)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
+                        .into_any_element(),
+                    dialog::primary_button(
+                        "el-conn-save",
+                        if self.writing {
+                            "Saving…"
+                        } else if editing {
+                            "Save changes"
+                        } else {
+                            "Add connection"
+                        },
+                        &focus,
+                        cx,
+                    )
+                    .disabled(self.writing)
+                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))
+                    .into_any_element(),
+                ],
+                cx,
+            ))
     }
 }
 

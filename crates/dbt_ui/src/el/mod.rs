@@ -6,6 +6,7 @@ pub mod canvas_item;
 pub mod cli;
 pub mod connection_modal;
 pub mod deploy_modal;
+pub mod dialog;
 pub mod layout;
 pub mod local_runner;
 pub mod mapping_editor;
@@ -22,6 +23,7 @@ pub use panel::ElPanel;
 pub use runs_panel::ElRunsPanel;
 
 use anyhow::Context as _;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext as _, Context, SharedString, Window};
@@ -302,6 +304,65 @@ pub(crate) fn toast_error(
     workspace.show_toast(toast, cx);
 }
 
+/// Each table as lowercase `schema.table`: folded once, so a search per
+/// keystroke only compares.
+pub(crate) fn fold_table_names(tables: &[(String, String)]) -> Vec<String> {
+    tables
+        .iter()
+        .map(|(schema, table)| format!("{schema}.{table}").to_lowercase())
+        .collect()
+}
+
+pub(crate) fn search_terms(text: &str) -> Vec<String> {
+    text.split_whitespace().map(str::to_lowercase).collect()
+}
+
+pub(crate) fn matching_tables(haystack: &[String], terms: &[String]) -> Vec<usize> {
+    haystack
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| terms.iter().all(|term| name.contains(term.as_str())))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Where each search term first appears in `label`, merged where they
+/// overlap. Folding only ASCII case keeps the byte offsets valid for the
+/// label itself; a term that matched through wider Unicode folding just
+/// goes unhighlighted.
+pub(crate) fn highlight_ranges(label: &str, terms: &[String]) -> Vec<Range<usize>> {
+    let folded = label.to_ascii_lowercase();
+    let mut ranges: Vec<Range<usize>> = terms
+        .iter()
+        .filter_map(|term| {
+            let start = folded.find(term.as_str())?;
+            let end = start + term.len();
+            (label.is_char_boundary(start) && label.is_char_boundary(end)).then_some(start..end)
+        })
+        .collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+pub(crate) fn thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +414,55 @@ connections:
         let dir = project("version: 1\nconnections: {}\n");
         let error = db_worker(dir.path(), "ghost").unwrap_err();
         assert!(format!("{error:#}").contains("ghost"), "{error:#}");
+    }
+
+    #[test]
+    fn search_needs_every_term_in_any_case() {
+        let haystack: Vec<String> = [
+            "adm_dba.dba_nb_process",
+            "art_ref.article_zone_tarif",
+            "art_ref.article",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("ART zone")),
+            vec![1]
+        );
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("article")),
+            vec![1, 2]
+        );
+        assert_eq!(
+            matching_tables(&haystack, &search_terms("  ")),
+            vec![0, 1, 2]
+        );
+        assert!(matching_tables(&haystack, &search_terms("orders")).is_empty());
+    }
+
+    #[test]
+    fn highlights_merge_and_keep_to_char_boundaries() {
+        assert_eq!(
+            highlight_ranges("ART_REF.ARTICLE", &search_terms("art ref")),
+            vec![0..3, 4..7]
+        );
+        assert_eq!(
+            highlight_ranges("ART_REF.ARTICLE", &search_terms("art_r rt_ref")),
+            vec![0..7]
+        );
+        assert!(highlight_ranges("CAFÉ.MENU", &search_terms("é")).is_empty());
+        assert_eq!(
+            highlight_ranges("café.menu", &search_terms("é menu")),
+            vec![3..5, 6..10]
+        );
+    }
+
+    #[test]
+    fn counts_are_grouped_by_thousands() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(100), "100");
+        assert_eq!(thousands(9_331), "9,331");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 }

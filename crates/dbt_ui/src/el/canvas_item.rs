@@ -1914,6 +1914,10 @@ impl ElPipelineCanvas {
         if kind == BuilderKind::Source {
             self.kick_builder_tables(cx);
         }
+        if let Some(form) = &self.builder {
+            let focus = form.initial_focus(cx);
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 
@@ -1955,25 +1959,32 @@ impl ElPipelineCanvas {
             form.tables = super::builder::TablesPick::Loading;
         }
         let root = self.project_root.clone();
-        let task = cx.background_spawn(async move { super::list_tables(&root, &connection_name) });
+        let task = cx.background_spawn(async move {
+            super::list_tables(&root, &connection_name).map(|items| {
+                let haystack = super::fold_table_names(&items);
+                (items, haystack)
+            })
+        });
         self._tables = cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
                 if let Some(form) = this.builder_mut() {
-                    form.tables = match result {
-                        Ok(items) => super::builder::TablesPick::Loaded {
-                            items,
-                            selected: Default::default(),
-                        },
+                    match result {
+                        Ok((items, haystack)) => form.tables_loaded(items, haystack),
                         Err(error) => {
-                            super::builder::TablesPick::Failed(format!("{error:#}").into())
+                            form.tables =
+                                super::builder::TablesPick::Failed(format!("{error:#}").into());
                         }
-                    };
+                    }
                 }
                 cx.notify();
             })
             .ok();
         });
+    }
+
+    pub(crate) fn builder(&self) -> Option<&BuilderForm> {
+        self.builder.as_ref()
     }
 
     pub(crate) fn builder_mut(&mut self) -> Option<&mut BuilderForm> {
@@ -2017,7 +2028,12 @@ impl ElPipelineCanvas {
             .as_ref()
             .map(|loaded| (*loaded.pipeline).clone());
         match form.build(pipeline, connections, cx) {
-            Err(error) => self.toast(format!("{error:#}"), cx),
+            Err(error) => {
+                if let Some(form) = self.builder_mut() {
+                    form.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+            }
             Ok(outcome) => {
                 let workspace = self.workspace.clone();
                 let project = self.project.clone();
@@ -2353,13 +2369,52 @@ impl Render for ElPipelineCanvas {
         .children(self.builder.as_ref().map(|form| {
             gpui::deferred(
                 div()
+                    .id("el-builder-backdrop")
                     .absolute()
                     .inset_0()
                     .flex()
                     .items_center()
                     .justify_center()
                     .bg(gpui::black().opacity(0.35))
-                    .child(form.render(cx.entity().downgrade(), cx)),
+                    .occlude()
+                    .key_context("ElBuilderForm")
+                    .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.close_builder(cx)))
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        this.apply_builder(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                        if let Some(form) = this.builder_mut() {
+                            form.step(true, window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                        if let Some(form) = this.builder_mut() {
+                            form.step(false, window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &menu::SecondaryConfirm, _, cx| {
+                        if let Some(form) = this.builder_mut() {
+                            form.toggle_highlighted();
+                        }
+                        cx.notify();
+                    }))
+                    // A click beside the form closes it only while nothing
+                    // typed or checked would be lost; Cancel always closes.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.builder.as_ref().is_some_and(|form| !form.is_dirty(cx)) {
+                                this.close_builder(cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(form.render(window, cx)),
+                    ),
             )
             .with_priority(2)
         }))

@@ -17,6 +17,8 @@ use project::Project;
 use ui::prelude::*;
 use workspace::{ModalView, Workspace};
 
+use super::dialog;
+
 use el_engine::server::RemotePipeline;
 use el_engine::spec::Pipeline;
 
@@ -365,9 +367,17 @@ impl ElDeployModal {
         pipelines: &[RemotePipeline],
         tracks_checkout: bool,
     ) -> Div {
-        let mut rows = v_flex().w_full().px_2().pb_2().gap_0p5();
-        let line =
-            |text: String, color: Color| Label::new(text).size(LabelSize::XSmall).color(color);
+        let mut rows = v_flex().w_full().gap_1p5();
+        let line = |text: String, color: Color| {
+            dialog::notice(
+                match color {
+                    Color::Error => Severity::Error,
+                    Color::Warning => Severity::Warning,
+                    _ => Severity::Info,
+                },
+                text,
+            )
+        };
         if let Some(refusal) = &self.refusal {
             return rows.child(line(refusal.to_string(), Color::Error));
         }
@@ -497,7 +507,16 @@ impl ElDeployModal {
 }
 
 impl EventEmitter<DismissEvent> for ElDeployModal {}
-impl ModalView for ElDeployModal {}
+impl ModalView for ElDeployModal {
+    fn on_before_dismiss(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> workspace::DismissDecision {
+        // A deploy in flight reports how it ended, so the popup stays up.
+        workspace::DismissDecision::Dismiss(!self.deploying)
+    }
+}
 
 impl Focusable for ElDeployModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -507,124 +526,97 @@ impl Focusable for ElDeployModal {
 
 impl Render for ElDeployModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
         let remote = self
             .remotes
             .get(self.selected_remote)
             .cloned()
             .unwrap_or_else(|| "remote".into());
-
-        let mut card = v_flex()
-            .key_context("ElDeployModal")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(460.))
-            .rounded_lg()
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.elevated_surface_background)
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .w_full()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new(format!("Deploy {}", self.pipeline)).size(LabelSize::Small))
-                    .child(div().flex_1())
-                    .child(
-                        IconButton::new("el-deploy-close", IconName::Close)
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                    ),
-            );
+        let focus = self.focus_handle.clone();
+        let mut body = dialog::body();
 
         if self.remotes.len() > 1 {
-            let mut remote_row = h_flex().w_full().px_2().pt_2().gap_1().flex_wrap().child(
-                Label::new("server")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-            for (ix, name) in self.remotes.iter().enumerate() {
-                let selected = ix == self.selected_remote;
-                remote_row = remote_row.child(
-                    Button::new(("el-deploy-remote", ix), name.clone())
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(selected)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_remote = ix;
+            let chips = self.remotes.iter().enumerate().map(|(ix, name)| {
+                dialog::chip(
+                    ("el-deploy-remote", ix),
+                    name.clone(),
+                    ix == self.selected_remote,
+                )
+                .disabled(self.deploying)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected_remote = ix;
+                    this.fetch_facts(cx);
+                    cx.notify();
+                }))
+            });
+            body = body.child(dialog::labeled("Server", dialog::chips(chips)));
+        }
+
+        body = body.child(match &self.facts {
+            RemoteFacts::Loading => {
+                dialog::labeled("Profile", dialog::loading(format!("Checking {remote}…")))
+            }
+            RemoteFacts::Failed(error) => v_flex()
+                .w_full()
+                .gap_1()
+                .child(dialog::notice(
+                    Severity::Error,
+                    format!("Couldn't reach {remote}: {error}"),
+                ))
+                .child(
+                    Button::new("el-deploy-retry", "Try again")
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                        .on_click(cx.listener(|this, _, _, cx| {
                             this.fetch_facts(cx);
                             cx.notify();
                         })),
-                );
-            }
-            card = card.child(remote_row);
-        }
-
-        card = card.child(match &self.facts {
-            RemoteFacts::Loading => div().p_2().child(
-                Label::new(format!("Checking {remote}…"))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ),
-            RemoteFacts::Failed(error) => div().p_2().child(
-                Label::new(error.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error),
-            ),
+                )
+                .into_any_element(),
             RemoteFacts::Loaded {
                 profiles, active, ..
             } => {
-                let mut rows = v_flex().w_full().p_2().gap_1();
-                rows = rows.child(
-                    Label::new("Run this pipeline under:")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-                let mut chips = h_flex().w_full().gap_1().flex_wrap();
                 let server_default_label: SharedString = match active {
                     Some(active) => format!("server default ({active})").into(),
                     None => "server default".into(),
                 };
-                chips = chips.child(
-                    Button::new("el-deploy-profile-default", server_default_label)
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(self.selected_profile.is_none())
-                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.selected_profile = None;
-                            cx.notify();
-                        })),
-                );
+                let mut chips = vec![
+                    dialog::chip(
+                        "el-deploy-profile-default",
+                        server_default_label,
+                        self.selected_profile.is_none(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected_profile = None;
+                        cx.notify();
+                    })),
+                ];
                 for (ix, profile) in profiles.iter().enumerate() {
                     let selected = self.selected_profile.as_deref() == Some(profile);
                     let profile = profile.clone();
-                    chips = chips.child(
-                        Button::new(
+                    chips.push(
+                        dialog::chip(
                             ("el-deploy-profile", ix),
                             SharedString::from(profile.clone()),
+                            selected,
                         )
-                        .label_size(LabelSize::XSmall)
-                        .toggle_state(selected)
-                        .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.selected_profile = Some(profile.clone());
                             cx.notify();
                         })),
                     );
                 }
-                rows = rows.child(chips);
-                if profiles.is_empty() {
-                    rows = rows.child(
-                        Label::new(
-                            "This server declares no profiles — it runs its base \
-                             connections.",
-                        )
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                    );
-                }
-                rows
+                let control = v_flex().w_full().gap_1().child(dialog::chips(chips));
+                dialog::labeled(
+                    "Profile",
+                    if profiles.is_empty() {
+                        control.child(dialog::notice(
+                            Severity::Info,
+                            "This server declares no profiles — it runs its base connections.",
+                        ))
+                    } else {
+                        control
+                    },
+                )
             }
         });
 
@@ -635,29 +627,17 @@ impl Render for ElDeployModal {
                 tracks_checkout,
                 ..
             } => {
-                card = card.child(self.render_consequences(&remote, pipelines, *tracks_checkout));
+                body = body.child(self.render_consequences(&remote, pipelines, *tracks_checkout));
             }
             _ => {
                 if let Some(refusal) = &self.refusal {
-                    card = card.child(
-                        div().px_2().pb_2().child(
-                            Label::new(refusal.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error),
-                        ),
-                    );
+                    body = body.child(dialog::notice(Severity::Error, refusal.clone()));
                 }
             }
         }
 
         if let Some(error) = &self.error {
-            card = card.child(
-                div().px_2().pb_1().child(
-                    Label::new(error.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
-                ),
-            );
+            body = body.child(dialog::notice(Severity::Error, error.clone()));
         }
 
         let deploy_label: SharedString = if self.deploying {
@@ -668,27 +648,39 @@ impl Render for ElDeployModal {
                 None => format!("Deploy to {remote}").into(),
             }
         };
-        card.child(
-            h_flex()
-                .w_full()
-                .p_2()
-                .gap_1()
-                .border_t_1()
-                .border_color(colors.border)
-                .child(div().flex_1())
-                .child(
-                    Button::new("el-deploy-cancel", "Cancel")
-                        .label_size(LabelSize::Small)
+        dialog::frame(dialog::NARROW, cx)
+            .key_context("ElDeployModal")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
+                if !this.deploying {
+                    cx.emit(DismissEvent);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.send(window, cx)))
+            .child(dialog::header(
+                "Deploy pipeline",
+                Some(self.pipeline.clone().into()),
+                cx.listener(|this, _, _, cx| {
+                    if !this.deploying {
+                        cx.emit(DismissEvent);
+                    }
+                }),
+                cx,
+            ))
+            .child(body)
+            .child(dialog::footer(
+                [],
+                [
+                    dialog::cancel_button("el-deploy-cancel", &focus, cx)
                         .disabled(self.deploying)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-                )
-                .child(
-                    Button::new("el-deploy-send", deploy_label)
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+                        .into_any_element(),
+                    dialog::primary_button("el-deploy-send", deploy_label, &focus, cx)
                         .disabled(!self.can_send())
-                        .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                ),
-        )
+                        .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+                        .into_any_element(),
+                ],
+                cx,
+            ))
     }
 }
