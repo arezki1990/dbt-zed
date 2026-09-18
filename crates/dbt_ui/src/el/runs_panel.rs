@@ -2815,20 +2815,27 @@ impl ElRunsPanel {
                                 .gap_1p5()
                                 .items_center()
                                 .child(
+                                    // The track has to be visible empty,
+                                    // or a run that has just started looks
+                                    // like a stray dot; and the fill needs
+                                    // a floor, or one percent is invisible.
                                     div()
                                         .w(px(84.))
-                                        .h(px(6.))
+                                        .h(px(8.))
                                         .rounded_sm()
                                         .bg(colors.element_background)
+                                        .border_1()
+                                        .border_color(colors.border)
                                         .child(
                                             div()
                                                 .h_full()
+                                                .min_w(px(3.))
                                                 .w(gpui::relative(fraction as f32))
                                                 .rounded_sm()
                                                 .bg(if done {
                                                     colors.text_accent
                                                 } else {
-                                                    colors.text_accent.opacity(0.8)
+                                                    colors.text_accent.opacity(0.85)
                                                 }),
                                         ),
                                 )
