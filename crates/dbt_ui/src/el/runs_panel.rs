@@ -1576,12 +1576,6 @@ impl ElRunsPanel {
 
 impl ElRunsPanel {
     fn render_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // Newest-last: following means the pane shows what just happened
-        // rather than where the reader last scrolled.
-        if self.remote_logs_dirty && self.remote_show_logs && self.remote_logs_follow {
-            self.remote_logs_dirty = false;
-            self.remote_logs_scroll.scroll_to_bottom();
-        }
         let chips = h_flex().gap_1().flex_wrap().children(
             self.remotes
                 .iter()
@@ -1704,6 +1698,21 @@ impl ElRunsPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
+        // Newest-last: following shows what just happened rather than
+        // where the reader last scrolled. The lines that arrived since
+        // the last frame have no measured height yet, so this reaches the
+        // previous bottom; the frame after, with their heights known,
+        // reaches the newest line.
+        if self.remote_logs_dirty && self.remote_logs_follow {
+            self.remote_logs_dirty = false;
+            self.remote_logs_scroll.scroll_to_bottom();
+            cx.on_next_frame(window, |this, _, cx| {
+                if this.remote_logs_follow {
+                    this.remote_logs_scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+            });
+        }
         let problems = self
             .remote_logs
             .iter()
@@ -2492,6 +2501,8 @@ impl ElRunsPanel {
         };
         // Fold the event log into per-stream rows.
         let (order, agg) = fold_stream_events(self.run_events(run_id));
+        // What a re-run would be for: the streams that reported an error,
+        // and the ones a stopped run never finished.
         let failed_streams: Vec<String> = order
             .iter()
             .filter(|stream| {
@@ -2500,6 +2511,9 @@ impl ElRunsPanel {
             })
             .cloned()
             .collect();
+        let all_errored = failed_streams
+            .iter()
+            .all(|stream| agg.get(stream).is_some_and(|entry| entry.error.is_some()));
         let pipeline_name = run.map(|run| run.pipeline.clone()).unwrap_or_default();
 
         let header = h_flex()
@@ -2557,8 +2571,9 @@ impl ElRunsPanel {
                 Button::new(
                     "el-run-detail-retry",
                     format!(
-                        "Re-run {} failed stream{}",
+                        "Re-run {} {} stream{}",
                         streams.len(),
+                        if all_errored { "failed" } else { "unfinished" },
                         if streams.len() == 1 { "" } else { "s" }
                     ),
                 )
