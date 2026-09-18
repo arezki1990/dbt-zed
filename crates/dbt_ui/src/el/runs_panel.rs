@@ -1165,6 +1165,29 @@ impl ElRunsPanel {
         });
     }
 
+    /// Replaces the selected remote's connections with this project's,
+    /// sealed to that daemon's key. The deploy popup does this too; here
+    /// it stands alone, for a password that changed under a pipeline that
+    /// is already deployed.
+    fn send_connections_to_remote(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        self.remote_action(
+            move |client| {
+                let (key, _) = client.pubkey().map_err(|error| {
+                    anyhow::anyhow!(
+                        "this server can't be sent connections ({error}) — update the daemon"
+                    )
+                })?;
+                let bundle = el_engine::secrets::ConnectionsBundle::read(&root)?;
+                let sealed = bundle.seal(&key)?;
+                client.send_connections(&sealed).map(|_| ())
+            },
+            cx,
+        );
+    }
+
     /// Launches a run on the selected remote: the whole pipeline when
     /// `streams` is empty, or exactly the streams named.
     fn run_remote(&mut self, pipeline: String, streams: Vec<String>, cx: &mut Context<Self>) {
@@ -1621,6 +1644,17 @@ impl ElRunsPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Error)
             }))
+            .child(
+                Button::new("el-remote-send-connections", "Send connections")
+                    .label_size(LabelSize::XSmall)
+                    .start_icon(Icon::new(IconName::Lock).size(IconSize::XSmall))
+                    .tooltip(ui::Tooltip::text(
+                        "Encrypt this project's connections to this server's own key and                          replace the ones it holds",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.send_connections_to_remote(cx);
+                    })),
+            )
             .child(
                 Button::new("el-remote-logs", "Server log")
                     .label_size(LabelSize::XSmall)
