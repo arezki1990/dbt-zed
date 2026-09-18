@@ -52,14 +52,17 @@ pub struct DraggedTables {
 /// Kinds the explorer can browse — the worker's list/query support. The
 /// panel lists their tables and queries them.
 pub(crate) fn browsable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres" | "oracle" | "snowflake")
+    matches!(
+        kind,
+        "duckdb" | "postgres" | "oracle" | "snowflake" | "mssql"
+    )
 }
 
 /// Kinds a pipeline extracts from, so their tables can become streams: the
 /// canvas invites a drag from these. Snowflake is browsable but only ever a
 /// destination.
 pub(crate) fn extractable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres" | "oracle")
+    matches!(kind, "duckdb" | "postgres" | "oracle" | "mssql")
 }
 
 /// The vertical scrollbar of an EL scroll area: always on screen rather
@@ -68,6 +71,12 @@ pub(crate) fn extractable(kind: &str) -> bool {
 /// bar scrolls away with the content.
 pub(crate) fn scrollbar<T: ui::ScrollableHandle>(handle: &T) -> ui::Scrollbars<T> {
     ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(handle)
+}
+
+/// Kinds a pipeline loads INTO: the warehouses with a loader. A source
+/// kind that is not here can still be browsed and queried.
+pub(crate) fn loadable(kind: &str) -> bool {
+    matches!(kind, "snowflake" | "duckdb" | "oracle" | "mssql")
 }
 
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or

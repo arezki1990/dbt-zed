@@ -21,8 +21,8 @@ use ui::{Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{ModalView, Workspace};
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, OracleConn, OracleDriver, Pipeline, SnowflakeAuth,
-    SnowflakeConn, SpecError,
+    Connection, Connections, DbConn, DuckdbConn, MssqlConn, OracleConn, OracleDriver, Pipeline,
+    SnowflakeAuth, SnowflakeConn, SpecError,
 };
 
 use super::builder::ConnType;
@@ -62,6 +62,8 @@ pub struct ElConnectionModal {
     conn_type: ConnType,
     /// Snowflake: password auth instead of key pair.
     auth_password: bool,
+    /// SQL Server: accept the server's certificate without validating it.
+    mssql_trust_cert: bool,
     /// The optional settings are unfolded — from the start when one of
     /// them already holds a value.
     show_optional: bool,
@@ -78,15 +80,22 @@ pub struct ElConnectionModal {
 }
 
 /// Field indices of the settings most connections leave unset: Snowflake's
-/// role, warehouse and database; Oracle's schema, wallet and TNS admin.
-const OPTIONAL_FIELDS: [usize; 6] = [3, 4, 5, 10, 11, 12];
+/// role, warehouse and database; Oracle's schema, wallet and TNS admin;
+/// SQL Server's port.
+const OPTIONAL_FIELDS: [usize; 7] = [3, 4, 5, 10, 11, 12, 15];
 const ORACLE_DRIVER_FIELD: usize = 13;
+/// SQL Server's fields, in the order the form shows them.
+const MSSQL_HOST_FIELD: usize = 14;
+const MSSQL_PORT_FIELD: usize = 15;
+const MSSQL_DATABASE_FIELD: usize = 16;
+const MSSQL_USER_FIELD: usize = 17;
+const MSSQL_PASSWORD_FIELD: usize = 18;
 
 /// True for kinds the form can round-trip; others fall back to YAML.
 fn form_supported(kind: &str) -> bool {
     matches!(
         kind,
-        "postgres" | "mysql" | "oracle" | "duckdb" | "snowflake" | "local"
+        "postgres" | "mysql" | "oracle" | "mssql" | "duckdb" | "snowflake" | "local"
     )
 }
 
@@ -95,6 +104,7 @@ fn conn_type_of(kind: &str) -> ConnType {
         "postgres" => ConnType::Postgres,
         "mysql" => ConnType::Mysql,
         "oracle" => ConnType::Oracle,
+        "mssql" => ConnType::Mssql,
         "snowflake" => ConnType::Snowflake,
         "local" => ConnType::Local,
         _ => ConnType::Duckdb,
@@ -263,6 +273,12 @@ impl ElConnectionModal {
         let mut oracle_wallet = String::new();
         let mut oracle_tns = String::new();
         let mut oracle_driver = String::new();
+        let mut mssql_host = String::new();
+        let mut mssql_port = String::new();
+        let mut mssql_database = String::new();
+        let mut mssql_user = String::new();
+        let mut mssql_password = String::new();
+        let mut mssql_trust_cert = false;
         match &existing {
             Some(Connection::Postgres(conn)) | Some(Connection::Mysql(conn)) => {
                 url_or_path = conn.url.clone();
@@ -289,6 +305,24 @@ impl ElConnectionModal {
                     .driver
                     .map(|driver| driver.as_str().to_owned())
                     .unwrap_or_default();
+            }
+            Some(Connection::Mssql(conn)) => {
+                mssql_host = conn.host.clone();
+                mssql_port = conn.port.map(|port| port.to_string()).unwrap_or_default();
+                mssql_database = conn.database.clone();
+                mssql_user = conn.user.clone();
+                mssql_trust_cert = conn.trust_server_certificate.unwrap_or(false);
+                // A ${VAR} reference round-trips; a literal credential is
+                // never echoed into the form.
+                if conn.password.is_empty() || conn.password.starts_with("${") {
+                    mssql_password = conn.password.clone();
+                } else {
+                    open_error = Some(
+                        "the YAML holds a literal password — enter a ${VAR} \
+                         reference here and move the value to .env"
+                            .into(),
+                    );
+                }
             }
             Some(Connection::Snowflake(conn)) => {
                 account = conn.account.clone();
@@ -334,6 +368,11 @@ impl ElConnectionModal {
             make("el/wallet (optional)", &oracle_wallet),
             make("el/tns (optional)", &oracle_tns),
             make("auto — thick for Oracle 10g/11g (optional)", &oracle_driver),
+            make("sql.example.com", &mssql_host),
+            make("1433 (optional)", &mssql_port),
+            make("Sales", &mssql_database),
+            make("${MSSQL_USER}", &mssql_user),
+            make("${MSSQL_PASSWORD}", &mssql_password),
         ];
         let name = make("pg_prod", editing.as_deref().unwrap_or("")).editor;
 
@@ -370,6 +409,7 @@ impl ElConnectionModal {
                 .unwrap_or(ConnType::Duckdb),
             editing,
             auth_password,
+            mssql_trust_cert,
             show_optional: false,
             name,
             fields,
@@ -461,6 +501,42 @@ impl ElConnectionModal {
                     wallet_dir: optional(self.text(11, cx)),
                     tns_admin: optional(self.text(12, cx)),
                     driver,
+                    workspace: self.runs_on.clone(),
+                    extra: Default::default(),
+                })
+            }
+            ConnType::Mssql => {
+                let host = self.text(MSSQL_HOST_FIELD, cx);
+                let database = self.text(MSSQL_DATABASE_FIELD, cx);
+                let user = self.text(MSSQL_USER_FIELD, cx);
+                let password = self.text(MSSQL_PASSWORD_FIELD, cx);
+                if host.is_empty() || database.is_empty() || user.is_empty() {
+                    bail!("sql server needs a host, a database and a user");
+                }
+                if password.is_empty() {
+                    bail!("sql server needs a password — reference it like ${{MSSQL_PASSWORD}}");
+                }
+                if !password.starts_with("${") {
+                    bail!(
+                        "store the password in the environment and reference it like \
+                         ${{MSSQL_PASSWORD}} — never a literal in YAML"
+                    );
+                }
+                let port = match self.text(MSSQL_PORT_FIELD, cx) {
+                    port if port.is_empty() => None,
+                    port => Some(
+                        port.parse::<u16>()
+                            .map_err(|_| anyhow::anyhow!("{port:?} is not a port number"))?,
+                    ),
+                };
+                Connection::Mssql(MssqlConn {
+                    host,
+                    port,
+                    database,
+                    user,
+                    password,
+                    encrypt: None,
+                    trust_server_certificate: self.mssql_trust_cert.then_some(true),
                     workspace: self.runs_on.clone(),
                     extra: Default::default(),
                 })
@@ -956,6 +1032,8 @@ impl ElConnectionModal {
             (ConnType::Postgres | ConnType::Mysql | ConnType::Duckdb, _) => &[0],
             (ConnType::Oracle, false) => &[7, 8, 9],
             (ConnType::Oracle, true) => &[7, 8, 9, 10, 11, 12],
+            (ConnType::Mssql, false) => &[14, 16, 17, 18],
+            (ConnType::Mssql, true) => &[14, 16, 17, 18, 15],
             (ConnType::Snowflake, false) => &[1, 2, 6],
             (ConnType::Snowflake, true) => &[1, 2, 6, 3, 4, 5],
             (ConnType::Local, _) => &[],
@@ -1206,6 +1284,71 @@ impl Render for ElConnectionModal {
                             .children(self.field_at(12, "TNS admin", None, window, cx));
                     }
                 }
+                ConnType::Mssql => {
+                    body = body
+                        .children(self.field_at(
+                            MSSQL_HOST_FIELD,
+                            "Host",
+                            Some("The server's name or address, without the port."),
+                            window,
+                            cx,
+                        ))
+                        .children(self.field_at(MSSQL_DATABASE_FIELD, "Database", None, window, cx))
+                        .children(self.field_at(MSSQL_USER_FIELD, "User", None, window, cx))
+                        .children(self.field_at(
+                            MSSQL_PASSWORD_FIELD,
+                            "Password",
+                            secret_hint,
+                            window,
+                            cx,
+                        ))
+                        .child(optional_toggle(self.show_optional, cx));
+                    if self.show_optional {
+                        let trust = self.mssql_trust_cert;
+                        body = body
+                            .children(self.field_at(
+                                MSSQL_PORT_FIELD,
+                                "Port",
+                                Some("1433 unless this says otherwise."),
+                                window,
+                                cx,
+                            ))
+                            .child(dialog::labeled(
+                                "Certificate",
+                                v_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .child(dialog::chips(
+                                        [("validate", false), ("trust the server's own", true)]
+                                            .into_iter()
+                                            .map(|(label, choice)| {
+                                                dialog::chip(
+                                                    SharedString::from(format!(
+                                                        "el-conn-cert-{label}"
+                                                    )),
+                                                    label,
+                                                    trust == choice,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.mssql_trust_cert = choice;
+                                                    cx.notify();
+                                                }))
+                                            }),
+                                    ))
+                                    .child(
+                                        Label::new(if trust {
+                                            "The connection is still encrypted; the \
+                                             certificate is simply not checked."
+                                        } else {
+                                            "The server's certificate must be one this \
+                                             machine trusts."
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
+                            ));
+                    }
+                }
                 ConnType::Local => {
                     body = body.child(dialog::notice(
                         Severity::Info,
@@ -1438,10 +1581,13 @@ mod tests {
             assert!(form_supported(kind), "{kind} is not form-supported");
             assert_eq!(conn_type_of(kind).label(), kind);
         }
+        // These two spell their kind differently from their label.
         assert!(form_supported("local"));
         assert!(conn_type_of("local") == ConnType::Local);
+        assert!(form_supported("mssql"));
+        assert!(conn_type_of("mssql") == ConnType::Mssql);
         // Kinds without a form still fall back to the YAML rename path.
-        assert!(!form_supported("mssql"));
+        assert!(!form_supported("bigquery"));
     }
 
     #[test]

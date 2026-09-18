@@ -15,8 +15,8 @@ use indexmap::IndexMap;
 use ui::{Checkbox, HighlightedLabel, Tooltip, WithScrollbar as _, prelude::*};
 
 use el_engine::spec::{
-    Connection, Connections, DbConn, DuckdbConn, FileFormat, OracleConn, Pipeline, SnowflakeAuth,
-    SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
+    Connection, Connections, DbConn, DuckdbConn, FileFormat, MssqlConn, OracleConn, Pipeline,
+    SnowflakeAuth, SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
 };
 
 use super::canvas_item::ElPipelineCanvas;
@@ -34,6 +34,7 @@ pub enum ConnType {
     Postgres,
     Mysql,
     Oracle,
+    Mssql,
     Duckdb,
     Snowflake,
     Local,
@@ -45,6 +46,7 @@ impl ConnType {
         ConnType::Postgres,
         ConnType::Mysql,
         ConnType::Oracle,
+        ConnType::Mssql,
         ConnType::Snowflake,
         ConnType::Local,
     ];
@@ -54,6 +56,7 @@ impl ConnType {
             ConnType::Postgres => "postgres",
             ConnType::Mysql => "mysql",
             ConnType::Oracle => "oracle",
+            ConnType::Mssql => "sql server",
             ConnType::Duckdb => "duckdb",
             ConnType::Snowflake => "snowflake",
             ConnType::Local => "local files",
@@ -228,6 +231,17 @@ impl BuilderForm {
                     window,
                     cx,
                 ),
+                field(
+                    "Host",
+                    "sql.example.com",
+                    Some("Port 1433 unless the connection says otherwise."),
+                    "",
+                    window,
+                    cx,
+                ),
+                field("Database", "Sales", None, "", window, cx),
+                field("User", "${MSSQL_USER}", None, "", window, cx),
+                field("Password", "${MSSQL_PASSWORD}", secret_hint, "", window, cx),
             ],
             BuilderKind::Target => {
                 let target = pipeline.map(|pipeline| &pipeline.target);
@@ -342,7 +356,8 @@ impl BuilderForm {
                         ConnType::Postgres | ConnType::Mysql | ConnType::Duckdb
                     ),
                     2..=4 => self.conn_type == ConnType::Snowflake,
-                    _ => self.conn_type == ConnType::Oracle,
+                    5..=7 => self.conn_type == ConnType::Oracle,
+                    _ => self.conn_type == ConnType::Mssql,
                 },
             })
             .map(|(_, field)| field)
@@ -685,6 +700,36 @@ impl BuilderForm {
                             extra: Default::default(),
                         })
                     }
+                    ConnType::Mssql => {
+                        let host = self.text(8, cx);
+                        let database = self.text(9, cx);
+                        let user = self.text(10, cx);
+                        let password = self.text(11, cx);
+                        if host.is_empty()
+                            || database.is_empty()
+                            || user.is_empty()
+                            || password.is_empty()
+                        {
+                            bail!("sql server needs host, database, user and password");
+                        }
+                        if !password.starts_with("${") {
+                            bail!(
+                                "store the password in the environment and reference it \
+                                 like ${{MSSQL_PASSWORD}} — never a literal in YAML"
+                            );
+                        }
+                        Connection::Mssql(MssqlConn {
+                            host,
+                            port: None,
+                            database,
+                            user,
+                            password,
+                            encrypt: None,
+                            trust_server_certificate: None,
+                            workspace: None,
+                            extra: Default::default(),
+                        })
+                    }
                     ConnType::Local => Connection::Local {
                         extra: Default::default(),
                     },
@@ -816,9 +861,7 @@ impl BuilderForm {
                 let chips = self
                     .connection_names
                     .iter()
-                    .filter(|(_, kind)| {
-                        !target_kinds || matches!(kind.as_ref(), "snowflake" | "duckdb" | "oracle")
-                    })
+                    .filter(|(_, kind)| !target_kinds || super::loadable(kind.as_ref()))
                     .map(|(name, kind)| {
                         let pick = name.clone();
                         dialog::chip(

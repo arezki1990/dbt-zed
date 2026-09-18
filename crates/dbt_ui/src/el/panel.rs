@@ -1698,7 +1698,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         let target = self
             .connections
             .iter()
-            .find(|(_, kind, _)| matches!(kind.as_ref(), "duckdb" | "snowflake" | "oracle"))
+            .find(|(_, kind, _)| super::loadable(kind.as_ref()))
             .map(|(name, _, _)| name.to_string())
             .unwrap_or_else(|| "warehouse".to_owned());
         let starter = format!(

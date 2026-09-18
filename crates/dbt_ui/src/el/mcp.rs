@@ -474,6 +474,12 @@ fn columns_sql(kind: &str, schema: &str, table: &str) -> Result<String> {
                 literal(schema)
             )
         }
+        "mssql" => format!(
+            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{table_literal}' \
+             ORDER BY ORDINAL_POSITION",
+            literal(schema)
+        ),
         other => bail!("{other} connections have no catalog to read"),
     })
 }

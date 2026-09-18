@@ -2490,11 +2490,16 @@ fn tip_cell(
 /// Snowflake schema arrives as DATABASE.SCHEMA, each part its own
 /// identifier, and a table with no schema is read by its bare name.
 fn select_sql(kind: &str, schema: Option<&str>, table: &str) -> String {
-    let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
-    let cap = if kind == "oracle" {
-        "WHERE ROWNUM <= 200"
-    } else {
-        "LIMIT 200"
+    let quote = |ident: &str| match kind {
+        // SQL Server brackets its identifiers; a double quote only works
+        // there when QUOTED_IDENTIFIER is on, which is not ours to assume.
+        "mssql" => format!("[{}]", ident.replace(']', "]]")),
+        _ => format!("\"{}\"", ident.replace('"', "\"\"")),
+    };
+    let (head, cap) = match kind {
+        "oracle" => ("SELECT *", "WHERE ROWNUM <= 200"),
+        "mssql" => ("SELECT TOP 200 *", ""),
+        _ => ("SELECT *", "LIMIT 200"),
     };
     let qualified = match schema.filter(|schema| !schema.is_empty()) {
         None => quote(table),
@@ -2508,7 +2513,9 @@ fn select_sql(kind: &str, schema: Option<&str>, table: &str) -> String {
             format!("{schema}.{}", quote(table))
         }
     };
-    format!("SELECT * FROM {qualified} {cap}")
+    format!("{head} FROM {qualified} {cap}")
+        .trim_end()
+        .to_owned()
 }
 
 /// A new table starts at its top-left corner.
@@ -3126,6 +3133,16 @@ mod tests {
         assert_eq!(
             select_sql("postgres", Some("odd.schema"), "t"),
             "SELECT * FROM \"odd.schema\".\"t\" LIMIT 200"
+        );
+        // SQL Server has no LIMIT, brackets its identifiers, and caps a
+        // result before the select list.
+        assert_eq!(
+            select_sql("mssql", Some("sales"), "orders"),
+            "SELECT TOP 200 * FROM [sales].[orders]"
+        );
+        assert_eq!(
+            select_sql("mssql", None, "we]ird"),
+            "SELECT TOP 200 * FROM [we]]ird]"
         );
         // A DuckDB table needs no schema, and a quote in a name is doubled.
         assert_eq!(
