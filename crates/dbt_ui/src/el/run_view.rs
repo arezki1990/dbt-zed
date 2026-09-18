@@ -20,6 +20,8 @@ pub struct StreamRow {
     pub phase: Option<Phase>,
     pub rows_read: u64,
     pub rows_written: u64,
+    /// What the source said it holds, when it could say cheaply.
+    pub estimated_rows: Option<u64>,
     pub cast_failures: u64,
     /// Which columns failed, with samples — arrives with StreamFinished.
     pub column_failures: Vec<el_engine::ColumnFailures>,
@@ -330,13 +332,21 @@ impl ElRunView {
         let Some(run) = &mut self.run else { return };
         match event {
             ProgressEvent::RunStarted { .. } => {}
-            ProgressEvent::StreamStarted { stream } => {
+            ProgressEvent::StreamStarted {
+                stream,
+                estimated_rows,
+            } => {
                 if let Some(row) = run
                     .streams
                     .iter_mut()
                     .find(|row| row.stream.as_ref() == stream)
                 {
                     row.phase = Some(Phase::Connect);
+                    // Sent again once the source answers; the first one
+                    // has nothing to say and must not erase the second.
+                    if estimated_rows.is_some() {
+                        row.estimated_rows = estimated_rows;
+                    }
                 }
             }
             ProgressEvent::Chunk {

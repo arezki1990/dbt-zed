@@ -97,6 +97,10 @@ pub struct ElRunsPanel {
     remote_runs_scroll: ScrollHandle,
     remote_logs_scroll: ScrollHandle,
     remote_streams_scroll: ScrollHandle,
+    /// (run, stream) → recent (when, rows written) samples. The rate a
+    /// run shows is measured over the last minute of them: an average
+    /// since the start would keep looking healthy through a stall.
+    rate_samples: HashMap<(u64, String), std::collections::VecDeque<(Instant, u64)>>,
     /// Pipelines whose streams are unfolded in the list, so one table can
     /// be launched without leaving it.
     remote_expanded: HashSet<String>,
@@ -463,6 +467,9 @@ pub(crate) struct StreamAgg {
     pub(crate) phase: Option<String>,
     pub(crate) read: u64,
     pub(crate) written: u64,
+    /// What the source said it holds, when it could say cheaply. The
+    /// denominator of the progress bar; None leaves the bar off.
+    pub(crate) estimated: Option<u64>,
     pub(crate) casts: u64,
     pub(crate) failures: Vec<el_engine::ColumnFailures>,
     pub(crate) error: Option<String>,
@@ -487,8 +494,17 @@ pub(crate) fn fold_stream_events(
                     }
                 }
             }
-            E::StreamStarted { stream } => {
-                agg.entry(stream.clone()).or_default().phase = Some("connect".to_owned());
+            E::StreamStarted {
+                stream,
+                estimated_rows,
+            } => {
+                let entry = agg.entry(stream.clone()).or_default();
+                entry.phase = Some("connect".to_owned());
+                // Sent again once the source answers; the first one has
+                // nothing to say and must not erase the second.
+                if estimated_rows.is_some() {
+                    entry.estimated = *estimated_rows;
+                }
             }
             E::Chunk {
                 stream,
@@ -616,6 +632,7 @@ impl ElRunsPanel {
                 remote_runs_scroll: ScrollHandle::new(),
                 remote_logs_scroll: ScrollHandle::new(),
                 remote_streams_scroll: ScrollHandle::new(),
+                rate_samples: HashMap::new(),
                 remote_expanded: HashSet::new(),
                 remote_stream_picks: HashSet::new(),
                 remote_log_height: 170.,
@@ -1186,6 +1203,38 @@ impl ElRunsPanel {
             },
             cx,
         );
+    }
+
+    /// Records where a stream is now and answers how fast it is going,
+    /// in rows per minute, measured across the last minute of samples.
+    /// None until there are two far enough apart to divide by.
+    fn sample_rate(&mut self, run_id: u64, stream: &str, rows: u64, done: bool) -> Option<f64> {
+        const WINDOW: Duration = Duration::from_secs(60);
+        let samples = self
+            .rate_samples
+            .entry((run_id, stream.to_owned()))
+            .or_default();
+        let now = Instant::now();
+        // A finished stream keeps whatever it was doing when it ended;
+        // sampling it again would only dilute the rate towards zero.
+        if !done {
+            match samples.back() {
+                Some((_, last)) if *last == rows => {}
+                _ => samples.push_back((now, rows)),
+            }
+        }
+        while samples.len() > 2
+            && samples
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > WINDOW)
+        {
+            samples.pop_front();
+        }
+        let (first_at, first_rows) = *samples.front()?;
+        let (last_at, last_rows) = *samples.back()?;
+        let elapsed = last_at.duration_since(first_at).as_secs_f64();
+        (elapsed >= 2. && last_rows > first_rows)
+            .then(|| (last_rows - first_rows) as f64 / elapsed * 60.)
     }
 
     /// Launches a run on the selected remote: the whole pipeline when
@@ -2505,7 +2554,14 @@ impl ElRunsPanel {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
-        let run = self.remote_runs.iter().find(|run| run.id == run_id);
+        // Cloned: measuring the rate below wants `self` mutably, and one
+        // run's facts are a handful of fields.
+        let run_snapshot = self
+            .remote_runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .cloned();
+        let run = run_snapshot.as_ref();
         let is_running = run.is_some_and(|run| run.status == "running");
         let status = run
             .map(|run| run.status.clone())
@@ -2515,23 +2571,6 @@ impl ElRunsPanel {
             "failed" => Color::Error,
             "cancelled" => Color::Warning,
             _ => Color::Accent,
-        };
-        let facts: SharedString = match run {
-            None => "no longer in the server's history".into(),
-            Some(run) => {
-                let mut text = format!(
-                    "started {} · {}",
-                    relative_time(run.started_unix, false),
-                    duration_text(run.started_unix, run.finished_unix)
-                );
-                if !is_running {
-                    text.push_str(&format!(" · {} rows", run.rows_written));
-                }
-                if run.attempt > 0 {
-                    text.push_str(&format!(" · retry {}", run.attempt));
-                }
-                text.into()
-            }
         };
         // Fold the event log into per-stream rows.
         let (order, agg) = fold_stream_events(self.run_events(run_id));
@@ -2549,7 +2588,32 @@ impl ElRunsPanel {
             .iter()
             .all(|stream| agg.get(stream).is_some_and(|entry| entry.error.is_some()));
         let pipeline_name = run.map(|run| run.pipeline.clone()).unwrap_or_default();
+        // The run's own rate, measured the same way as each stream's, so
+        // the header says how fast this is going and not merely how long
+        // it has been going.
+        let moved: u64 = agg.values().map(|entry| entry.written).sum();
+        let run_rate = self.sample_rate(run_id, "", moved, !is_running);
 
+        let facts: SharedString = match run {
+            None => "no longer in the server's history".into(),
+            Some(run) => {
+                let mut text = format!(
+                    "started {} · {}",
+                    relative_time(run.started_unix, false),
+                    duration_text(run.started_unix, run.finished_unix)
+                );
+                if !is_running {
+                    text.push_str(&format!(" · {} rows", run.rows_written));
+                }
+                if run.attempt > 0 {
+                    text.push_str(&format!(" · retry {}", run.attempt));
+                }
+                if let Some(rate) = run_rate {
+                    text.push_str(&format!(" · {}", rate_text(rate)));
+                }
+                text.into()
+            }
+        };
         let header = h_flex()
             .w_full()
             .px_1()
@@ -2673,10 +2737,12 @@ impl ElRunsPanel {
             .px_2()
             .gap_2()
             .child(head(150., "stream"))
-            .child(head(80., "phase"))
-            .child(head(90., "rows read"))
-            .child(head(90., "rows written"))
-            .child(head(80., "cast fails"))
+            .child(head(70., "phase"))
+            .child(head(140., "progress"))
+            .child(head(100., "rows read"))
+            .child(head(100., "rows written"))
+            .child(head(80., "rows/min"))
+            .child(head(70., "cast fails"))
             .child(
                 Label::new("status")
                     .size(LabelSize::XSmall)
@@ -2724,10 +2790,64 @@ impl ElRunsPanel {
                 .unwrap_or((None, 0, 0, 0, Vec::new(), None, false));
             // The count is a badge that opens the failing columns; an
             // older daemon sends the count alone, which stays a plain cell.
+            let estimated = entry.and_then(|entry| entry.estimated);
+            // Measured, not averaged since the start: a stall shows up.
+            let rate = self.sample_rate(run_id, stream, written, done);
+            let progress_cell: gpui::AnyElement = match estimated {
+                Some(total) if total > 0 => {
+                    let fraction = (read as f64 / total as f64).clamp(0., 1.);
+                    let eta = (!done)
+                        .then(|| rate.and_then(|rate| eta_text(total.saturating_sub(read), rate)))
+                        .flatten();
+                    let tip = format!(
+                        "{} of about {} rows{}",
+                        super::thousands(read as usize),
+                        super::thousands(total as usize),
+                        eta.map(|eta| format!(" · {eta}")).unwrap_or_default()
+                    );
+                    div()
+                        .id(cell_id("progress"))
+                        .w(px(140.))
+                        .flex_shrink_0()
+                        .tooltip(ui::Tooltip::text(tip))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(84.))
+                                        .h(px(6.))
+                                        .rounded_sm()
+                                        .bg(colors.element_background)
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(gpui::relative(fraction as f32))
+                                                .rounded_sm()
+                                                .bg(if done {
+                                                    colors.text_accent
+                                                } else {
+                                                    colors.text_accent.opacity(0.8)
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    Label::new(format!("{:.0}%", fraction * 100.))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                // A source that cannot say how much it holds gets no bar
+                // rather than a made-up one.
+                _ => cell(140., "—".to_owned(), Color::Muted).into_any_element(),
+            };
             let casts_cell: gpui::AnyElement = if casts > 0 && !failures.is_empty() {
                 let stream_name = stream.clone();
                 div()
-                    .w(px(80.))
+                    .w(px(70.))
                     .flex_shrink_0()
                     .child(
                         Button::new(("el-remote-casts", ix), casts.to_string())
@@ -2754,7 +2874,7 @@ impl ElRunsPanel {
                 };
                 div()
                     .id(("el-remote-casts-count", ix))
-                    .w(px(80.))
+                    .w(px(70.))
                     .flex_shrink_0()
                     .overflow_hidden()
                     .tooltip(ui::Tooltip::text(why))
@@ -2766,7 +2886,7 @@ impl ElRunsPanel {
                     )
                     .into_any_element()
             } else {
-                cell(80., casts.to_string(), Color::Muted).into_any_element()
+                cell(70., casts.to_string(), Color::Muted).into_any_element()
             };
             let (status_text, status_color) = match (&error, done, &phase) {
                 (Some(error), _, _) => (error.clone(), Color::Error),
@@ -2789,9 +2909,23 @@ impl ElRunsPanel {
                         stream.clone(),
                         Color::Default,
                     ))
-                    .child(cell(80., phase.unwrap_or_else(|| "—".into()), Color::Muted))
-                    .child(cell(90., read.to_string(), Color::Muted))
-                    .child(cell(90., written.to_string(), Color::Default))
+                    .child(cell(70., phase.unwrap_or_else(|| "—".into()), Color::Muted))
+                    .child(progress_cell)
+                    .child(cell(100., super::thousands(read as usize), Color::Muted))
+                    .child(cell(
+                        100.,
+                        super::thousands(written as usize),
+                        Color::Default,
+                    ))
+                    .child(cell(
+                        80.,
+                        rate.map(rate_text).unwrap_or_else(|| "—".to_owned()),
+                        if rate.is_some() {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        },
+                    ))
                     .child(casts_cell)
                     .child(
                         h_flex()
@@ -3140,6 +3274,33 @@ fn one_line(value: &str) -> SharedString {
 }
 
 /// [`tip_text`] at a fixed column width.
+/// Rows per minute as text, in the unit that reads best at that size.
+fn rate_text(rows_per_minute: f64) -> String {
+    if rows_per_minute >= 1_000_000. {
+        format!("{:.1}M/min", rows_per_minute / 1_000_000.)
+    } else if rows_per_minute >= 1_000. {
+        format!("{:.0}k/min", rows_per_minute / 1_000.)
+    } else {
+        format!("{rows_per_minute:.0}/min")
+    }
+}
+
+/// How long `rows` more take at `rows_per_minute`, as text. None when
+/// nothing is moving — a countdown from a stalled rate is a lie.
+fn eta_text(remaining: u64, rows_per_minute: f64) -> Option<String> {
+    if rows_per_minute <= 0. {
+        return None;
+    }
+    let minutes = remaining as f64 / rows_per_minute;
+    Some(if minutes >= 90. {
+        format!("{:.1} h left", minutes / 60.)
+    } else if minutes >= 1.5 {
+        format!("{minutes:.0} min left")
+    } else {
+        format!("{:.0} s left", minutes * 60.)
+    })
+}
+
 /// A daemon log line as the daemon writes it: "HH:MM:SS  what it did".
 /// Anything else is left whole rather than guessed at.
 fn split_log_line(line: &str) -> (&str, &str) {
@@ -3814,9 +3975,9 @@ mod tests {
     use gpui::SharedString;
 
     use super::{
-        Color, ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, fit_widths,
-        log_color, merge_log_tail, merge_run, one_line, place_run_event, select_sql, sorted_rows,
-        split_log_line, tooltip_text,
+        Color, ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, eta_text,
+        fit_widths, log_color, merge_log_tail, merge_run, one_line, place_run_event, rate_text,
+        select_sql, sorted_rows, split_log_line, tooltip_text,
     };
 
     #[test]
@@ -3958,6 +4119,7 @@ mod tests {
     fn stream(name: &str) -> el_engine::ProgressEvent {
         el_engine::ProgressEvent::StreamStarted {
             stream: name.to_owned(),
+            estimated_rows: None,
         }
     }
 
@@ -3990,7 +4152,7 @@ mod tests {
         assert_eq!(events[&1].len(), 2);
         assert!(matches!(
             events[&1][1],
-            el_engine::ProgressEvent::StreamStarted { ref stream } if stream == "orders"
+            el_engine::ProgressEvent::StreamStarted { ref stream, .. } if stream == "orders"
         ));
 
         // A gap cannot be folded into honest rows, so the list goes and
@@ -4062,6 +4224,26 @@ mod tests {
 
     /// The log pane reads the daemon's own format, and leaves anything
     /// else alone rather than cutting it at the first double space.
+    /// What the run header and the rows/min column print.
+    #[test]
+    fn a_rate_reads_in_the_unit_that_suits_its_size() {
+        assert_eq!(rate_text(0.), "0/min");
+        assert_eq!(rate_text(940.), "940/min");
+        assert_eq!(rate_text(15_400.), "15k/min");
+        assert_eq!(rate_text(928_000.), "928k/min");
+        assert_eq!(rate_text(2_500_000.), "2.5M/min");
+    }
+
+    /// A countdown is only shown when something is actually moving.
+    #[test]
+    fn an_eta_needs_a_rate_to_count_down_from() {
+        assert_eq!(eta_text(1_000, 0.), None);
+        assert_eq!(eta_text(1_000, -1.), None);
+        assert_eq!(eta_text(30_000, 60_000.), Some("30 s left".to_owned()));
+        assert_eq!(eta_text(600_000, 60_000.), Some("10 min left".to_owned()));
+        assert_eq!(eta_text(60_000_000, 600_000.), Some("1.7 h left".to_owned()));
+    }
+
     #[test]
     fn a_log_line_splits_into_its_time_and_what_happened() {
         assert_eq!(

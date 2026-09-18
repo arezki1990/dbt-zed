@@ -23,7 +23,6 @@ pub use canvas_item::ElPipelineCanvas;
 pub use panel::ElPanel;
 pub use runs_panel::ElRunsPanel;
 
-use anyhow::Context as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -151,6 +150,21 @@ fn local_connection(
     Ok((connection, el_engine::env::EnvMap::load(project_root, None)))
 }
 
+/// What a remote worker's failure reads as. A daemon that does not know
+/// the connection is not broken — it has never been sent this project's
+/// connections, and the Remote tab is where that is done. Saying so beats
+/// a bare 404.
+fn on_remote(remote: &str, error: anyhow::Error) -> anyhow::Error {
+    let text = format!("{error:#}");
+    if text.contains("is not defined on this server") {
+        return anyhow::anyhow!(
+            "on remote {remote}: {text} — send this project's connections to it first \
+             (Remote tab → Send connections)"
+        );
+    }
+    error.context(format!("on remote {remote}"))
+}
+
 /// Lists a connection's tables on the checkout's database worker.
 /// Blocking — call from a background thread.
 pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -162,7 +176,7 @@ pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<
         DbWorker::Remote(remote) => {
             el_engine::server::RemoteClient::connect(project_root, &remote)?
                 .explore_tables(connection)
-                .with_context(|| format!("on remote {remote}"))
+                .map_err(|error| on_remote(&remote, error))
         }
     }
 }
@@ -236,7 +250,7 @@ pub fn run_query(
         DbWorker::Remote(remote) => {
             el_engine::server::RemoteClient::connect(project_root, &remote)?
                 .explore_query(connection, sql, limit)
-                .with_context(|| format!("on remote {remote}"))
+                .map_err(|error| on_remote(&remote, error))
         }
     }
 }
@@ -258,7 +272,7 @@ pub fn preview_stream(
         DbWorker::Remote(remote) => {
             el_engine::server::RemoteClient::connect(project_root, &remote)?
                 .explore_preview(&el_engine::spec::to_canonical_yaml(pipeline), stream, limit)
-                .with_context(|| format!("on remote {remote}"))
+                .map_err(|error| on_remote(&remote, error))
         }
     }
 }
