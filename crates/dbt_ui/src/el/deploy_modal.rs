@@ -219,6 +219,8 @@ impl ElDeployModal {
                     Ok(bundle) => this.connections = Some(Arc::new(bundle)),
                     Err(error) => this.connections_error = Some(format!("{error:#}").into()),
                 }
+                // The profiles on offer may have just changed under it.
+                this.settle_profile();
                 cx.notify();
             })
             .ok();
@@ -272,10 +274,17 @@ impl ElDeployModal {
                             .get("tracks_checkout")
                             .and_then(|flag| flag.as_bool())
                             .unwrap_or(false);
-                        // Preselect the server's own profile when declared.
-                        this.selected_profile = active
-                            .clone()
-                            .filter(|name| profiles.iter().any(|p| p == name));
+                        // A deploy that carries connections leaves the
+                        // pin empty: "the server's own" then names the
+                        // environment and keeps naming it if the server's
+                        // choice moves. Otherwise pin what it runs today.
+                        this.selected_profile = if this.send_connections {
+                            None
+                        } else {
+                            active
+                                .clone()
+                                .filter(|name| profiles.iter().any(|p| p == name))
+                        };
                         RemoteFacts::Loaded {
                             profiles,
                             active,
@@ -291,6 +300,41 @@ impl ElDeployModal {
             })
             .ok();
         });
+    }
+
+    /// Which profiles this deploy can pin, and which one the server falls
+    /// back to for a pipeline that pins none.
+    ///
+    /// When the deploy carries connections, that is the file the server
+    /// will be running — so its profiles are the ones to offer, not the
+    /// ones the server declares this second. Otherwise the server's own.
+    fn profile_choices(&self) -> (Vec<String>, Option<String>, bool) {
+        if self.send_connections {
+            if let Some(bundle) = &self.connections {
+                return (
+                    bundle.profiles.clone(),
+                    bundle.default_profile.clone(),
+                    true,
+                );
+            }
+        }
+        match &self.facts {
+            RemoteFacts::Loaded {
+                profiles, active, ..
+            } => (profiles.clone(), active.clone(), false),
+            _ => (Vec::new(), None, false),
+        }
+    }
+
+    /// Keeps the pinned profile honest when the choice of source moves —
+    /// a name the server will not have must not stay selected.
+    fn settle_profile(&mut self) {
+        let (profiles, _, _) = self.profile_choices();
+        if let Some(selected) = &self.selected_profile {
+            if !profiles.iter().any(|profile| profile == selected) {
+                self.selected_profile = None;
+            }
+        }
     }
 
     fn can_send(&self) -> bool {
@@ -499,6 +543,7 @@ impl ElDeployModal {
                 .disabled(self.deploying)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.send_connections = true;
+                    this.settle_profile();
                     cx.notify();
                 })),
             dialog::chip(
@@ -509,6 +554,7 @@ impl ElDeployModal {
             .disabled(self.deploying)
             .on_click(cx.listener(|this, _, _, cx| {
                 this.send_connections = false;
+                this.settle_profile();
                 cx.notify();
             })),
         ]);
@@ -606,9 +652,12 @@ impl ElDeployModal {
         };
         let pf =
             el_engine::server::deploy_preflight(local, pipelines, self.selected_profile.as_deref());
-        let profile_text = match &self.selected_profile {
-            Some(profile) => format!("profile {profile}"),
-            None => "the server default profile".to_owned(),
+        let profile_text = match (&self.selected_profile, self.profile_choices().1) {
+            (Some(profile), _) => format!("profile {profile}"),
+            // Unpinned follows the server's own choice — which is worth
+            // naming, since it is what the run will actually use.
+            (None, Some(fallback)) => format!("{remote}'s own profile ({fallback})"),
+            (None, None) => format!("{remote}'s base connections"),
         };
         match &pf.replacing {
             None => {
@@ -784,17 +833,19 @@ impl Render for ElDeployModal {
                         })),
                 )
                 .into_any_element(),
-            RemoteFacts::Loaded {
-                profiles, active, ..
-            } => {
-                let server_default_label: SharedString = match active {
-                    Some(active) => format!("server default ({active})").into(),
-                    None => "server default".into(),
+            RemoteFacts::Loaded { .. } => {
+                let (profiles, fallback, from_local) = self.profile_choices();
+                // A pipeline that pins nothing runs under the server's own
+                // choice, so the chip says which one that is rather than
+                // leaving it to be discovered in a run.
+                let unpinned_label: SharedString = match &fallback {
+                    Some(fallback) => format!("server's own ({fallback})").into(),
+                    None => "server's own".into(),
                 };
                 let mut chips = vec![
                     dialog::chip(
                         "el-deploy-profile-default",
-                        server_default_label,
+                        unpinned_label,
                         self.selected_profile.is_none(),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -817,18 +868,35 @@ impl Render for ElDeployModal {
                         })),
                     );
                 }
-                let control = v_flex().w_full().gap_1().child(dialog::chips(chips));
-                dialog::labeled(
-                    "Profile",
-                    if profiles.is_empty() {
-                        control.child(dialog::notice(
-                            Severity::Info,
-                            "This server declares no profiles — it runs its base connections.",
-                        ))
-                    } else {
-                        control
+                let mut control = v_flex().w_full().gap_1().child(dialog::chips(chips));
+                control = control.child(dialog::notice(
+                    Severity::Info,
+                    match (profiles.is_empty(), from_local) {
+                        // The list comes from the file this deploy sends,
+                        // which is what the server will be running — not
+                        // from what it declares this second.
+                        (false, true) => format!(
+                            "{} — the environments in the connections this deploy sends. \
+                             A pipeline pinned to one runs under it; pinned to none, it \
+                             follows {remote}'s own choice.",
+                            profiles.join(", ")
+                        ),
+                        (false, false) => format!(
+                            "{} — the environments {remote} declares today.",
+                            profiles.join(", ")
+                        ),
+                        (true, true) => {
+                            "The connections this deploy sends declare no environments — \
+                             the pipeline runs against their base connections."
+                                .to_owned()
+                        }
+                        (true, false) => format!(
+                            "{remote} declares no environments — the pipeline runs against \
+                             its base connections."
+                        ),
                     },
-                )
+                ));
+                dialog::labeled("Profile", control)
             }
         });
 
