@@ -396,11 +396,22 @@ impl ElDeployModal {
                         .clone()
                         .unwrap_or_else(|| "the server's profile".to_owned());
                     let credentials = match sent {
-                        Some((connections, variables)) => format!(
-                            " Sent {connections} connection{} and {variables} variable{}, sealed.",
-                            if connections == 1 { "" } else { "s" },
-                            if variables == 1 { "" } else { "s" },
-                        ),
+                        Some((connections, variables, files)) => {
+                            let carried = if files > 0 {
+                                format!(
+                                    " and {files} credential file{}",
+                                    if files == 1 { "" } else { "s" }
+                                )
+                            } else {
+                                String::new()
+                            };
+                            format!(
+                                " Sent {connections} connection{}, {variables} variable{}{carried}, \
+                                 sealed.",
+                                if connections == 1 { "" } else { "s" },
+                                if variables == 1 { "" } else { "s" },
+                            )
+                        }
                         None => String::new(),
                     };
                     workspace
@@ -518,12 +529,24 @@ impl ElDeployModal {
             }
             if !bundle.file_valued.is_empty() {
                 control = control.child(dialog::notice(
-                    Severity::Warning,
+                    Severity::Info,
                     format!(
-                        "{} name{} a file on this machine — the path travels, the file does \
-                         not. It has to be on {remote} already.",
+                        "{} name{} a file here — a key pair or a wallet. The file travels \
+                         sealed too, and {remote} keeps its own copy, readable only by the \
+                         daemon.",
                         bundle.file_valued.join(", "),
                         if bundle.file_valued.len() == 1 { "s" } else { "" },
+                    ),
+                ));
+            }
+            if !bundle.too_large.is_empty() {
+                control = control.child(dialog::notice(
+                    Severity::Warning,
+                    format!(
+                        "{} name{} a file too large to send — it has to be on {remote} \
+                         already, at the path this variable holds.",
+                        bundle.too_large.join(", "),
+                        if bundle.too_large.len() == 1 { "s" } else { "" },
                     ),
                 ));
             }
