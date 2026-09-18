@@ -3,7 +3,7 @@
 //! any EL connection, through the on-demand worker). Mapping-editor
 //! previews overlay either view and return with Back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -70,7 +70,7 @@ pub struct ElRunsPanel {
     remote_status: Option<RemoteStatus>,
     remote_logs: Vec<SharedString>,
     /// Logs live in a read-only editor so they can be selected/copied.
-    remote_log_editor: Entity<Editor>,
+    /// New lines have arrived and the pane has not yet followed them.
     remote_logs_dirty: bool,
     remote_log_next: u64,
     remote_show_logs: bool,
@@ -95,6 +95,19 @@ pub struct ElRunsPanel {
     remote_history_for: Option<u64>,
     remote_pipelines_scroll: ScrollHandle,
     remote_runs_scroll: ScrollHandle,
+    remote_logs_scroll: ScrollHandle,
+    remote_streams_scroll: ScrollHandle,
+    /// Pipelines whose streams are unfolded in the list, so one table can
+    /// be launched without leaving it.
+    remote_expanded: HashSet<String>,
+    /// Streams ticked on a pipeline's page — what "Run selected" sends.
+    remote_stream_picks: HashSet<String>,
+    /// Log pane: its height (draggable), whether it sticks to the newest
+    /// line, and whether it hides everything that isn't a problem.
+    remote_log_height: f32,
+    remote_log_drag: Option<(f32, f32)>,
+    remote_logs_follow: bool,
+    remote_logs_problems_only: bool,
     run_streams_scroll: ScrollHandle,
     run_error_scroll: ScrollHandle,
     /// Height of the SQL editor in the Query tab; its splitter drags it.
@@ -539,11 +552,6 @@ impl ElRunsPanel {
             editor.set_show_gutter(false, cx);
             editor
         });
-        let remote_log_editor = cx.new(|cx| {
-            let mut editor = Editor::multi_line(window, cx);
-            editor.set_read_only(true);
-            editor
-        });
         // Give the query editor SQL syntax highlighting.
         {
             let sql = sql.clone();
@@ -595,7 +603,6 @@ impl ElRunsPanel {
                 remote_action_error: None,
                 remote_status: None,
                 remote_logs: Vec::new(),
-                remote_log_editor,
                 remote_logs_dirty: false,
                 remote_log_next: 0,
                 remote_show_logs: false,
@@ -607,6 +614,14 @@ impl ElRunsPanel {
                 remote_history_for: None,
                 remote_pipelines_scroll: ScrollHandle::new(),
                 remote_runs_scroll: ScrollHandle::new(),
+                remote_logs_scroll: ScrollHandle::new(),
+                remote_streams_scroll: ScrollHandle::new(),
+                remote_expanded: HashSet::new(),
+                remote_stream_picks: HashSet::new(),
+                remote_log_height: 170.,
+                remote_log_drag: None,
+                remote_logs_follow: true,
+                remote_logs_problems_only: false,
                 run_streams_scroll: ScrollHandle::new(),
                 run_error_scroll: ScrollHandle::new(),
                 query_split: 110.,
@@ -1150,6 +1165,141 @@ impl ElRunsPanel {
         });
     }
 
+    /// Launches a run on the selected remote: the whole pipeline when
+    /// `streams` is empty, or exactly the streams named.
+    fn run_remote(&mut self, pipeline: String, streams: Vec<String>, cx: &mut Context<Self>) {
+        self.remote_action(
+            move |client| client.start_run(&pipeline, &streams).map(|_| ()),
+            cx,
+        );
+    }
+
+    /// One stream of a deployed pipeline: what it reads, where it lands,
+    /// how it loads — and a Run that launches that stream by itself. The
+    /// tick box appears on a pipeline's own page, where several streams
+    /// can go in one run.
+    fn render_stream_row(
+        &self,
+        scope: &'static str,
+        pipeline: &str,
+        stream: &el_engine::server::RemoteStream,
+        ix: usize,
+        pickable: bool,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let id = |part: &str| {
+            SharedString::from(format!("{scope}-{pipeline}-{}-{part}", stream.name))
+        };
+        let incremental = stream.mode == "incremental";
+        let picked = self.remote_stream_picks.contains(&stream.name);
+        let pick_name = stream.name.clone();
+        let run_name = stream.name.clone();
+        let run_pipeline = pipeline.to_owned();
+        h_flex()
+            .id(id("row"))
+            .w_full()
+            .h(px(24.))
+            .pl(px(if pickable { 6. } else { 24. }))
+            .pr_1()
+            .gap_2()
+            .items_center()
+            .rounded_sm()
+            .when(ix % 2 == 1, |row| row.bg(colors.element_background))
+            .hover(|style| style.bg(colors.element_hover))
+            .when(pickable, |row| {
+                row.child(
+                    ui::Checkbox::new(id("pick"), picked.into()).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if !this.remote_stream_picks.remove(&pick_name) {
+                                this.remote_stream_picks.insert(pick_name.clone());
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+            })
+            .child(tip_cell(
+                id("name"),
+                150.,
+                stream.name.clone(),
+                Color::Default,
+            ))
+            .child(tip_cell(
+                id("source"),
+                170.,
+                stream.source.clone(),
+                Color::Muted,
+            ))
+            .child(
+                Icon::new(IconName::ArrowRight)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(tip_cell(
+                id("table"),
+                170.,
+                stream.table.clone(),
+                Color::Default,
+            ))
+            .child(tip_cell(
+                id("mode"),
+                90.,
+                if incremental {
+                    "incremental".to_owned()
+                } else {
+                    "full refresh".to_owned()
+                },
+                if incremental {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                },
+            ))
+            .child(div().flex_1())
+            .child(
+                Button::new(id("run"), "Run")
+                    .label_size(LabelSize::XSmall)
+                    .start_icon(Icon::new(IconName::PlayOutlined).size(IconSize::XSmall))
+                    .disabled(running)
+                    .tooltip(ui::Tooltip::text(if running {
+                        format!("{run_pipeline} is already running")
+                    } else {
+                        format!("Run {run_name} on its own")
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.run_remote(run_pipeline.clone(), vec![run_name.clone()], cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The column names over a stream table, aligned with its rows.
+    fn stream_header(&self, pickable: bool) -> gpui::AnyElement {
+        let head = |width: f32, text: &'static str| {
+            div().w(px(width)).flex_shrink_0().child(
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent),
+            )
+        };
+        h_flex()
+            .w_full()
+            .pl(px(if pickable { 6. } else { 24. }))
+            .pr_1()
+            .gap_2()
+            .items_center()
+            .when(pickable, |row| row.child(div().w(px(16.)).flex_shrink_0()))
+            .child(head(150., "stream"))
+            .child(head(170., "reads"))
+            .child(div().w(px(12.)).flex_shrink_0())
+            .child(head(170., "lands on"))
+            .child(head(90., "mode"))
+            .into_any_element()
+    }
+
     /// Fire-and-refresh action against the selected remote.
     fn remote_action(
         &mut self,
@@ -1426,21 +1576,11 @@ impl ElRunsPanel {
 
 impl ElRunsPanel {
     fn render_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().colors().clone();
-        if self.remote_logs_dirty {
+        // Newest-last: following means the pane shows what just happened
+        // rather than where the reader last scrolled.
+        if self.remote_logs_dirty && self.remote_show_logs && self.remote_logs_follow {
             self.remote_logs_dirty = false;
-            let text = self
-                .remote_logs
-                .iter()
-                .map(|line| line.as_ref())
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.remote_log_editor.update(cx, |editor, cx| {
-                editor.set_read_only(false);
-                editor.set_text(text, window, cx);
-                editor.set_read_only(true);
-                editor.move_to_end(&Default::default(), window, cx);
-            });
+            self.remote_logs_scroll.scroll_to_bottom();
         }
         let chips = h_flex().gap_1().flex_wrap().children(
             self.remotes
@@ -1488,11 +1628,19 @@ impl ElRunsPanel {
                     .color(Color::Error)
             }))
             .child(
-                Button::new("el-remote-logs", "Logs")
+                Button::new("el-remote-logs", "Server log")
                     .label_size(LabelSize::XSmall)
+                    .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
                     .toggle_state(self.remote_show_logs)
+                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .tooltip(ui::Tooltip::text(
+                        "What the daemon has been doing: deploys, runs, schedule fires",
+                    ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remote_show_logs = !this.remote_show_logs;
+                        // Opening it shows the newest line, not wherever
+                        // the last reading left off.
+                        this.remote_logs_dirty = true;
                         cx.notify();
                     })),
             );
@@ -1532,24 +1680,7 @@ impl ElRunsPanel {
         };
 
         if self.remote_show_logs {
-            let log_pane = v_flex()
-                .id("el-remote-logs-pane")
-                .h(px(140.))
-                .flex_shrink_0()
-                .border_t_1()
-                .border_color(colors.border)
-                .bg(colors.editor_background)
-                .px_2()
-                .py_1()
-                .child(if self.remote_logs.is_empty() {
-                    Label::new("No daemon activity yet.")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .into_any_element()
-                } else {
-                    // A read-only editor: selectable, copyable logs.
-                    self.remote_log_editor.clone().into_any_element()
-                });
+            let log_pane = self.render_remote_logs(window, cx);
             return v_flex()
                 .size_full()
                 .child(toolbar)
@@ -1561,6 +1692,252 @@ impl ElRunsPanel {
             .size_full()
             .child(toolbar)
             .child(body)
+            .into_any_element()
+    }
+
+    /// The daemon's own log: one line per thing it did, newest at the
+    /// bottom, the problems colored as such and reachable on their own.
+    /// Drag its top edge to trade height with the tables above.
+    fn render_remote_logs(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let problems = self
+            .remote_logs
+            .iter()
+            .filter(|line| log_color(line) != Color::Muted)
+            .count();
+        let shown: Vec<SharedString> = self
+            .remote_logs
+            .iter()
+            .filter(|line| !self.remote_logs_problems_only || log_color(line) != Color::Muted)
+            .cloned()
+            .collect();
+        let copyable = shown
+            .iter()
+            .map(|line| line.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dragging = self.remote_log_drag.is_some();
+
+        let filter_chip = |id: &'static str, label: SharedString, on: bool| {
+            Button::new(id, label)
+                .label_size(LabelSize::XSmall)
+                .toggle_state(on)
+                .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+        };
+        let header = h_flex()
+            .w_full()
+            .px_2()
+            .py_0p5()
+            .gap_2()
+            .items_center()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                Label::new("Server log")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Default),
+            )
+            .child(
+                Label::new(format!(
+                    "{} line{}",
+                    self.remote_logs.len(),
+                    if self.remote_logs.len() == 1 { "" } else { "s" }
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                filter_chip("el-remote-log-all", "All".into(), !self.remote_logs_problems_only)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_logs_problems_only = false;
+                        this.remote_logs_dirty = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                filter_chip(
+                    "el-remote-log-problems",
+                    format!("Problems ({problems})").into(),
+                    self.remote_logs_problems_only,
+                )
+                .disabled(problems == 0)
+                .tooltip(ui::Tooltip::text(
+                    "Only the lines that report something failing",
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.remote_logs_problems_only = true;
+                    this.remote_logs_dirty = true;
+                    cx.notify();
+                })),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("el-remote-log-follow", IconName::ArrowDown)
+                    .icon_size(IconSize::XSmall)
+                    .toggle_state(self.remote_logs_follow)
+                    .tooltip(ui::Tooltip::text(if self.remote_logs_follow {
+                        "Following the newest line — click to stay put"
+                    } else {
+                        "Follow the newest line"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_logs_follow = !this.remote_logs_follow;
+                        this.remote_logs_dirty = this.remote_logs_follow;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ui::CopyButton::new("el-remote-log-copy", copyable)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip_label("Copy these lines"),
+            )
+            .child(
+                IconButton::new("el-remote-log-clear", IconName::Eraser)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text(
+                        "Clear what's shown here — the server keeps its own log",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_logs.clear();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("el-remote-log-hide", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(ui::Tooltip::text("Hide the log"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_show_logs = false;
+                        cx.notify();
+                    })),
+            );
+
+        let mut lines = v_flex()
+            .id("el-remote-log-lines")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.remote_logs_scroll)
+            .px_1()
+            .py_0p5();
+        if shown.is_empty() {
+            lines = lines.child(
+                div().px_1().py_1().child(
+                    Label::new(if self.remote_logs.is_empty() {
+                        "Nothing yet — deploys, runs and schedule fires appear here as the                          server does them."
+                    } else {
+                        "No problems in what the server has logged."
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                ),
+            );
+        }
+        for (ix, line) in shown.iter().enumerate() {
+            let color = log_color(line);
+            let (stamp, message) = split_log_line(line);
+            lines = lines.child(
+                h_flex()
+                    .group("el-remote-log-line")
+                    .w_full()
+                    .px_1()
+                    .gap_2()
+                    .items_start()
+                    .rounded_sm()
+                    .when(ix % 2 == 1, |row| row.bg(colors.element_background))
+                    .hover(|style| style.bg(colors.element_hover))
+                    .child(
+                        div().w(px(56.)).flex_shrink_0().child(
+                            Label::new(stamp.to_owned())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(message.to_owned()).size(LabelSize::XSmall).color(
+                                if color == Color::Muted {
+                                    Color::Default
+                                } else {
+                                    color
+                                },
+                            ),
+                        ),
+                    )
+                    .child(
+                        ui::CopyButton::new(("el-remote-log-copy-line", ix), message.to_owned())
+                            .icon_size(IconSize::XSmall)
+                            .tooltip_label("Copy this line")
+                            .visible_on_hover("el-remote-log-line"),
+                    ),
+            );
+        }
+
+        v_flex()
+            .h(px(self.remote_log_height))
+            .flex_shrink_0()
+            .bg(colors.editor_background)
+            .when(dragging, |pane| {
+                pane.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some((start_y, start_height)) = this.remote_log_drag {
+                        this.remote_log_height =
+                            (start_height - (f32::from(event.position.y) - start_y))
+                                .clamp(80., 520.);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.remote_log_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.remote_log_drag = None;
+                        cx.notify();
+                    }),
+                )
+            })
+            .child(
+                // The pane's top edge doubles as its resize handle.
+                div()
+                    .id("el-remote-log-split")
+                    .w_full()
+                    .h(px(5.))
+                    .flex_shrink_0()
+                    .cursor(gpui::CursorStyle::ResizeRow)
+                    .border_t_1()
+                    .border_color(if dragging {
+                        colors.border_focused
+                    } else {
+                        colors.border
+                    })
+                    .hover(|style| style.border_color(colors.border_focused))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.remote_log_drag =
+                                Some((f32::from(event.position.y), this.remote_log_height));
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(lines)
+                    .custom_scrollbars(super::scrollbar(&self.remote_logs_scroll), window, cx),
+            )
             .into_any_element()
     }
 
@@ -1584,6 +1961,7 @@ impl ElRunsPanel {
             .w_full()
             .px_2()
             .gap_2()
+            .child(div().w(px(16.)).flex_shrink_0())
             .child(head(140., "pipeline"))
             .child(head(55., "streams"))
             .child(head(110., "schedule"))
@@ -1594,9 +1972,19 @@ impl ElRunsPanel {
             .child(head(80., "last run"))
             .child(head(60., "state"));
         let mut pipelines = v_flex().w_full().px_1();
-        for (ix, pipeline) in self.remote_pipelines.iter().enumerate() {
+        // Cloned: the rows hold listeners that borrow `self` mutably.
+        let deployed = self.remote_pipelines.clone();
+        for (ix, pipeline) in deployed.iter().enumerate() {
             let name: SharedString = pipeline.name.clone().into();
             let run_name = pipeline.name.clone();
+            let expanded = self.remote_expanded.contains(&pipeline.name);
+            let toggle_name = pipeline.name.clone();
+            // The run to stop, when one of this pipeline's is in flight.
+            let in_flight = self
+                .remote_runs
+                .iter()
+                .find(|run| run.pipeline == pipeline.name && run.status == "running")
+                .map(|run| run.id);
             let cell = |width: f32, text: String, color: Color| {
                 div().w(px(width)).flex_shrink_0().overflow_hidden().child(
                     Label::new(text)
@@ -1623,8 +2011,39 @@ impl ElRunsPanel {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remote_detail = Some(open_name.clone());
+                        this.remote_stream_picks.clear();
                         cx.notify();
                     }))
+                    .child(
+                        // Streams unfold in place, so one table can be
+                        // launched without leaving the list.
+                        div().w(px(16.)).flex_shrink_0().children(
+                            (!pipeline.stream_info.is_empty()).then(|| {
+                                IconButton::new(
+                                    ("el-remote-expand", ix),
+                                    if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(if expanded {
+                                    "Hide the streams"
+                                } else {
+                                    "Show the streams, to run one on its own"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.remote_expanded.remove(&toggle_name) {
+                                        this.remote_expanded.insert(toggle_name.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                            }),
+                        ),
+                    )
                     .child(tip_cell(
                         cell_id("name"),
                         140.,
@@ -1694,20 +2113,41 @@ impl ElRunsPanel {
                         },
                     ))
                     .child(div().flex_1())
-                    .child(
-                        Button::new(("el-remote-run", ix), "Run")
+                    .children(in_flight.map(|run_id| {
+                        Button::new(("el-remote-cancel", ix), "Cancel")
                             .label_size(LabelSize::XSmall)
-                            .disabled(pipeline.running)
+                            .color(Color::Warning)
+                            .tooltip(ui::Tooltip::text("Stop the run in progress"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                let name = run_name.clone();
-                                this.remote_action(
-                                    move |client| client.start_run(&name).map(|_| ()),
-                                    cx,
-                                );
-                            })),
-                    ),
+                                this.remote_action(move |client| client.cancel(run_id), cx);
+                            }))
+                    }))
+                    .children(in_flight.is_none().then(|| {
+                        Button::new(("el-remote-run", ix), "Run")
+                            .label_size(LabelSize::XSmall)
+                            .start_icon(Icon::new(IconName::PlayOutlined).size(IconSize::XSmall))
+                            .disabled(pipeline.running)
+                            .tooltip(ui::Tooltip::text("Run every stream of this pipeline"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.run_remote(run_name.clone(), Vec::new(), cx);
+                            }))
+                    })),
             );
+            if expanded {
+                for (stream_ix, stream) in pipeline.stream_info.iter().enumerate() {
+                    pipelines = pipelines.child(self.render_stream_row(
+                        "el-remote-list-stream",
+                        &pipeline.name,
+                        stream,
+                        stream_ix,
+                        false,
+                        pipeline.running,
+                        cx,
+                    ));
+                }
+            }
         }
 
         let dragging = self.remote_split_drag.is_some();
@@ -1803,6 +2243,18 @@ impl ElRunsPanel {
             .find(|pipeline| pipeline.name == name.as_ref());
         let run_name = name.to_string();
         let running = pipeline.map(|pipeline| pipeline.running).unwrap_or(false);
+        // Ticked streams, in the pipeline's own order rather than the
+        // order they happened to be clicked in.
+        let picked: Vec<String> = pipeline
+            .map(|pipeline| {
+                pipeline
+                    .stream_info
+                    .iter()
+                    .map(|stream| stream.name.clone())
+                    .filter(|name| self.remote_stream_picks.contains(name))
+                    .collect()
+            })
+            .unwrap_or_default();
         let meta: SharedString = match pipeline {
             None if self.remote_detail_pending => "waiting for the server to list it…".into(),
             None => "no longer on the server".into(),
@@ -1853,6 +2305,7 @@ impl ElRunsPanel {
                     .tooltip(ui::Tooltip::text("Back to pipelines"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remote_detail = None;
+                        this.remote_stream_picks.clear();
                         cx.notify();
                     })),
             )
@@ -1864,21 +2317,131 @@ impl ElRunsPanel {
                     .size(LabelSize::XSmall)
                     .color(Color::Accent)
             }))
-            .child(
-                Button::new("el-remote-detail-run", "Run")
+            .children(picked.is_empty().then(|| {
+                Button::new("el-remote-detail-run", "Run pipeline")
                     .label_size(LabelSize::XSmall)
                     .style(ButtonStyle::Filled)
+                    .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
                     .disabled(running || pipeline.is_none())
+                    .tooltip(ui::Tooltip::text("Run every stream"))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let name = run_name.clone();
-                        this.remote_action(move |client| client.start_run(&name).map(|_| ()), cx);
-                    })),
-            );
+                        this.run_remote(run_name.clone(), Vec::new(), cx);
+                    }))
+            }))
+            .children((!picked.is_empty()).then(|| {
+                let picked_names = picked.clone();
+                let picked_pipeline = name.to_string();
+                Button::new(
+                    "el-remote-detail-run-picked",
+                    format!(
+                        "Run {} stream{}",
+                        picked.len(),
+                        if picked.len() == 1 { "" } else { "s" }
+                    ),
+                )
+                .label_size(LabelSize::XSmall)
+                .style(ButtonStyle::Filled)
+                .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
+                .disabled(running)
+                .tooltip(ui::Tooltip::text(format!(
+                    "Run only: {}",
+                    picked_names.join(", ")
+                )))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let picked = picked_names.clone();
+                    this.run_remote(picked_pipeline.clone(), picked, cx);
+                }))
+            }));
+
+        // The streams as a table: tick several and send them in one run,
+        // or run one on its own from its row.
+        let streams = pipeline
+            .map(|pipeline| pipeline.stream_info.clone())
+            .unwrap_or_default();
+        let picked_count = picked.len();
+        let streams_block: gpui::AnyElement = if streams.is_empty() {
+            div()
+                .px_2()
+                .pt_1()
+                .child(
+                    Label::new(match pipeline {
+                        Some(pipeline) if pipeline.streams > 0 => {
+                            "This server doesn't report a pipeline's streams — update the \
+                             daemon to run them one at a time."
+                        }
+                        Some(_) => "This pipeline has no streams.",
+                        None => "",
+                    })
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .into_any_element()
+        } else {
+            let all_picked = picked_count == streams.len();
+            let every_name: Vec<String> =
+                streams.iter().map(|stream| stream.name.clone()).collect();
+            let mut rows = v_flex()
+                .id("el-remote-detail-streams")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.remote_streams_scroll)
+                .px_1();
+            for (ix, stream) in streams.iter().enumerate() {
+                rows = rows.child(self.render_stream_row(
+                    "el-remote-detail-stream",
+                    name.as_ref(),
+                    stream,
+                    ix,
+                    true,
+                    running,
+                    cx,
+                ));
+            }
+            v_flex()
+                .flex_shrink_0()
+                .max_h(px(200.))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .pt_1()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new(format!("Streams ({})", streams.len()))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            Button::new(
+                                "el-remote-pick-all",
+                                if all_picked { "Clear" } else { "Select all" },
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remote_stream_picks.clear();
+                                if !all_picked {
+                                    this.remote_stream_picks.extend(every_name.iter().cloned());
+                                }
+                                cx.notify();
+                            })),
+                        ),
+                )
+                .child(self.stream_header(true))
+                .child(div().flex_1().min_h_0().child(rows).custom_scrollbars(
+                    super::scrollbar(&self.remote_streams_scroll),
+                    window,
+                    cx,
+                ))
+                .into_any_element()
+        };
 
         v_flex()
             .flex_1()
             .min_h_0()
             .child(header)
+            .child(streams_block)
             .child(
                 div().px_2().pt_1().child(
                     Label::new("Runs of this pipeline")
@@ -1927,6 +2490,18 @@ impl ElRunsPanel {
                 text.into()
             }
         };
+        // Fold the event log into per-stream rows.
+        let (order, agg) = fold_stream_events(self.run_events(run_id));
+        let failed_streams: Vec<String> = order
+            .iter()
+            .filter(|stream| {
+                agg.get(*stream)
+                    .is_some_and(|entry| entry.error.is_some() || !entry.done)
+            })
+            .cloned()
+            .collect();
+        let pipeline_name = run.map(|run| run.pipeline.clone()).unwrap_or_default();
+
         let header = h_flex()
             .w_full()
             .px_1()
@@ -1967,9 +2542,33 @@ impl ElRunsPanel {
             .children(is_running.then(|| {
                 Button::new("el-run-detail-cancel", "Cancel")
                     .label_size(LabelSize::XSmall)
+                    .color(Color::Warning)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remote_action(move |client| client.cancel(run_id), cx);
                     }))
+            }))
+            // What a failed run is usually followed by: the streams that
+            // failed, again, without the ones that already landed.
+            .children((!is_running && !failed_streams.is_empty()).then(|| {
+                let pipeline = run
+                    .map(|run| run.pipeline.clone())
+                    .unwrap_or_default();
+                let streams = failed_streams.clone();
+                Button::new(
+                    "el-run-detail-retry",
+                    format!(
+                        "Re-run {} failed stream{}",
+                        streams.len(),
+                        if streams.len() == 1 { "" } else { "s" }
+                    ),
+                )
+                .label_size(LabelSize::XSmall)
+                .style(ButtonStyle::Filled)
+                .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                .tooltip(ui::Tooltip::text(format!("Runs only: {}", streams.join(", "))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.run_remote(pipeline.clone(), streams.clone(), cx);
+                }))
             }));
 
         // The run's own error (a fatal message or the failed-stream
@@ -2012,9 +2611,6 @@ impl ElRunsPanel {
                         .tooltip_label("Copy error"),
                 )
         });
-
-        // Fold the event log into per-stream rows.
-        let (order, agg) = fold_stream_events(self.run_events(run_id));
 
         let head = |width: f32, text: &'static str| {
             div().w(px(width)).flex_shrink_0().child(
@@ -2163,7 +2759,27 @@ impl ElRunsPanel {
                                 ui::CopyButton::new(cell_id("copy"), error)
                                     .icon_size(IconSize::XSmall)
                                     .tooltip_label("Copy error")
-                            })),
+                            }))
+                            .child({
+                                // Re-running one stream is how a run that
+                                // half-failed gets finished.
+                                let pipeline = pipeline_name.clone();
+                                let stream = stream.clone();
+                                IconButton::new(cell_id("rerun"), IconName::PlayOutlined)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .disabled(is_running)
+                                    .tooltip(ui::Tooltip::text(format!(
+                                        "Run {stream} again, on its own"
+                                    )))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.run_remote(
+                                            pipeline.clone(),
+                                            vec![stream.clone()],
+                                            cx,
+                                        );
+                                    }))
+                            }),
                     ),
             );
         }
@@ -2475,6 +3091,47 @@ fn one_line(value: &str) -> SharedString {
 }
 
 /// [`tip_text`] at a fixed column width.
+/// A daemon log line as the daemon writes it: "HH:MM:SS  what it did".
+/// Anything else is left whole rather than guessed at.
+fn split_log_line(line: &str) -> (&str, &str) {
+    match line.split_once("  ") {
+        Some((stamp, rest))
+            if stamp.len() == 8
+                && stamp
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ':') =>
+        {
+            (stamp, rest.trim_start())
+        }
+        _ => ("", line),
+    }
+}
+
+/// What a log line is worth noticing as. Problems are what a person
+/// scans a server log for; everything else is ordinary progress and
+/// stays quiet.
+fn log_color(line: &str) -> Color {
+    let line = line.to_ascii_lowercase();
+    const FAILURES: [&str; 8] = [
+        "failed",
+        "error",
+        "refused",
+        "not delivered",
+        "not run",
+        "panic",
+        "cannot",
+        "can't",
+    ];
+    const WARNINGS: [&str; 5] = ["cancelled", "skipped", "retry", "warning", "exited"];
+    if FAILURES.iter().any(|word| line.contains(word)) {
+        Color::Error
+    } else if WARNINGS.iter().any(|word| line.contains(word)) {
+        Color::Warning
+    } else {
+        Color::Muted
+    }
+}
+
 fn tip_cell(
     id: impl Into<gpui::ElementId>,
     width: f32,
@@ -3108,9 +3765,9 @@ mod tests {
     use gpui::SharedString;
 
     use super::{
-        ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, fit_widths,
-        merge_log_tail, merge_run, one_line, place_run_event, select_sql, sorted_rows,
-        tooltip_text,
+        Color, ConsoleGrid, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, append_log, fit_widths,
+        log_color, merge_log_tail, merge_run, one_line, place_run_event, select_sql, sorted_rows,
+        split_log_line, tooltip_text,
     };
 
     #[test]
@@ -3352,6 +4009,40 @@ mod tests {
             4,
         ));
         assert_eq!(logs.len(), 4);
+    }
+
+    /// The log pane reads the daemon's own format, and leaves anything
+    /// else alone rather than cutting it at the first double space.
+    #[test]
+    fn a_log_line_splits_into_its_time_and_what_happened() {
+        assert_eq!(
+            split_log_line("14:02:58  run 7 (orders) finished"),
+            ("14:02:58", "run 7 (orders) finished")
+        );
+        assert_eq!(split_log_line("no stamp  here"), ("", "no stamp  here"));
+        assert_eq!(split_log_line("plain line"), ("", "plain line"));
+        // A message that itself contains a double space keeps it whole.
+        assert_eq!(
+            split_log_line("09:00:00  deployed 2 pipeline(s):  a, b"),
+            ("09:00:00", "deployed 2 pipeline(s):  a, b")
+        );
+    }
+
+    /// What "Problems" filters to: the lines that report something the
+    /// daemon could not do.
+    #[test]
+    fn a_log_line_is_colored_by_what_it_reports() {
+        assert_eq!(
+            log_color("14:02:58  run 7 (orders) failed: connection refused"),
+            Color::Error
+        );
+        assert_eq!(
+            log_color("14:02:58  failure webhook not delivered: status 500"),
+            Color::Error
+        );
+        assert_eq!(log_color("14:02:58  run 7 (orders) cancelled"), Color::Warning);
+        assert_eq!(log_color("14:02:58  run 7 (orders) finished"), Color::Muted);
+        assert_eq!(log_color("14:02:58  deployed 1 pipeline(s): orders"), Color::Muted);
     }
 
     #[test]

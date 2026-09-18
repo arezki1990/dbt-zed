@@ -4,6 +4,12 @@
 //! on that server (new vs replacing, a run in flight, the schedule that
 //! starts firing) before anything ships. A stale spec (unsaved edits,
 //! parse errors) is refused with the reason.
+//!
+//! A pipeline names connections; a server that does not have them can
+//! only fail the run. So the deploy also carries the project's
+//! connections file and the variables it names — sealed to the key that
+//! server publishes, which no one else can open. The popup names the
+//! variables and shows the key's fingerprint; it never shows a value.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +40,10 @@ enum RemoteFacts {
         pipelines: Vec<RemotePipeline>,
         /// The daemon tracks a git checkout and refuses /deploy.
         tracks_checkout: bool,
+        /// The key credentials travel sealed to, with the fingerprint a
+        /// person compares. None = a daemon older than /pubkey, which can
+        /// only take the pipeline.
+        pubkey: Option<(String, SharedString)>,
     },
     Failed(SharedString),
 }
@@ -54,11 +64,19 @@ pub struct ElDeployModal {
     facts: RemoteFacts,
     /// None = run under the server's own profile.
     selected_profile: Option<String>,
+    /// The connections file and the variables it names, read from the
+    /// project when the popup opened. Values stay inside it.
+    connections: Option<Arc<el_engine::secrets::ConnectionsBundle>>,
+    connections_error: Option<SharedString>,
+    /// Whether this deploy carries them. Off leaves whatever the server
+    /// already has.
+    send_connections: bool,
     deploying: bool,
     error: Option<SharedString>,
     epoch: u64,
     _fetch: Task<()>,
     _check: Task<()>,
+    _connections: Task<()>,
 }
 
 impl ElDeployModal {
@@ -112,13 +130,18 @@ impl ElDeployModal {
                 selected_remote: 0,
                 facts: RemoteFacts::Loading,
                 selected_profile: None,
+                connections: None,
+                connections_error: None,
+                send_connections: true,
                 deploying: false,
                 error: None,
                 epoch: 0,
                 _fetch: Task::ready(()),
                 _check: Task::ready(()),
+                _connections: Task::ready(()),
             };
             this.check_local(cx);
+            this.read_connections(cx);
             this.fetch_facts(cx);
             this
         });
@@ -182,6 +205,26 @@ impl ElDeployModal {
         });
     }
 
+    /// Reads the project's connections and resolves the variables they
+    /// name, off the main thread — dotenv files are on disk. Values never
+    /// leave the bundle.
+    fn read_connections(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let read = cx
+            .background_spawn(async move { el_engine::secrets::ConnectionsBundle::read(&root) });
+        self._connections = cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(bundle) => this.connections = Some(Arc::new(bundle)),
+                    Err(error) => this.connections_error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
     /// Asks the selected remote which profiles it declares, which one it
     /// runs by default, and which pipelines it already holds.
     fn fetch_facts(&mut self, cx: &mut Context<Self>) {
@@ -197,7 +240,10 @@ impl ElDeployModal {
             let client = el_engine::server::RemoteClient::connect(&root, remote.as_ref())?;
             let health = client.health()?;
             let pipelines = client.pipelines()?;
-            anyhow::Ok((health, pipelines))
+            // Older daemons have no /pubkey; that is a missing feature,
+            // not a failed deploy.
+            let pubkey = client.pubkey().ok();
+            anyhow::Ok((health, pipelines, pubkey))
         });
         self._fetch = cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -206,7 +252,7 @@ impl ElDeployModal {
                     return;
                 }
                 this.facts = match result {
-                    Ok((health, pipelines)) => {
+                    Ok((health, pipelines, pubkey)) => {
                         let profiles: Vec<String> = health
                             .get("profiles")
                             .and_then(|names| names.as_array())
@@ -235,6 +281,8 @@ impl ElDeployModal {
                             active,
                             pipelines,
                             tracks_checkout,
+                            pubkey: pubkey
+                                .map(|(key, print)| (key, SharedString::from(print))),
                         }
                     }
                     Err(error) => RemoteFacts::Failed(format!("{error:#}").into()),
@@ -280,11 +328,23 @@ impl ElDeployModal {
         let spec_path = self.spec_path.clone();
         let profile = self.selected_profile.clone();
         let workspace = self.workspace.clone();
+        // What the credentials travel sealed to, and what travels — None
+        // for either means this deploy carries the pipeline alone.
+        let sealing = self
+            .send_connections
+            .then(|| match (&self.facts, &self.connections) {
+                (RemoteFacts::Loaded { pubkey: Some((key, _)), .. }, Some(bundle)) => {
+                    Some((key.clone(), bundle.clone()))
+                }
+                _ => None,
+            })
+            .flatten();
         cx.spawn_in(window, async move |this, cx| {
             let task_root = root.clone();
             let task_name = name.clone();
             let task_remote = remote.to_string();
             let task_profile = profile.clone();
+            let task_sealing = sealing.clone();
             let result = cx
                 .background_spawn(async move {
                     // Ship the file as it is on disk, re-validated now.
@@ -304,12 +364,26 @@ impl ElDeployModal {
                     }
                     let client =
                         el_engine::server::RemoteClient::connect(&task_root, &task_remote)?;
+                    // Credentials first: a pipeline deployed against
+                    // connections the server does not have can only fail
+                    // its next run.
+                    let sent = match task_sealing {
+                        Some((key, bundle)) => {
+                            let sealed = bundle.seal(&key).context("sealing the connections")?;
+                            Some(
+                                client
+                                    .send_connections(&sealed)
+                                    .context("sending the connections")?,
+                            )
+                        }
+                        None => None,
+                    };
                     client.deploy(&[(task_name, yaml, task_profile)])?;
-                    anyhow::Ok(())
+                    anyhow::Ok(sent)
                 })
                 .await;
             match result {
-                Ok(()) => {
+                Ok(sent) => {
                     // Dismiss first: hiding the modal restores the focus it
                     // took, which would otherwise steal the console back.
                     this.update_in(cx, |this, _, cx| {
@@ -321,12 +395,20 @@ impl ElDeployModal {
                     let profile_text = profile
                         .clone()
                         .unwrap_or_else(|| "the server's profile".to_owned());
+                    let credentials = match sent {
+                        Some((connections, variables)) => format!(
+                            " Sent {connections} connection{} and {variables} variable{}, sealed.",
+                            if connections == 1 { "" } else { "s" },
+                            if variables == 1 { "" } else { "s" },
+                        ),
+                        None => String::new(),
+                    };
                     workspace
                         .update_in(cx, |workspace, window, cx| {
                             super::toast(
                                 workspace,
                                 &format!(
-                                    "Deployed {name} to {remote} — runs under {profile_text}."
+                                    "Deployed {name} to {remote} — runs under                                      {profile_text}.{credentials}"
                                 ),
                                 cx,
                             );
@@ -358,6 +440,102 @@ impl ElDeployModal {
             }
         })
         .detach();
+    }
+
+    /// The credentials half: what travels, sealed to which key. Names
+    /// and counts only — a value never reaches this popup's surface.
+    fn render_connections(
+        &self,
+        remote: &SharedString,
+        pubkey: Option<&(String, SharedString)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((_, fingerprint)) = pubkey else {
+            return dialog::labeled(
+                "Connections",
+                dialog::notice(
+                    Severity::Warning,
+                    format!(
+                        "{remote} is older than sealed connections — this deploy carries the \
+                         pipeline only, and the server runs it against whatever connections \
+                         it already has."
+                    ),
+                ),
+            );
+        };
+        if let Some(error) = &self.connections_error {
+            return dialog::labeled(
+                "Connections",
+                dialog::notice(
+                    Severity::Error,
+                    format!("Can't read this project's connections: {error}"),
+                ),
+            );
+        }
+        let Some(bundle) = &self.connections else {
+            return dialog::labeled("Connections", dialog::loading("Reading el/connections.yml…"));
+        };
+        let send_label: SharedString = format!(
+            "Send {} connection{} · {} variable{}",
+            bundle.connections,
+            if bundle.connections == 1 { "" } else { "s" },
+            bundle.variables.len(),
+            if bundle.variables.len() == 1 { "" } else { "s" },
+        )
+        .into();
+        let chips = dialog::chips([
+            dialog::chip("el-deploy-conn-send", send_label, self.send_connections)
+                .disabled(self.deploying)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.send_connections = true;
+                    cx.notify();
+                })),
+            dialog::chip(
+                "el-deploy-conn-keep",
+                "Leave the server's",
+                !self.send_connections,
+            )
+            .disabled(self.deploying)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.send_connections = false;
+                cx.notify();
+            })),
+        ]);
+        let mut control = v_flex().w_full().gap_1().child(chips);
+        if self.send_connections {
+            control = control.child(dialog::notice(
+                Severity::Info,
+                format!(
+                    "Encrypted for {remote} alone — its key is {fingerprint}. Passwords are \
+                     unreadable in transit and to anything between here and the daemon."
+                ),
+            ));
+            if !bundle.variables.is_empty() {
+                control = control.child(dialog::notice(
+                    Severity::Info,
+                    format!("Variables sent: {}", bundle.variables.join(", ")),
+                ));
+            }
+            if !bundle.missing.is_empty() {
+                control = control.child(dialog::notice(
+                    Severity::Warning,
+                    format!(
+                        "Not set here, so they can't travel: {}. Connections that use them \
+                         won't work on {remote}.",
+                        bundle.missing.join(", ")
+                    ),
+                ));
+            }
+        } else {
+            control = control.child(dialog::notice(
+                Severity::Warning,
+                format!(
+                    "{remote} keeps the connections it has — a name this pipeline uses that \
+                     is missing there fails the run."
+                ),
+            ));
+        }
+        dialog::labeled("Connections", control)
     }
 
     /// The consequence lines: what pressing Deploy would do on `remote`.
@@ -619,6 +797,10 @@ impl Render for ElDeployModal {
                 )
             }
         });
+
+        if let RemoteFacts::Loaded { pubkey, .. } = &self.facts {
+            body = body.child(self.render_connections(&remote, pubkey.as_ref(), cx));
+        }
 
         // What the deploy changes on the server, or why it can't ship.
         match &self.facts {
