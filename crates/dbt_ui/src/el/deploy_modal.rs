@@ -516,6 +516,17 @@ impl ElDeployModal {
                     format!("Variables sent: {}", bundle.variables.join(", ")),
                 ));
             }
+            if !bundle.file_valued.is_empty() {
+                control = control.child(dialog::notice(
+                    Severity::Warning,
+                    format!(
+                        "{} name{} a file on this machine — the path travels, the file does \
+                         not. It has to be on {remote} already.",
+                        bundle.file_valued.join(", "),
+                        if bundle.file_valued.len() == 1 { "s" } else { "" },
+                    ),
+                ));
+            }
             if !bundle.missing.is_empty() {
                 control = control.child(dialog::notice(
                     Severity::Warning,
