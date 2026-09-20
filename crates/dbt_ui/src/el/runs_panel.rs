@@ -24,6 +24,49 @@ use crate::ToggleElRunsFocus;
 
 const QUERY_ROW_CAP: usize = 500;
 
+/// Runs drawn at a time.
+const RUNS_PAGE: usize = 50;
+
+/// A server older than this panel answers 404 to a route it never had,
+/// which reads as "not found" about the wrong thing. A pipeline that is
+/// really gone says so by name, and keeps its own words.
+fn older_server(error: anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if message.contains("returned 404") && !message.contains("no pipeline named") {
+        anyhow::anyhow!(
+            "This server is older than this panel and cannot pause or remove a deployment \
+             yet — update its image, then try again."
+        )
+    } else {
+        error
+    }
+}
+
+/// The run in flight that is moving `stream` of `pipeline`. A daemon older
+/// than per-stream runs lists no streams on a run: it ran one thing per
+/// pipeline at a time, so its run is moving all of them.
+fn run_moving<'a>(
+    runs: &'a [el_engine::server::RemoteRun],
+    pipeline: &str,
+    stream: &str,
+) -> Option<&'a el_engine::server::RemoteRun> {
+    runs.iter().find(|run| {
+        run.status == "running"
+            && run.pipeline == pipeline
+            && (run.streams.is_empty() || run.streams.iter().any(|name| name == stream))
+    })
+}
+
+/// The slice of `total` rows that `page` shows, and how many pages there
+/// are: `(first, one past last, pages)`. A page past the end — the list
+/// shrank under it — is read as the last one.
+fn page_bounds(total: usize, page: usize, size: usize) -> (usize, usize, usize) {
+    let pages = total.div_ceil(size).max(1);
+    let page = page.min(pages - 1);
+    let first = page * size;
+    (first, (first + size).min(total), pages)
+}
+
 /// How long the explorer lets a query run before it stops it — the
 /// engine's limit, on this machine's worker and on a remote's alike. Said
 /// in the panel because the engine's own words for it are "is the database
@@ -141,6 +184,12 @@ pub struct ElRunsPanel {
     /// Whether the height above is the operator's. A double-click on the
     /// splitter hands it back to the content.
     remote_split_by_hand: bool,
+    /// Which page of the run history is on screen. Every row used to be
+    /// drawn on every frame, and a pipeline firing every two minutes fills
+    /// the server's 500 in a day — the table froze under its own length.
+    remote_runs_page: usize,
+    /// Failed and cancelled runs only: what one looks for in five hundred.
+    remote_runs_problems_only: bool,
     /// The height on screen right now, which is what a drag starts from.
     remote_split_shown: f32,
     /// (pointer y at drag start, split at drag start).
@@ -676,6 +725,8 @@ impl ElRunsPanel {
                 query_split_drag: None,
                 remote_split: 170.,
                 remote_split_by_hand: false,
+                remote_runs_page: 0,
+                remote_runs_problems_only: false,
                 remote_split_shown: 170.,
                 remote_split_drag: None,
                 remote_epoch: 0,
@@ -763,6 +814,7 @@ impl ElRunsPanel {
             }
         }
         self.remote_detail = None;
+        self.remote_runs_page = 0;
         self.remote_detail_pending = false;
         self.remote_run_detail = None;
         self.start_remote_feed(cx);
@@ -782,6 +834,7 @@ impl ElRunsPanel {
     ) {
         self.show_remote(remote, cx);
         self.remote_detail = Some(pipeline);
+        self.remote_runs_page = 0;
         self.remote_detail_pending = true;
         self.remote_run_detail = None;
         cx.notify();
@@ -791,6 +844,7 @@ impl ElRunsPanel {
     /// the old environment's query state and re-read the resolved set.
     pub fn profile_changed(&mut self, cx: &mut Context<Self>) {
         self.remote_detail = None;
+        self.remote_runs_page = 0;
         self.remote_run_detail = None;
         self.result = None;
         self.query_error = None;
@@ -1272,6 +1326,113 @@ impl ElRunsPanel {
         );
     }
 
+    /// Holds or releases a deployment's schedule on the selected remote.
+    fn set_pipeline_paused(&mut self, pipeline: String, paused: bool, cx: &mut Context<Self>) {
+        self.remote_action(
+            move |client| {
+                if paused {
+                    client.pause_pipeline(&pipeline)
+                } else {
+                    client.resume_pipeline(&pipeline)
+                }
+                .map_err(older_server)
+            },
+            cx,
+        );
+    }
+
+    /// Asks, then takes a pipeline off the selected remote. What goes and
+    /// what stays is said before anything does.
+    fn remove_pipeline(&mut self, pipeline: String, window: &mut Window, cx: &mut Context<Self>) {
+        let remote = self
+            .selected_remote
+            .and_then(|ix| self.remotes.get(ix).cloned())
+            .unwrap_or_else(|| "this server".into());
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            &format!("Remove {pipeline} from {remote}?"),
+            Some(
+                "Its spec leaves the server and its schedule stops. Its cursors and its run \
+                 history stay, so deploying it again resumes where it was. Nothing is dropped \
+                 in the warehouse.",
+            ),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                if this
+                    .remote_detail
+                    .as_ref()
+                    .is_some_and(|open| open.as_ref() == pipeline)
+                {
+                    this.remote_detail = None;
+                    this.remote_runs_page = 0;
+                    this.remote_stream_picks.clear();
+                }
+                this.remote_action(
+                    move |client| client.remove_pipeline(&pipeline).map_err(older_server),
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The "…" of a deployed pipeline: what can be done to the deployment
+    /// itself, as opposed to running it.
+    fn pipeline_menu(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        pipeline: &el_engine::server::RemotePipeline,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let name = pipeline.name.clone();
+        let scheduled = pipeline.schedule.is_some();
+        let paused = pipeline.paused;
+        ui::PopoverMenu::new(id)
+            .trigger(
+                IconButton::new("el-remote-pipeline-more", IconName::Ellipsis)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(ui::Tooltip::text("Pause its schedule, or remove it from this server")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let name = name.clone();
+                Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if scheduled {
+                        let panel = panel.clone();
+                        let name = name.clone();
+                        menu = menu.entry(
+                            if paused { "Resume schedule" } else { "Pause schedule" },
+                            None,
+                            move |_, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.set_pipeline_paused(name.clone(), !paused, cx)
+                                    })
+                                    .ok();
+                            },
+                        );
+                        menu = menu.separator();
+                    }
+                    let panel = panel.clone();
+                    let name = name.clone();
+                    menu.entry("Remove from this server…", None, move |window, cx| {
+                        panel
+                            .update(cx, |this, cx| this.remove_pipeline(name.clone(), window, cx))
+                            .ok();
+                    })
+                }))
+            })
+    }
+
     /// One stream of a deployed pipeline: what it reads, where it lands,
     /// how it loads — and a Run that launches that stream by itself. The
     /// tick box appears on a pipeline's own page, where several streams
@@ -1283,7 +1444,6 @@ impl ElRunsPanel {
         stream: &el_engine::server::RemoteStream,
         ix: usize,
         pickable: bool,
-        running: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors().clone();
@@ -1295,6 +1455,130 @@ impl ElRunsPanel {
         let pick_name = stream.name.clone();
         let run_name = stream.name.clone();
         let run_pipeline = pipeline.to_owned();
+
+        // A stream answers for itself: another table of the same pipeline
+        // loading is no reason this one cannot start. What holds it is a
+        // run that has this very stream in it.
+        let moving = run_moving(&self.remote_runs, pipeline, &stream.name);
+        let (state, action): (gpui::AnyElement, gpui::AnyElement) = match moving {
+            Some(run) => {
+                let run_id = run.id;
+                let (_, streams) = fold_stream_events(self.run_events(run_id));
+                let mine = streams.get(&stream.name);
+                let others: Vec<&str> = run
+                    .streams
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| *name != stream.name)
+                    .collect();
+                let state = match mine {
+                    Some(agg) if agg.done => h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Success),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "done · {} rows",
+                                super::thousands(agg.written as usize)
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Success)
+                            .truncate(),
+                        )
+                        .into_any_element(),
+                    Some(agg) if agg.error.is_some() => h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Label::new("failed")
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                        .into_any_element(),
+                    Some(agg) if agg.phase.is_some() => {
+                        let rows = if agg.written > 0 {
+                            format!("{} rows", super::thousands(agg.written as usize))
+                        } else {
+                            format!("{} read", super::thousands(agg.read as usize))
+                        };
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(live_dot(id("live"), Color::Accent))
+                            .child(
+                                Label::new(format!(
+                                    "{} · {rows} · {}",
+                                    agg.phase.clone().unwrap_or_default(),
+                                    elapsed_text(run.started_unix)
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Accent)
+                                .truncate(),
+                            )
+                            .into_any_element()
+                    }
+                    // In the run and not reached yet — or the run's events
+                    // have not arrived, which a polled server never sends.
+                    _ => h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(live_dot(id("live"), Color::Muted))
+                        .child(
+                            Label::new(format!("in run #{run_id}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .into_any_element(),
+                };
+                let finished_here = mine.is_some_and(|agg| agg.done || agg.error.is_some());
+                let action = if finished_here {
+                    // Through, but the run that holds it is still going.
+                    div().into_any_element()
+                } else {
+                    Button::new(id("cancel"), "Cancel")
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Tinted(ui::TintColor::Warning))
+                        .start_icon(Icon::new(IconName::Stop).size(IconSize::Small))
+                        .tooltip(ui::Tooltip::text(if others.is_empty() {
+                            format!("Stop run #{run_id}, and the query it has open on the source")
+                        } else {
+                            format!(
+                                "Stop run #{run_id} — it is one run, so {} stops with it",
+                                others.join(", ")
+                            )
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remote_action(move |client| client.cancel(run_id), cx);
+                        }))
+                        .into_any_element()
+                };
+                (state, action)
+            }
+            None => (
+                div().into_any_element(),
+                Button::new(id("run"), "Run")
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Outlined)
+                    .start_icon(Icon::new(IconName::PlayOutlined).size(IconSize::Small))
+                    .tooltip(ui::Tooltip::text(format!("Run {run_name} on its own")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.run_remote(run_pipeline.clone(), vec![run_name.clone()], cx);
+                    }))
+                    .into_any_element(),
+            ),
+        };
+
         h_flex()
             .id(id("row"))
             .w_full()
@@ -1355,24 +1639,11 @@ impl ElRunsPanel {
                     Color::Muted
                 },
             ))
-            .child(div().flex_1())
-            .child(
-                Button::new(id("run"), "Run")
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::PlayOutlined).size(IconSize::XSmall))
-                    .disabled(running)
-                    .tooltip(ui::Tooltip::text(if running {
-                        format!("{run_pipeline} is already running")
-                    } else {
-                        format!("Run {run_name} on its own")
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.run_remote(run_pipeline.clone(), vec![run_name.clone()], cx);
-                    })),
-            )
+            .child(h_flex().flex_1().min_w_0().child(state))
+            .child(action)
             .into_any_element()
     }
+
 
     /// The column names over a stream table, aligned with its rows.
     fn stream_header(&self, pickable: bool) -> gpui::AnyElement {
@@ -1953,6 +2224,7 @@ impl ElRunsPanel {
                             this.remote_runs.clear();
                             this.remote_action_error = None;
                             this.remote_detail = None;
+                            this.remote_runs_page = 0;
                             this.remote_detail_pending = false;
                             this.remote_run_detail = None;
                             this.start_remote_feed(cx);
@@ -2658,12 +2930,14 @@ impl ElRunsPanel {
             let run_name = pipeline.name.clone();
             let expanded = self.remote_expanded.contains(&pipeline.name);
             let toggle_name = pipeline.name.clone();
-            // The run to stop, when one of this pipeline's is in flight.
-            let in_flight = self
+            // The runs to stop, when some of this pipeline's are in flight:
+            // two tables of one pipeline can be loading at once.
+            let in_flight: Vec<(u64, u64)> = self
                 .remote_runs
                 .iter()
-                .find(|run| run.pipeline == pipeline.name && run.status == "running")
-                .map(|run| (run.id, run.started_unix));
+                .filter(|run| run.pipeline == pipeline.name && run.status == "running")
+                .map(|run| (run.id, run.started_unix))
+                .collect();
             // How the last finished run went. The list is newest first, and
             // only as long as the server's memory: after a restart there is
             // a time and no outcome, which is what gets shown.
@@ -2736,11 +3010,33 @@ impl ElRunsPanel {
 
             // What it is doing this second, without opening the run: the
             // phase, the rows, and how long it has been at it.
-            let now_cell = match in_flight {
-                Some((run_id, started)) => {
-                    let doing = live_progress(self.run_events(run_id))
-                        .map(|progress| progress.summary())
-                        .unwrap_or_else(|| "running".to_owned());
+            let now_cell = match in_flight.as_slice() {
+                [] => h_flex().flex_1().min_w_0().child(
+                    Label::new("idle")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+                runs => {
+                    let started = runs.iter().map(|(_, started)| *started).min().unwrap_or(0);
+                    let doing = match runs {
+                        [(run_id, _)] => live_progress(self.run_events(*run_id))
+                            .map(|progress| progress.summary())
+                            .unwrap_or_else(|| "running".to_owned()),
+                        // Several at once: the rows of all of them, and
+                        // each stream's own line says the rest.
+                        _ => {
+                            let rows: u64 = runs
+                                .iter()
+                                .filter_map(|(run_id, _)| live_progress(self.run_events(*run_id)))
+                                .map(|progress| progress.rows_written.max(progress.rows_read))
+                                .sum();
+                            format!(
+                                "{} runs · {} rows",
+                                runs.len(),
+                                super::thousands(rows as usize)
+                            )
+                        }
+                    };
                     h_flex()
                         .flex_1()
                         .min_w_0()
@@ -2754,11 +3050,6 @@ impl ElRunsPanel {
                                 .truncate(),
                         )
                 }
-                None => h_flex().flex_1().min_w_0().child(
-                    Label::new("idle")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
             };
 
             let deployed_tip = match (pipeline.deployed_unix, pipeline.created_unix) {
@@ -2785,6 +3076,7 @@ impl ElRunsPanel {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remote_detail = Some(open_name.clone());
+                        this.remote_runs_page = 0;
                         this.remote_stream_picks.clear();
                         cx.notify();
                     }))
@@ -2792,6 +3084,20 @@ impl ElRunsPanel {
                         // Streams unfold in place, so one table can be
                         // launched without leaving the list.
                         div().w(px(16.)).flex_shrink_0().children(
+                            (pipeline.stream_info.is_empty() && pipeline.streams > 0).then(|| {
+                                // The same chevron everywhere: a server too
+                                // old to list its streams says so, instead
+                                // of a row that simply will not open.
+                                IconButton::new(("el-remote-expand-old", ix), IconName::ChevronRight)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Disabled)
+                                    .disabled(true)
+                                    .tooltip(ui::Tooltip::text(
+                                        "This server is older than this panel and does not list \
+                                         its streams — update its image to run them one by one",
+                                    ))
+                            }),
+                        ).children(
                             (!pipeline.stream_info.is_empty()).then(|| {
                                 IconButton::new(
                                     ("el-remote-expand", ix),
@@ -2842,6 +3148,12 @@ impl ElRunsPanel {
                     )
                     .when(any_schedule, |row| {
                         let (text, tip) = match (&pipeline.schedule, pipeline.next_run_unix) {
+                            (Some(schedule), _) if pipeline.paused => (
+                                format!("paused · {schedule}"),
+                                "Its schedule is held: it fires again once resumed, and still \
+                                 runs when asked to"
+                                    .to_owned(),
+                            ),
                             (Some(schedule), Some(next)) => (
                                 format!("{schedule} · {}", relative_time(next, true)),
                                 format!(
@@ -2868,7 +3180,11 @@ impl ElRunsPanel {
                                     .child(
                                         Label::new(text)
                                             .size(LabelSize::Small)
-                                            .color(Color::Muted)
+                                            .color(if pipeline.paused {
+                                                Color::Warning
+                                            } else {
+                                                Color::Muted
+                                            })
                                             .truncate(),
                                     ),
                             ),
@@ -2905,20 +3221,36 @@ impl ElRunsPanel {
                     )
                     .child(last_run_cell)
                     .child(now_cell)
-                    .children(in_flight.map(|(run_id, _)| {
-                        Button::new(("el-remote-cancel", ix), "Cancel")
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Tinted(ui::TintColor::Warning))
-                            .start_icon(Icon::new(IconName::Stop).size(IconSize::XSmall))
-                            .tooltip(ui::Tooltip::text(
-                                "Stop the run in progress, and the query it has open on the source",
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remote_action(move |client| client.cancel(run_id), cx);
-                            }))
+                    .children((!in_flight.is_empty()).then(|| {
+                        let run_ids: Vec<u64> = in_flight.iter().map(|(id, _)| *id).collect();
+                        Button::new(
+                            ("el-remote-cancel", ix),
+                            if run_ids.len() > 1 { "Cancel all" } else { "Cancel" },
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Tinted(ui::TintColor::Warning))
+                        .start_icon(Icon::new(IconName::Stop).size(IconSize::XSmall))
+                        .tooltip(ui::Tooltip::text(if run_ids.len() > 1 {
+                            format!(
+                                "Stop its {} runs in progress — or one of them from its stream's row",
+                                run_ids.len()
+                            )
+                        } else {
+                            "Stop the run in progress, and the query it has open on the source"
+                                .to_owned()
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let run_ids = run_ids.clone();
+                            this.remote_action(
+                                move |client| {
+                                    run_ids.iter().try_for_each(|run_id| client.cancel(*run_id))
+                                },
+                                cx,
+                            );
+                        }))
                     }))
-                    .children(in_flight.is_none().then(|| {
+                    .children(in_flight.is_empty().then(|| {
                         Button::new(("el-remote-run", ix), "Run")
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Outlined)
@@ -2929,7 +3261,15 @@ impl ElRunsPanel {
                                 cx.stop_propagation();
                                 this.run_remote(run_name.clone(), Vec::new(), cx);
                             }))
-                    })),
+                    }))
+                    .child(
+                        // Its own click, not the row's: the menu opens, the
+                        // pipeline's page does not.
+                        div()
+                            .id(("el-remote-more-slot", ix))
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(self.pipeline_menu(("el-remote-more", ix), pipeline, cx)),
+                    ),
             );
             if expanded {
                 for (stream_ix, stream) in pipeline.stream_info.iter().enumerate() {
@@ -2940,7 +3280,6 @@ impl ElRunsPanel {
                         stream,
                         stream_ix,
                         false,
-                        pipeline.running,
                         cx,
                     ));
                 }
@@ -2955,7 +3294,6 @@ impl ElRunsPanel {
             natural.clamp(56., 320.)
         };
         self.remote_split_shown = shown;
-        let run_count = self.remote_runs.len();
 
         let dragging = self.remote_split_drag.is_some();
         v_flex()
@@ -3033,22 +3371,6 @@ impl ElRunsPanel {
                         }),
                     ),
             )
-            .child(
-                h_flex()
-                    .px_2()
-                    .pt_1()
-                    .pb_0p5()
-                    .gap_1p5()
-                    .items_center()
-                    .child(Label::new("Recent runs").size(LabelSize::Default))
-                    .when(run_count > 0, |title| {
-                        title.child(
-                            Label::new(run_count.to_string())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    }),
-            )
             .child(self.render_runs_table(None, window, cx))
             .into_any_element()
     }
@@ -3068,6 +3390,7 @@ impl ElRunsPanel {
             .find(|pipeline| pipeline.name == name.as_ref());
         let run_name = name.to_string();
         let running = pipeline.map(|pipeline| pipeline.running).unwrap_or(false);
+        let paused = pipeline.is_some_and(|pipeline| pipeline.paused);
         // Ticked streams, in the pipeline's own order rather than the
         // order they happened to be clicked in.
         let picked: Vec<String> = pipeline
@@ -3097,6 +3420,9 @@ impl ElRunsPanel {
                     ),
                 };
                 let mut text = match (&pipeline.schedule, pipeline.next_run_unix) {
+                    (Some(schedule), _) if pipeline.paused => {
+                        format!("{streams} — schedule {schedule} is paused")
+                    }
                     (Some(schedule), Some(next)) => format!(
                         "{streams} — runs on {schedule}, next {}",
                         relative_time(next, true)
@@ -3130,6 +3456,7 @@ impl ElRunsPanel {
                     .tooltip(ui::Tooltip::text("Back to pipelines"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.remote_detail = None;
+                        this.remote_runs_page = 0;
                         this.remote_stream_picks.clear();
                         cx.notify();
                     })),
@@ -3137,6 +3464,11 @@ impl ElRunsPanel {
             .child(Label::new(name.clone()).size(LabelSize::Default))
             .child(Label::new(meta).size(LabelSize::Small).color(Color::Muted))
             .child(div().flex_1())
+            .children(paused.then(|| {
+                ui::Chip::new("schedule paused")
+                    .label_size(LabelSize::Small)
+                    .label_color(Color::Warning)
+            }))
             .children(running.then(|| {
                 Label::new("running")
                     .size(LabelSize::Small)
@@ -3148,7 +3480,11 @@ impl ElRunsPanel {
                     .style(ButtonStyle::Filled)
                     .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
                     .disabled(running || pipeline.is_none())
-                    .tooltip(ui::Tooltip::text("Run every stream"))
+                    .tooltip(ui::Tooltip::text(if running {
+                        "Part of it is running — start the other streams from their own rows"
+                    } else {
+                        "Run every stream"
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_remote(run_name.clone(), Vec::new(), cx);
                     }))
@@ -3156,6 +3492,13 @@ impl ElRunsPanel {
             .children((!picked.is_empty()).then(|| {
                 let picked_names = picked.clone();
                 let picked_pipeline = name.to_string();
+                let picked_busy: Vec<String> = picked
+                    .iter()
+                    .filter(|stream| {
+                        run_moving(&self.remote_runs, name.as_ref(), stream).is_some()
+                    })
+                    .cloned()
+                    .collect();
                 Button::new(
                     "el-remote-detail-run-picked",
                     format!(
@@ -3167,15 +3510,19 @@ impl ElRunsPanel {
                 .label_size(LabelSize::Small)
                 .style(ButtonStyle::Filled)
                 .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
-                .disabled(running)
-                .tooltip(ui::Tooltip::text(format!(
-                    "Run only: {}",
-                    picked_names.join(", ")
-                )))
+                .disabled(!picked_busy.is_empty())
+                .tooltip(ui::Tooltip::text(if picked_busy.is_empty() {
+                    format!("Run only: {}", picked_names.join(", "))
+                } else {
+                    format!("Already running: {}", picked_busy.join(", "))
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let picked = picked_names.clone();
                     this.run_remote(picked_pipeline.clone(), picked, cx);
                 }))
+            }))
+            .children(pipeline.map(|pipeline| {
+                self.pipeline_menu("el-remote-detail-more", pipeline, cx)
             }));
 
         // The streams as a table: tick several and send them in one run,
@@ -3218,7 +3565,6 @@ impl ElRunsPanel {
                     stream,
                     ix,
                     true,
-                    running,
                     cx,
                 ));
             }
@@ -3267,13 +3613,6 @@ impl ElRunsPanel {
             .min_h_0()
             .child(header)
             .child(streams_block)
-            .child(
-                div().px_2().pt_1().child(
-                    Label::new("Runs of this pipeline")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            )
             .child(self.render_runs_table(Some(name.as_ref()), window, cx))
             .into_any_element()
     }
@@ -3731,9 +4070,18 @@ impl ElRunsPanel {
                 .child(element)
         };
         let show_pipeline = filter.is_none();
+        let problems_only = self.remote_runs_problems_only;
         let listed = |run: &&el_engine::server::RemoteRun| {
             filter.is_none_or(|name| run.pipeline == name)
+                && (!problems_only || matches!(run.status.as_str(), "failed" | "cancelled"))
         };
+        // Only the page is drawn. All of them used to be, on every frame:
+        // five hundred rows of a pipeline that fires every two minutes was
+        // a table that froze under its own length.
+        let total = self.remote_runs.iter().filter(listed).count();
+        let (first, last, pages) = page_bounds(total, self.remote_runs_page, RUNS_PAGE);
+        let page = first / RUNS_PAGE;
+        self.remote_runs_page = page;
         // Columns that would be a dash on every line stay away until a run
         // gives them something to say.
         let any_casts = self
@@ -3775,10 +4123,13 @@ impl ElRunsPanel {
             .track_scroll(&self.remote_runs_scroll)
             .px_1();
         let mut shown = 0usize;
-        for run in &self.remote_runs {
-            if filter.is_some_and(|name| run.pipeline != name) {
-                continue;
-            }
+        for run in self
+            .remote_runs
+            .iter()
+            .filter(listed)
+            .skip(first)
+            .take(last - first)
+        {
             let stripe = shown % 2 == 1;
             shown += 1;
             let run_id = run.id;
@@ -3985,7 +4336,9 @@ impl ElRunsPanel {
                             .color(Color::Muted),
                     )
                     .child(
-                        Label::new(if filter.is_some() {
+                        Label::new(if problems_only {
+                            "No failed or cancelled runs — every run the server remembers went through."
+                        } else if filter.is_some() {
                             "This pipeline has not run here yet — Run starts it."
                         } else {
                             "Nothing has run on this server since it started — press Run on a pipeline."
@@ -3995,9 +4348,80 @@ impl ElRunsPanel {
                     ),
             );
         }
+        // The table's own bar: what is listed, how much of it, and the way
+        // through the rest.
+        let bar = h_flex()
+            .w_full()
+            .px_2()
+            .pt_1()
+            .pb_0p5()
+            .gap_2()
+            .items_center()
+            .child(
+                Label::new(if filter.is_some() { "Runs" } else { "Recent runs" })
+                    .size(LabelSize::Default),
+            )
+            .child(
+                Label::new(if total == 0 {
+                    "none".to_owned()
+                } else {
+                    format!(
+                        "{}–{} of {}",
+                        super::thousands(first + 1),
+                        super::thousands(last),
+                        super::thousands(total)
+                    )
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("el-runs-problems", "Problems only")
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Warning).size(IconSize::Small))
+                    .toggle_state(problems_only)
+                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Warning))
+                    .tooltip(ui::Tooltip::text("Failed and cancelled runs only"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.remote_runs_problems_only = !this.remote_runs_problems_only;
+                        this.remote_runs_page = 0;
+                        cx.notify();
+                    })),
+            )
+            .when(pages > 1, |bar| {
+                bar.child(
+                    IconButton::new("el-runs-newer", IconName::ChevronLeft)
+                        .icon_size(IconSize::Small)
+                        .disabled(page == 0)
+                        .tooltip(ui::Tooltip::text("Newer runs"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.remote_runs_page = this.remote_runs_page.saturating_sub(1);
+                            this.remote_runs_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Label::new(format!("{} / {pages}", page + 1))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    IconButton::new("el-runs-older", IconName::ChevronRight)
+                        .icon_size(IconSize::Small)
+                        .disabled(page + 1 >= pages)
+                        .tooltip(ui::Tooltip::text("Older runs"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.remote_runs_page += 1;
+                            this.remote_runs_scroll.set_offset(gpui::point(px(0.), px(0.)));
+                            cx.notify();
+                        })),
+                )
+            });
         v_flex()
             .flex_1()
             .min_h_0()
+            .child(bar)
             .child(header)
             .child(div().flex_1().min_h_0().child(runs).custom_scrollbars(
                 super::scrollbar(&self.remote_runs_scroll),
@@ -4925,8 +5349,8 @@ mod tests {
     use super::{
         Color, ConsoleGrid, IconName, PreviewTable, REMOTE_LOG_CAP, TOOLTIP_CAP, absolute_time,
         append_log, eta_text, fit_widths, live_progress, log_color, merge_log_tail, merge_run,
-        one_line, place_run_event, rate_text, select_sql, sorted_rows, span_text, split_log_line,
-        status_mark, tooltip_text,
+        older_server, one_line, page_bounds, place_run_event, rate_text, run_moving, select_sql,
+        sorted_rows, span_text, split_log_line, status_mark, tooltip_text,
     };
 
     #[test]
@@ -5055,7 +5479,67 @@ mod tests {
             rows_written: 0,
             cast_failures: None,
             error: None,
+            streams: Vec::new(),
         }
+    }
+
+    fn run_of(id: u64, status: &str, streams: &[&str]) -> el_engine::server::RemoteRun {
+        el_engine::server::RemoteRun {
+            streams: streams.iter().map(|name| (*name).to_owned()).collect(),
+            ..run(id, status)
+        }
+    }
+
+    /// One table of a pipeline loading does not grey out the others: a
+    /// stream is held by a run that has that stream in it, and by nothing
+    /// else — except on a server too old to say what its runs hold, where
+    /// a run holds the whole pipeline, as it did.
+    #[test]
+    fn a_stream_is_held_only_by_a_run_that_moves_it() {
+        let runs = vec![
+            run_of(3, "ok", &["bls_doctax"]),
+            run_of(2, "running", &["oas_docline"]),
+        ];
+        assert_eq!(run_moving(&runs, "orders", "oas_docline").map(|run| run.id), Some(2));
+        assert!(
+            run_moving(&runs, "orders", "bls_doctax").is_none(),
+            "its own last run is over, and the one in flight is another table's"
+        );
+        assert!(run_moving(&runs, "invoices", "oas_docline").is_none(), "another pipeline");
+
+        let older = vec![run(7, "running")];
+        assert_eq!(
+            run_moving(&older, "orders", "anything").map(|run| run.id),
+            Some(7),
+            "no stream list: the run is the whole pipeline's"
+        );
+    }
+
+    #[test]
+    fn a_page_is_a_slice_and_a_page_past_the_end_is_the_last_one() {
+        assert_eq!(page_bounds(0, 0, 50), (0, 0, 1), "an empty list is one empty page");
+        assert_eq!(page_bounds(120, 0, 50), (0, 50, 3));
+        assert_eq!(page_bounds(120, 2, 50), (100, 120, 3));
+        assert_eq!(
+            page_bounds(60, 9, 50),
+            (50, 60, 2),
+            "the list shrank under the page that was open"
+        );
+        assert_eq!(page_bounds(50, 0, 50), (0, 50, 1), "exactly one page is one page");
+    }
+
+    /// A 404 from a route an older server never had is not "not found"
+    /// about the pipeline; a pipeline that really is gone keeps its words.
+    #[test]
+    fn an_older_servers_404_is_said_as_what_it_is() {
+        let route = older_server(anyhow::anyhow!("remote returned 404: not found"));
+        assert!(route.to_string().contains("older than this panel"));
+        let gone = older_server(anyhow::anyhow!(
+            "remote returned 404: no pipeline named \"orders\" is deployed"
+        ));
+        assert!(gone.to_string().contains("no pipeline named"));
+        let other = older_server(anyhow::anyhow!("remote returned 409: orders is running"));
+        assert!(other.to_string().contains("is running"));
     }
 
     fn started(pipeline: &str) -> el_engine::ProgressEvent {

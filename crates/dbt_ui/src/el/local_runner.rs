@@ -20,7 +20,7 @@ pub const REMOTE_NAME: &str = "localhost";
 pub const PORT: u16 = 7431;
 /// The image offered when the project does not name one.
 pub const DEFAULT_IMAGE: &str =
-    "europe-west4-docker.pkg.dev/jules-terraform/docker/zdbt-el-serve:el-v0.3.0-10-gce77cc2";
+    "europe-west4-docker.pkg.dev/jules-terraform/docker/zdbt-el-serve:el-v0.3.0-42-g2f180fe";
 /// Environment or `.env` variable overriding the image: another tag, or a
 /// provider's other registry.
 pub const IMAGE_VAR: &str = "EL_RUNNER_IMAGE";
