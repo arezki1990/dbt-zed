@@ -89,6 +89,9 @@ impl ElPipelineCanvas {
             .items_of_type::<ElPipelineCanvas>(cx)
             .find(|item| item.read(cx).spec_path == spec_path);
         if let Some(existing) = existing {
+            // Coming from the YAML, the file may have been saved a moment
+            // ago: look now rather than when the worktree event lands.
+            existing.update(cx, |canvas, cx| canvas.reload_if_changed(cx));
             workspace.activate_item(&existing, true, true, window, cx);
             return;
         }

@@ -116,40 +116,6 @@ pub fn pipeline_project_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Deploys the pipeline whose spec is open in the active editor — the
-/// same popup the canvas opens, for someone editing the YAML directly.
-pub fn deploy_active_pipeline(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut gpui::Context<Workspace>,
-) {
-    let Some(spec_path) = active_pipeline_path(workspace, cx) else {
-        toast(
-            workspace,
-            "Open a pipeline under el/pipelines to deploy it.",
-            cx,
-        );
-        return;
-    };
-    let Some(root) = pipeline_project_root(&spec_path) else {
-        return;
-    };
-    // The name the spec declares, not the file's: they are usually the
-    // same, and when they are not the popup says so rather than deploying
-    // under a name nobody wrote.
-    let name = el_engine::spec::load_pipeline(&spec_path)
-        .map(|pipeline| pipeline.pipeline)
-        .unwrap_or_else(|_| {
-            spec_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("pipeline")
-                .to_owned()
-        });
-    let project = workspace.project().clone();
-    deploy_modal::ElDeployModal::deploy(workspace, root, name, spec_path, project, window, cx);
-}
-
 /// The pipeline spec open in the active editor, if that is what it is.
 pub fn active_pipeline_path(workspace: &Workspace, cx: &gpui::App) -> Option<PathBuf> {
     let editor = workspace
@@ -375,10 +341,16 @@ pub fn find_worker() -> Option<PathBuf> {
     managed.is_file().then_some(managed)
 }
 
-/// `el::OpenPipelines`: opens the canvas for the project's pipeline(s) —
-/// the first (alphabetically) when several exist; the database panel's
-/// pipeline list is the picker for the rest.
+/// `el::OpenPipelines`: opens the pipeline canvas. With a pipeline spec in
+/// the active editor it is that pipeline's — the switch from the YAML to
+/// its graph, which is where Run and Deploy are. Otherwise the project's
+/// first (alphabetically); the database panel's pipeline list is the
+/// picker for the rest.
 pub fn open_pipelines(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if let Some(spec_path) = active_pipeline_path(workspace, cx) {
+        open_active_pipeline(workspace, spec_path, window, cx);
+        return;
+    }
     let Some(root) = discover_el_root(workspace, cx) else {
         toast(workspace, "No project folder open in this workspace.", cx);
         return;
@@ -394,6 +366,48 @@ pub fn open_pipelines(workspace: &mut Workspace, window: &mut Window, cx: &mut C
             cx,
         ),
     }
+}
+
+/// Opens the canvas for the spec in the active editor. The canvas draws
+/// the file, not the buffer, and refuses to write under a dirty one — so
+/// unsaved edits are saved first: the graph is then the YAML that was on
+/// screen, and the first edit made on it goes through.
+fn open_active_pipeline(
+    workspace: &mut Workspace,
+    spec_path: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(root) = pipeline_project_root(&spec_path) else {
+        return;
+    };
+    let unsaved = workspace
+        .active_item(cx)
+        .is_some_and(|item| item.is_dirty(cx));
+    if !unsaved {
+        canvas_item::ElPipelineCanvas::deploy(workspace, root, spec_path, window, cx);
+        return;
+    }
+    let save = workspace.save_active_item(workspace::SaveIntent::Save, window, cx);
+    cx.spawn_in(window, async move |workspace, cx| {
+        let saved = save.await;
+        workspace
+            .update_in(cx, |workspace, window, cx| match saved {
+                // A save the user cancelled is `Ok` too: the canvas then
+                // shows the file as it is, and the tab still says unsaved.
+                Ok(()) => {
+                    canvas_item::ElPipelineCanvas::deploy(workspace, root, spec_path, window, cx)
+                }
+                Err(error) => toast_error(
+                    workspace,
+                    &format!("Couldn't save the pipeline to open its canvas: {error:#}"),
+                    None,
+                    cx,
+                ),
+            })
+            .ok();
+    })
+    .detach();
 }
 
 /// `el::InitializeWorkspace`: scaffolds `el/` and opens the example
