@@ -24,6 +24,13 @@ use crate::ToggleElRunsFocus;
 
 const QUERY_ROW_CAP: usize = 500;
 
+/// How long the explorer lets a query run before it stops it — the
+/// engine's limit, on this machine's worker and on a remote's alike. Said
+/// in the panel because the engine's own words for it are "is the database
+/// reachable?", which sends people looking at the network for a query
+/// that was merely slow.
+const QUERY_LIMIT_SECS: u64 = 90;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Surface {
     Runs,
@@ -45,6 +52,9 @@ pub struct ElRunsPanel {
     sql: Entity<Editor>,
     /// (name, kind) — names only, credential posture as everywhere.
     connections: Vec<(SharedString, SharedString)>,
+    /// Where each connection's queries run, by the same index: the remote
+    /// its `workspace:` names, or None for this machine's own worker.
+    connection_workspaces: Vec<Option<SharedString>>,
     selected: Option<usize>,
     root: Option<PathBuf>,
     running: bool,
@@ -55,7 +65,13 @@ pub struct ElRunsPanel {
     detail_scroll: ScrollHandle,
     elapsed: Option<Duration>,
     query_error: Option<SharedString>,
+    /// When the query in flight was sent, for a clock that moves.
+    query_started: Option<Instant>,
+    /// Said once, after the operator stopped waiting for a query.
+    query_notice: Option<SharedString>,
     _query: Task<()>,
+    /// Redraws once a second while a query runs.
+    _query_tick: Task<()>,
     // Remote surface state (from el/remotes.yml).
     remotes: Vec<SharedString>,
     selected_remote: Option<usize>,
@@ -612,6 +628,7 @@ impl ElRunsPanel {
                 preview_h_scroll: ScrollHandle::new(),
                 sql,
                 connections: Vec::new(),
+                connection_workspaces: Vec::new(),
                 selected: None,
                 root: None,
                 running: false,
@@ -621,7 +638,10 @@ impl ElRunsPanel {
                 detail_scroll: ScrollHandle::new(),
                 elapsed: None,
                 query_error: None,
+                query_started: None,
+                query_notice: None,
                 _query: Task::ready(()),
+                _query_tick: Task::ready(()),
                 remotes: Vec::new(),
                 selected_remote: None,
                 remote_pipelines: Vec::new(),
@@ -820,17 +840,19 @@ impl ElRunsPanel {
         });
         self.root = root.clone();
         let Some(root) = root else { return };
-        self.connections = el_engine::spec::load_active_connections(&root)
-            .map(|(connections, _)| {
-                connections
-                    .connections
-                    .iter()
-                    .map(|(name, connection)| {
-                        (name.clone().into(), connection.kind().to_owned().into())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let loaded = el_engine::spec::load_active_connections(&root)
+            .map(|(connections, _)| connections)
+            .ok();
+        self.connections = loaded
+            .iter()
+            .flat_map(|connections| connections.connections.iter())
+            .map(|(name, connection)| (name.clone().into(), connection.kind().to_owned().into()))
+            .collect();
+        self.connection_workspaces = loaded
+            .iter()
+            .flat_map(|connections| connections.connections.values())
+            .map(|connection| connection.workspace().map(|remote| remote.to_owned().into()))
+            .collect();
         if self
             .selected
             .map_or(true, |ix| ix >= self.connections.len())
@@ -1441,6 +1463,22 @@ impl ElRunsPanel {
         self.running = true;
         self.result = None;
         self.elapsed = None;
+        self.query_notice = None;
+        self.query_started = Some(Instant::now());
+        self._query_tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let running = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.running
+                    })
+                    .unwrap_or(false);
+                if !running {
+                    return;
+                }
+            }
+        });
         cx.notify();
         let task = cx.background_spawn(async move {
             let started = std::time::Instant::now();
@@ -1451,6 +1489,7 @@ impl ElRunsPanel {
             let outcome = task.await;
             this.update(cx, |this, cx| {
                 this.running = false;
+                this.query_started = None;
                 match outcome {
                     Ok((result, elapsed)) => {
                         this.elapsed = Some(elapsed);
@@ -1477,44 +1516,149 @@ impl ElRunsPanel {
         });
     }
 
+    /// Stops waiting for the query in flight. The wait is all that can be
+    /// dropped from here: the worker call underneath blocks until the
+    /// database answers or the explorer's own limit cuts it off, so the
+    /// notice says what is true rather than "cancelled".
+    fn stop_waiting(&mut self, cx: &mut Context<Self>) {
+        if !self.running {
+            return;
+        }
+        self._query = Task::ready(());
+        self.running = false;
+        self.query_started = None;
+        self.query_notice = Some(
+            format!(
+                "Stopped waiting. The query itself ends on its own — the explorer cuts \
+                 every query off at {QUERY_LIMIT_SECS} seconds."
+            )
+            .into(),
+        );
+        cx.notify();
+    }
+
     fn render_query(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().colors();
-        // The connection comes from the EL panel (expand one, or click a
-        // table); here it is only stated, not chosen.
-        let target: gpui::AnyElement = match self.selected.and_then(|ix| self.connections.get(ix)) {
-            Some((name, kind)) => h_flex()
-                .gap_1()
-                .items_center()
-                .child(Label::new("on").size(LabelSize::XSmall).color(Color::Muted))
-                .child(
-                    Label::new(name.clone())
-                        .size(LabelSize::Default)
-                        .color(Color::Accent),
-                )
-                .child(
-                    Label::new(kind.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .into_any_element(),
-            None => Label::new("Pick a connection in the EL panel")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
+        let colors = cx.theme().colors().clone();
+        let colors = &colors;
+        let selected = self
+            .selected
+            .and_then(|ix| self.connections.get(ix).cloned());
+        let runs_on: Option<SharedString> = self
+            .selected
+            .and_then(|ix| self.connection_workspaces.get(ix).cloned().flatten());
+        let where_text: SharedString = match &runs_on {
+            Some(remote) => format!("on {remote}").into(),
+            None => "on this machine".into(),
         };
 
-        let status: Option<SharedString> = if self.running {
-            Some("Running…".into())
-        } else if let (Some(result), Some(elapsed)) = (&self.result, self.elapsed) {
-            let count = result.table.rows.len();
-            let capped = if count >= QUERY_ROW_CAP {
-                format!(" (first {QUERY_ROW_CAP})")
-            } else {
-                String::new()
-            };
-            Some(format!("{count} rows{capped} in {:.2}s", elapsed.as_secs_f64()).into())
+        // The connection is chosen here as well as from the EL panel: it
+        // used to be only stated, and changing it meant leaving the console.
+        let picker: gpui::AnyElement = if self.connections.is_empty() {
+            Label::new("No connections yet")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
         } else {
-            None
+            let this = cx.entity();
+            let connections = self.connections.clone();
+            let current = self.selected;
+            let label: SharedString = selected
+                .as_ref()
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| "Pick a connection".into());
+            ui::DropdownMenu::new(
+                "el-query-connection",
+                label,
+                ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Query on");
+                    for (ix, (name, kind)) in connections.iter().enumerate() {
+                        let this = this.clone();
+                        menu = menu.toggleable_entry(
+                            format!("{name}  ·  {kind}"),
+                            current == Some(ix),
+                            ui::IconPosition::Start,
+                            None,
+                            move |_window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.selected = Some(ix);
+                                    this.query_notice = None;
+                                    cx.notify();
+                                });
+                            },
+                        );
+                    }
+                    menu
+                }),
+            )
+            .style(ui::DropdownStyle::Outlined)
+            .trigger_tooltip(ui::Tooltip::text(
+                "The connection this query runs on — any of el/connections.yml",
+            ))
+            .into_any_element()
+        };
+
+        let target = h_flex()
+            .gap_2()
+            .items_center()
+            .child(picker)
+            .children(selected.as_ref().map(|(_, kind)| {
+                ui::Chip::new(kind.clone())
+                    .label_size(LabelSize::Small)
+                    .label_color(Color::Muted)
+            }))
+            .children(selected.as_ref().map(|(name, _)| {
+                // Where it runs explains what the wait is made of, and why
+                // a laptop with no route to the database still gets rows.
+                let tip = match &runs_on {
+                    Some(remote) => format!(
+                        "{name} names the {remote} workspace in connections.yml: the query is \
+                         sent to that server and runs there, next to the database"
+                    ),
+                    None => format!("{name} runs through this machine's own connector worker"),
+                };
+                h_flex()
+                    .id("el-query-where")
+                    .gap_1()
+                    .items_center()
+                    .when(runs_on.is_some(), |place| {
+                        place.child(
+                            Icon::new(IconName::Server)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        Label::new(format!("runs {where_text}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(ui::Tooltip::text(tip))
+            }));
+
+        let sql_focus = self.sql.focus_handle(cx);
+        let action: gpui::AnyElement = if self.running {
+            Button::new("el-query-stop", "Stop waiting")
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Tinted(ui::TintColor::Warning))
+                .start_icon(Icon::new(IconName::Stop).size(IconSize::Small))
+                .tooltip(ui::Tooltip::text(format!(
+                    "Give the console back. The query itself ends on its own, at the \
+                     explorer's {QUERY_LIMIT_SECS}-second limit at the latest"
+                )))
+                .on_click(cx.listener(|this, _, _, cx| this.stop_waiting(cx)))
+                .into_any_element()
+        } else {
+            let focus = sql_focus.clone();
+            Button::new("el-query-run", "Run query")
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Filled)
+                .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
+                .disabled(selected.is_none())
+                .tooltip(move |_window, cx| {
+                    ui::Tooltip::for_action_in("Run query", &crate::RunQuery, &focus, cx)
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.run_query(cx)))
+                .into_any_element()
         };
 
         let toolbar = h_flex()
@@ -1522,22 +1666,13 @@ impl ElRunsPanel {
             .p_1()
             .gap_2()
             .items_center()
+            .flex_wrap()
             .child(target)
             .child(div().flex_1())
-            .children(status.map(|status| {
-                Label::new(status)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-            }))
-            .child(
-                Button::new("el-query-run", "Run query")
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Filled)
-                    .disabled(self.running)
-                    .on_click(cx.listener(|this, _, _, cx| this.run_query(cx))),
-            );
+            .child(action);
 
         let dragging = self.query_split_drag.is_some();
+        let editing = sql_focus.is_focused(window);
         let editor = div().w_full().px_1().child(
             div()
                 .w_full()
@@ -1545,7 +1680,13 @@ impl ElRunsPanel {
                 .p_1()
                 .rounded_sm()
                 .border_1()
-                .border_color(colors.border)
+                // Which box has the keyboard is otherwise a blinking
+                // cursor's worth of evidence.
+                .border_color(if editing {
+                    colors.border_focused
+                } else {
+                    colors.border
+                })
                 .bg(colors.editor_background)
                 .child(self.sql.clone()),
         );
@@ -1572,25 +1713,157 @@ impl ElRunsPanel {
                 }),
             );
 
-        let body: gpui::AnyElement = if let Some(error) = &self.query_error {
+        let run_hint = ui::KeyBinding::for_action_in(&crate::RunQuery, &sql_focus, cx);
+        let body: gpui::AnyElement = if self.running {
+            let waited = self
+                .query_started
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0);
+            v_flex()
+                .flex_1()
+                .p_3()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(live_dot("el-query-live", Color::Accent))
+                        .child(
+                            Label::new(format!("Running {where_text} · {}", span_text(waited)))
+                                .size(LabelSize::Default),
+                        ),
+                )
+                .child(
+                    // How much of the explorer's patience is used up: a wait
+                    // with an end in sight is a different wait.
+                    div().w(px(260.)).child(ui::ProgressBar::new(
+                        "el-query-limit",
+                        waited.min(QUERY_LIMIT_SECS) as f32,
+                        QUERY_LIMIT_SECS as f32,
+                        cx,
+                    )),
+                )
+                .child(
+                    Label::new(format!(
+                        "The explorer stops a query at {QUERY_LIMIT_SECS} seconds."
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .when(waited >= 15, |state| {
+                    state.child(
+                        Label::new(
+                            "A long wait usually means the database is reading a whole table — \
+                             a TOP / LIMIT, or a filter on an indexed column, answers sooner.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                })
+                .into_any_element()
+        } else if let Some(error) = self.query_error.clone() {
+            // The engine's words for its own limit are "is the database
+            // reachable?" — it usually is, and was busy.
+            let timed_out = error.contains("timed out after");
             v_flex()
                 .flex_1()
                 .p_2()
                 .child(
-                    Label::new(error.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
+                    ui::Callout::new()
+                        .severity(ui::Severity::Error)
+                        .icon(IconName::XCircle)
+                        .title(if timed_out {
+                            format!("The query did not finish in {QUERY_LIMIT_SECS} seconds")
+                        } else {
+                            "The query failed".to_owned()
+                        })
+                        .description_slot(
+                            v_flex()
+                                .gap_1()
+                                .child(Label::new(error.clone()).size(LabelSize::Small))
+                                .when(timed_out, |text| {
+                                    text.child(
+                                        Label::new(
+                                            "That is the explorer's limit, not a network error: \
+                                             the database was most likely busy reading. Add a \
+                                             TOP / LIMIT, or filter on an indexed column.",
+                                        )
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                        .actions_slot(
+                            ui::CopyButton::new("el-query-copy-error", error.to_string())
+                                .icon_size(IconSize::Small)
+                                .tooltip_label("Copy error"),
+                        ),
                 )
                 .into_any_element()
-        } else if self.result.is_some() {
-            self.render_grid(GridSlot::Result, window, cx)
+        } else if let Some(result) = &self.result {
+            let count = result.table.rows.len();
+            let capped = count >= QUERY_ROW_CAP;
+            let took = self.elapsed.map(|elapsed| elapsed.as_secs_f64());
+            let result_bar = h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .child(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Success),
+                )
+                .child(
+                    Label::new(format!(
+                        "{} {}",
+                        super::thousands(count),
+                        if count == 1 { "row" } else { "rows" }
+                    ))
+                    .size(LabelSize::Small),
+                )
+                .when(capped, |bar| {
+                    bar.child(
+                        div()
+                            .id("el-query-capped")
+                            .child(
+                                Label::new(format!("first {QUERY_ROW_CAP} shown"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Warning),
+                            )
+                            .tooltip(ui::Tooltip::text(format!(
+                                "The console shows at most {QUERY_ROW_CAP} rows. There may be \
+                                 more: narrow the query to see the ones you are after"
+                            ))),
+                    )
+                })
+                .children(took.map(|took| {
+                    Label::new(format!("{took:.2}s"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                }))
+                .child(
+                    Label::new(where_text.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(result_bar)
+                .child(self.render_grid(GridSlot::Result, window, cx))
+                .into_any_element()
         } else if self.connections.is_empty() {
             v_flex()
                 .flex_1()
-                .p_2()
+                .p_3()
+                .gap_1p5()
+                .child(Label::new("No connections yet").size(LabelSize::Default))
                 .child(
                     Label::new(
-                        "No connections yet — run el: initialize workspace to create el/connections.yml.",
+                        "Run \"el: initialize workspace\" to create el/connections.yml, or add \
+                         one from the EL panel.",
                     )
                     .size(LabelSize::Small)
                     .color(Color::Muted),
@@ -1599,14 +1872,33 @@ impl ElRunsPanel {
         } else {
             v_flex()
                 .flex_1()
-                .p_2()
+                .p_3()
+                .gap_1p5()
+                .children(self.query_notice.clone().map(|notice| {
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Info)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(notice).size(LabelSize::Small))
+                }))
+                .child(Label::new("Write a query, then run it").size(LabelSize::Default))
                 .child(
-                    Label::new(
-                        "Write a query and run it — or click a table in the EL panel to \
-                         start from SELECT *.",
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(run_hint)
+                        .child(
+                            Label::new(
+                                "runs it — or click a table in the EL panel to start from its \
+                                 first rows.",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ),
                 )
                 .into_any_element()
         };
@@ -4108,7 +4400,7 @@ impl ElRunsPanel {
                     .w(px(ROW_NUMBER_WIDTH))
                     .flex_none()
                     .px_2()
-                    .child(Label::new("#").size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(Label::new("#").size(LabelSize::Small).color(Color::Muted)),
             )
             .children(columns.iter().enumerate().map(|(column, name)| {
                 let arrow = match grid.sort {
@@ -4211,7 +4503,7 @@ impl ElRunsPanel {
                                 .child(
                                     div().w(px(ROW_NUMBER_WIDTH)).flex_none().px_2().child(
                                         Label::new((original + 1).to_string())
-                                            .size(LabelSize::XSmall)
+                                            .size(LabelSize::Small)
                                             .color(Color::Muted),
                                     ),
                                 )
@@ -4552,7 +4844,7 @@ impl Render for ElRunsPanel {
                             .child(Label::new(preview.table.title.clone()).size(LabelSize::Default))
                             .child(
                                 Label::new(format!("{count} rows"))
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted),
                             ),
                     )
@@ -4611,6 +4903,13 @@ impl Render for ElRunsPanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("ElRunsPanel")
+            .on_action(cx.listener(|this, _: &crate::RunQuery, _, cx| {
+                // Bound inside the SQL box; the Query surface is the only
+                // place that box is on screen.
+                if this.surface == Surface::Query {
+                    this.run_query(cx);
+                }
+            }))
             .bg(colors.panel_background)
             .child(body)
             .children(self.render_cell_detail(window, cx))

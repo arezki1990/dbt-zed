@@ -44,6 +44,8 @@ actions!(
         RunPipeline,
         /// Cancels the active EL run.
         CancelRun,
+        /// Runs the query in the EL console's editor.
+        RunQuery,
         /// Toggles focus on the EL pipelines panel.
         ToggleElPanelFocus,
         /// Toggles focus on the EL runs panel.

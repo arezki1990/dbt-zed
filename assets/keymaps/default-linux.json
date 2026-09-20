@@ -624,6 +624,15 @@
     },
   },
   {
+    // Deeper than the editor's own binding for the same keys, and later in
+    // this file: in the console's SQL box it runs the query.
+    "context": "ElRunsPanel > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "el::RunQuery",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
