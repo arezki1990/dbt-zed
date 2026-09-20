@@ -5327,6 +5327,7 @@ dependencies = [
  "anyhow",
  "async-compression",
  "async-tar",
+ "chrono",
  "client",
  "editor",
  "el_engine",
