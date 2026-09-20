@@ -84,6 +84,82 @@ pub fn el_dir(project_root: &Path) -> PathBuf {
     project_root.join("el")
 }
 
+/// Whether a path is a pipeline spec — `<root>/el/pipelines/<name>.yml`.
+/// Shape only: this is asked on every toolbar render, so it never opens
+/// the file, and a deploy re-reads and re-validates the spec anyway.
+pub fn is_pipeline_file(path: &Path) -> bool {
+    let is_yaml = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "yml" || extension == "yaml");
+    if !is_yaml {
+        return false;
+    }
+    let mut ancestors = path.ancestors().skip(1);
+    let in_pipelines = ancestors
+        .next()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "pipelines");
+    let under_el = ancestors
+        .next()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "el");
+    in_pipelines && under_el
+}
+
+/// The project root a pipeline spec belongs to: the directory holding the
+/// `el/` its `pipelines/` sits in.
+pub fn pipeline_project_root(path: &Path) -> Option<PathBuf> {
+    is_pipeline_file(path)
+        .then(|| path.ancestors().nth(3))
+        .flatten()
+        .map(Path::to_path_buf)
+}
+
+/// Deploys the pipeline whose spec is open in the active editor — the
+/// same popup the canvas opens, for someone editing the YAML directly.
+pub fn deploy_active_pipeline(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let Some(spec_path) = active_pipeline_path(workspace, cx) else {
+        toast(
+            workspace,
+            "Open a pipeline under el/pipelines to deploy it.",
+            cx,
+        );
+        return;
+    };
+    let Some(root) = pipeline_project_root(&spec_path) else {
+        return;
+    };
+    // The name the spec declares, not the file's: they are usually the
+    // same, and when they are not the popup says so rather than deploying
+    // under a name nobody wrote.
+    let name = el_engine::spec::load_pipeline(&spec_path)
+        .map(|pipeline| pipeline.pipeline)
+        .unwrap_or_else(|_| {
+            spec_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("pipeline")
+                .to_owned()
+        });
+    let project = workspace.project().clone();
+    deploy_modal::ElDeployModal::deploy(workspace, root, name, spec_path, project, window, cx);
+}
+
+/// The pipeline spec open in the active editor, if that is what it is.
+pub fn active_pipeline_path(workspace: &Workspace, cx: &gpui::App) -> Option<PathBuf> {
+    let editor = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<editor::Editor>(cx))?;
+    let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+    let path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
+    is_pipeline_file(&path).then_some(path)
+}
+
 /// The EL project root in this workspace: a dbt root when present, else
 /// any worktree already holding `el/`, else the first worktree (so
 /// Initialize can create a standalone EL project).
@@ -468,6 +544,37 @@ pub(crate) fn thousands(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// What the toolbar asks on every render, and what a deploy resolves
+    /// the project root from.
+    #[test]
+    fn a_pipeline_spec_is_known_by_where_it_sits() {
+        use std::path::Path;
+        assert!(super::is_pipeline_file(Path::new(
+            "/work/shop/el/pipelines/orders.yml"
+        )));
+        assert!(super::is_pipeline_file(Path::new(
+            "/work/shop/el/pipelines/orders.yaml"
+        )));
+        assert_eq!(
+            super::pipeline_project_root(Path::new("/work/shop/el/pipelines/orders.yml")),
+            Some(Path::new("/work/shop").to_path_buf())
+        );
+
+        // Connections live beside pipelines, and are not one.
+        assert!(!super::is_pipeline_file(Path::new(
+            "/work/shop/el/connections.yml"
+        )));
+        // A pipelines directory that is not EL's.
+        assert!(!super::is_pipeline_file(Path::new(
+            "/work/shop/ci/pipelines/deploy.yml"
+        )));
+        // The canvas's own file, and anything that is not YAML.
+        assert!(!super::is_pipeline_file(Path::new(
+            "/work/shop/el/pipelines/orders.sql"
+        )));
+        assert_eq!(super::pipeline_project_root(Path::new("orders.yml")), None);
+    }
+
     use super::*;
 
     /// Writes a project whose two connections sit on different workspaces.

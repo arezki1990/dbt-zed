@@ -1,4 +1,5 @@
 mod dbt_button;
+mod el_button;
 mod preview;
 mod repl_menu;
 
@@ -710,6 +711,7 @@ impl Render for QuickActionBar {
             .children(self.render_repl_menu(cx))
             .children(self.render_preview_button(cx))
             .children(self.render_dbt_button(cx))
+            .children(self.render_el_deploy_button(cx))
             .children(search_button)
             .when(
                 AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button,
