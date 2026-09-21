@@ -44,4 +44,9 @@ log.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
