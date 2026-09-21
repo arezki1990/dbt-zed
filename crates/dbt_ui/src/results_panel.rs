@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use editor::{Editor, ToOffset as _};
@@ -11,7 +12,7 @@ use gpui::{
 };
 use language::LanguageRegistry;
 use settings::Settings as _;
-use ui::{ContextMenu, WithScrollbar, prelude::*};
+use ui::{CommonAnimationExt as _, ContextMenu, WithScrollbar, prelude::*};
 use util::command::new_command;
 use workspace::{
     Workspace,
@@ -73,28 +74,31 @@ fn sources_toward(
     column_sources(to, column)
 }
 
-/// One-glance badge string for a node's SQL operations, e.g. "⋈2 Σ σ ƒ".
-fn ops_badges(ops: &crate::lineage::NodeOps) -> String {
-    let mut badges = Vec::new();
-    if !ops.joins.is_empty() {
-        badges.push(format!("⋈{}", ops.joins.len()));
+/// The second line of a node's tooltip: what kind of thing it is, what it
+/// does to its inputs, and what a click does.
+fn node_tooltip_meta(node: &crate::lineage::GraphLayoutNode) -> String {
+    let mut lines = Vec::new();
+    lines.push(if node.kind == node.materialization || node.materialization.is_empty() {
+        node.kind.clone()
+    } else {
+        format!("{} · {}", node.kind, node.materialization)
+    });
+    if let Some(ops) = node.ops.as_ref().filter(|ops| !ops.is_empty()) {
+        lines.push(ops_tooltip(ops));
     }
-    if ops.group_by || !ops.aggregations.is_empty() {
-        badges.push("Σ".to_owned());
+    if !node.columns.is_empty() {
+        lines.push(format!(
+            "{} column{}",
+            node.columns.len(),
+            if node.columns.len() == 1 { "" } else { "s" }
+        ));
     }
-    if !ops.filters.is_empty() {
-        badges.push("σ".to_owned());
-    }
-    if ops.windows {
-        badges.push("ƒ".to_owned());
-    }
-    if ops.distinct {
-        badges.push("D".to_owned());
-    }
-    if ops.unions > 0 {
-        badges.push("∪".to_owned());
-    }
-    badges.join(" ")
+    lines.push(if node.path.is_some() {
+        "Click to open · drag to move".to_owned()
+    } else {
+        "Drag to move".to_owned()
+    });
+    lines.join("\n")
 }
 
 /// Multi-line tooltip describing a node's operations for debugging.
@@ -161,6 +165,22 @@ pub struct DbtResultsPanel {
     canvas_scroll: ScrollHandle,
     /// The model the current lineage graph is centered on.
     lineage_model: Option<String>,
+    /// The project that model belongs to: what a refresh parses.
+    lineage_root: Option<PathBuf>,
+    /// What the lineage view is waiting on, when it is waiting.
+    lineage_job: Option<LineageJob>,
+    /// What dbt said when the last parse failed. It used to go to the log
+    /// and nowhere else, which left a graph that silently stayed as it was.
+    lineage_error: Option<SharedString>,
+    /// Why there is no graph for the model being browsed.
+    lineage_problem: Option<LineageProblem>,
+    /// The manifest and catalog the graph on screen was drawn from, to
+    /// notice when dbt has rewritten them — from a terminal, from cmd-enter.
+    lineage_artifacts: (Option<SystemTime>, Option<SystemTime>),
+    /// When this session last parsed the project and it went through.
+    lineage_parsed_at: Option<SystemTime>,
+    /// The code is newer than the last parse: the graph may be out of date.
+    lineage_stale: bool,
     search_editor: Entity<Editor>,
     /// Active sort: (column index, ascending).
     sort: Option<(usize, bool)>,
@@ -195,6 +215,29 @@ pub struct DbtResultsPanel {
     connection_scroll: ScrollHandle,
     _run: Task<()>,
     _lineage_refresh: Task<()>,
+    _lineage_parse: Task<()>,
+    /// Debounced: replaced on every worktree event, so a burst of writes
+    /// costs one look at the disk once it is over.
+    _lineage_freshness: Task<()>,
+}
+
+/// What the lineage view is waiting on.
+#[derive(Clone, Copy, PartialEq)]
+enum LineageJob {
+    /// `dbt parse`: the manifest is being rebuilt from the code.
+    Parsing,
+    /// The catalog, which is where the columns of sources come from. Only
+    /// the first load of a project asks for it: it goes to the warehouse.
+    Catalog,
+}
+
+/// Why there is no graph for the model being browsed.
+#[derive(Clone, PartialEq)]
+enum LineageProblem {
+    /// The project has never been parsed: there is no manifest to draw from.
+    NoManifest,
+    /// The manifest does not know this model — new, renamed, or disabled.
+    UnknownModel(SharedString),
 }
 
 enum GraphDrag {
@@ -248,6 +291,23 @@ enum ResultsState {
         rows: Arc<Vec<Vec<SharedString>>>,
         compiled: Option<SharedString>,
     },
+}
+
+/// Runs one dbt command in `root` with the project's settings and hands back
+/// everything it said — the caller decides what a failure means.
+async fn run_dbt(
+    settings: DbtSettings,
+    root: PathBuf,
+    arguments: &'static [&'static str],
+    http: Option<Arc<dyn http_client::HttpClient>>,
+) -> std::io::Result<std::process::Output> {
+    let binary = crate::dbt_install::ensure_binary(&settings, http)
+        .await
+        .map_err(std::io::Error::other)?;
+    let mut command = new_command(&binary);
+    command.args(arguments);
+    apply_common_args(&mut command, &settings, &root);
+    command.current_dir(&root).output().await
 }
 
 /// Finds the dbt project root for a model file: the configured `project_dir`
@@ -385,9 +445,18 @@ impl DbtResultsPanel {
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let languages = workspace.project().read(cx).languages().clone();
+        let project = workspace.project().clone();
         let workspace_handle = cx.entity().downgrade();
         let workspace_entity = cx.entity();
         cx.new(|cx| {
+            // A save, a checkout, a dbt run in a terminal: anything that
+            // moves files may have made the graph older than the code.
+            cx.subscribe(&project, |this: &mut Self, _, event: &project::Event, cx| {
+                if matches!(event, project::Event::WorktreeUpdatedEntries(..)) {
+                    this.check_lineage_freshness(cx);
+                }
+            })
+            .detach();
             let search_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
                 editor.set_placeholder_text("Search results…", window, cx);
@@ -440,6 +509,13 @@ impl DbtResultsPanel {
                 drag_moved: false,
                 canvas_scroll: ScrollHandle::new(),
                 lineage_model: None,
+                lineage_root: None,
+                lineage_job: None,
+                lineage_error: None,
+                lineage_problem: None,
+                lineage_artifacts: (None, None),
+                lineage_parsed_at: None,
+                lineage_stale: false,
                 search_editor,
                 sort: None,
                 col_widths: Default::default(),
@@ -460,6 +536,8 @@ impl DbtResultsPanel {
                 connection_scroll: ScrollHandle::new(),
                 _run: Task::ready(()),
                 _lineage_refresh: Task::ready(()),
+                _lineage_parse: Task::ready(()),
+                _lineage_freshness: Task::ready(()),
             }
         })
     }
@@ -565,123 +643,302 @@ impl DbtResultsPanel {
         }
 
         // First detection of a project this session: refresh its manifest so
-        // the lineage graph reflects the current model files.
-        let settings = DbtSettings::get_global(cx).clone();
+        // the lineage graph reflects the current model files, and its
+        // catalog so sources (which only get columns from catalog.json)
+        // take part in column lineage.
+        let settings = DbtSettings::get_global(cx);
+        if settings.parse_on_load && !self.parsed_roots.contains(&root) {
+            self.parsed_roots.insert(root.clone());
+            self.parse_project(root.clone(), true, cx);
+        }
+        self.load_lineage(model, root, false, cx);
+    }
+
+    /// Draws the lineage of `model` from the manifest as it is on disk.
+    ///
+    /// `keep_view` is for the same model drawn again — after a parse, or
+    /// because dbt rewrote the manifest: the zoom, the collapsed branches
+    /// and the nodes dragged out of the way stay where they were put, and
+    /// the panel stays on the tab it is on. A model browsed to starts clean
+    /// and brings the Lineage tab forward, as it always has.
+    fn load_lineage(
+        &mut self,
+        model: String,
+        root: PathBuf,
+        keep_view: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = DbtSettings::get_global(cx);
         let graph_depth = settings.lineage_depth as i32;
         let tree_depth = settings.lineage_tree_depth as usize;
         let max_nodes = settings.lineage_max_nodes as usize;
-        if settings.parse_on_load && !self.parsed_roots.contains(&root) {
-            self.parsed_roots.insert(root.clone());
-            let command_root = root.clone();
-            let parse_root = root.clone();
-            let parse_model = model.clone();
-            let catalog_settings = settings.clone();
-            let http = self.http_client(cx);
-            let parse = cx.background_spawn(async move {
-                let binary = crate::dbt_install::ensure_binary(&settings, http)
-                    .await
-                    .map_err(std::io::Error::other)?;
-                let mut command = new_command(&binary);
-                command.arg("parse");
-                apply_common_args(&mut command, &settings, &command_root);
-                command.current_dir(&command_root).output().await
-            });
-            cx.spawn(async move |this, cx| {
-                match parse.await {
-                    Ok(output) if output.status.success() => {
-                        log::info!("dbt: auto-parse succeeded for {parse_root:?}");
-                        this.update(cx, |this, cx| {
-                            this.lineage_model = None;
-                            this.refresh_lineage(parse_model.clone(), parse_root.clone(), cx);
-                        })
-                        .ok();
-                    }
-                    Ok(output) => {
-                        log::warn!(
-                            "dbt: auto-parse failed for {parse_root:?}:\n{}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        log::warn!("dbt: auto-parse spawn failed: {error:#}");
-                        return;
-                    }
-                }
-
-                // Second stage: refresh the catalog so sources (which only get
-                // columns from catalog.json) participate in column lineage.
-                let catalog_root = parse_root.clone();
-                let catalog = cx.background_executor().spawn(async move {
-                    let binary = crate::dbt_install::ensure_binary(&catalog_settings, None)
-                        .await
-                        .map_err(std::io::Error::other)?;
-                    let mut command = new_command(&binary);
-                    // Fusion writes the catalog from compile; Core uses docs.
-                    if catalog_settings.distribution == "core" {
-                        command.args(["docs", "generate"]);
-                    } else {
-                        command.args(["compile", "--write-catalog"]);
-                    }
-                    apply_common_args(&mut command, &catalog_settings, &catalog_root);
-                    command.current_dir(&catalog_root).output().await
-                });
-                match catalog.await {
-                    Ok(output) if output.status.success() => {
-                        log::info!("dbt: catalog refreshed for {parse_root:?}");
-                        this.update(cx, |this, cx| {
-                            this.lineage_model = None;
-                            this.refresh_lineage(parse_model, parse_root, cx);
-                        })
-                        .ok();
-                    }
-                    Ok(output) => log::warn!(
-                        "dbt: catalog refresh failed for {parse_root:?}:\n{}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ),
-                    Err(error) => log::warn!("dbt: catalog spawn failed: {error:#}"),
-                }
-            })
-            .detach();
-        }
-
         self.lineage_model = Some(model.clone());
+        self.lineage_root = Some(root.clone());
         let store = self.lineage_store.clone();
         let expansions = self.depth_expansions.clone();
         let task = cx.background_spawn(async move {
+            let artifacts = crate::lineage::artifact_mtimes(&root);
             let tree = store
                 .lineage_tree(&root, &model, tree_depth, max_nodes)
                 .ok();
-            let layout = store
-                .lineage_layout(&root, &model, graph_depth, max_nodes, &expansions)
-                .ok();
-            (tree, layout)
+            let layout =
+                store.lineage_layout(&root, &model, graph_depth, max_nodes, &expansions);
+            (artifacts, tree, layout, model)
         });
         self._lineage_refresh = cx.spawn(async move |this, cx| {
-            let (tree, layout) = task.await;
+            let (artifacts, tree, layout, model) = task.await;
             this.update(cx, |this, cx| {
-                if tree.is_none() && layout.is_none() {
+                // Recorded either way: a load that failed has still looked
+                // at this manifest, and must not be retried until it moves.
+                this.lineage_artifacts = artifacts;
+                match layout {
+                    Ok(layout) => {
+                        log::debug!("dbt lineage: {} nodes for {model}", layout.nodes.len());
+                        this.lineage_problem = None;
+                        this.lineage_tree = tree.map(Arc::new);
+                        let has_column = |column: &str| {
+                            layout.nodes.iter().any(|node| {
+                                node.columns
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(column))
+                            })
+                        };
+                        let selection_gone = this
+                            .selected_column
+                            .as_deref()
+                            .is_some_and(|column| !has_column(column));
+                        let focus_gone = this
+                            .column_focus
+                            .as_deref()
+                            .is_some_and(|column| !has_column(column));
+                        this.lineage_layout = Some(Arc::new(layout));
+                        this.graph_drag = None;
+                        if keep_view {
+                            // A column the new code no longer has cannot stay
+                            // selected or focused; everything else the
+                            // operator set up survives the redraw.
+                            if selection_gone {
+                                this.selected_column = None;
+                            }
+                            if focus_gone {
+                                this.exit_column_focus(cx);
+                            }
+                            if !this.center_in_view() {
+                                this.pending_center = !this.center_on_model();
+                            }
+                        } else {
+                            this.expanded.clear();
+                            this.collapsed_up.clear();
+                            this.collapsed_down.clear();
+                            this.selected_column = None;
+                            this.pan = (0., 0.);
+                            this.node_offsets.clear();
+                            this.view = ResultsView::Lineage;
+                            // Centering last: it owns the final pan — nothing
+                            // below may reset it (that exact stomp hid the
+                            // first-open centering).
+                            this.pending_center = !this.center_on_model();
+                        }
+                    }
+                    Err(error) => {
+                        log::info!("dbt lineage: nothing to draw for {model}: {error:#}");
+                        this.lineage_problem = Some(if artifacts.0.is_none() {
+                            LineageProblem::NoManifest
+                        } else {
+                            LineageProblem::UnknownModel(model.into())
+                        });
+                    }
+                }
+                this.check_lineage_freshness(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// The model and project a refresh is about: what the graph shows, or
+    /// failing that the model file in front.
+    fn lineage_target(&self, cx: &App) -> Option<(String, PathBuf)> {
+        if let (Some(model), Some(root)) = (self.lineage_model.clone(), self.lineage_root.clone())
+        {
+            return Some((model, root));
+        }
+        let workspace = self.workspace.upgrade()?;
+        active_model_file(workspace.read(cx), cx)
+    }
+
+    /// Draws the current model again from the manifest on disk, keeping the
+    /// view. No parse: for when dbt has already done that part.
+    fn reload_lineage(&mut self, cx: &mut Context<Self>) {
+        if let Some((model, root)) = self.lineage_target(cx) {
+            self.load_lineage(model, root, true, cx);
+        }
+    }
+
+    /// What the Refresh button does: the code changed, so parse it again and
+    /// draw what comes out. dbt reads files, not buffers, so the file in
+    /// front is saved first — an edit that is not on disk is exactly the one
+    /// someone presses Refresh to see.
+    fn refresh_from_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lineage_job.is_some() {
+            return;
+        }
+        let Some((_, root)) = self.lineage_target(cx) else {
+            return;
+        };
+        let save = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .is_some_and(|item| item.is_dirty(cx))
+                    .then(|| {
+                        workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+                    })
+            })
+            .ok()
+            .flatten();
+        let Some(save) = save else {
+            self.parse_project(root, false, cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let saved = save.await;
+            this.update(cx, |this, cx| match saved {
+                Ok(()) => this.parse_project(root, false, cx),
+                Err(error) => {
+                    this.lineage_error =
+                        Some(format!("Couldn't save the file before parsing: {error:#}").into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs `dbt parse` for `root` and draws the result, saying so while it
+    /// runs and saying why when it fails. `with_catalog` follows a good
+    /// parse with the catalog — which asks the warehouse, so only the first
+    /// load of a project does it; a Refresh never leaves this machine.
+    fn parse_project(&mut self, root: PathBuf, with_catalog: bool, cx: &mut Context<Self>) {
+        if self.lineage_job.is_some() {
+            return;
+        }
+        self.lineage_job = Some(LineageJob::Parsing);
+        self.lineage_error = None;
+        cx.notify();
+
+        let settings = DbtSettings::get_global(cx).clone();
+        let http = self.http_client(cx);
+        self._lineage_parse = cx.spawn(async move |this, cx| {
+            let parse = cx.background_spawn(run_dbt(
+                settings.clone(),
+                root.clone(),
+                &["parse"],
+                http,
+            ));
+            let failure = match parse.await {
+                Ok(output) if output.status.success() => None,
+                Ok(output) => Some(crate::lineage::failure_text(&output.stdout, &output.stderr)),
+                Err(error) => Some(format!("Couldn't run dbt: {error:#}")),
+            };
+            let parsed = failure.is_none();
+            this.update(cx, |this, cx| {
+                match failure {
+                    None => {
+                        log::info!("dbt: parsed {root:?}");
+                        this.lineage_parsed_at = Some(SystemTime::now());
+                        this.lineage_stale = false;
+                        this.lineage_job = with_catalog.then_some(LineageJob::Catalog);
+                        this.reload_lineage(cx);
+                    }
+                    Some(failure) => {
+                        log::warn!("dbt: parse failed for {root:?}:\n{failure}");
+                        this.lineage_job = None;
+                        this.lineage_error = Some(failure.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+            if !parsed || !with_catalog {
+                return;
+            }
+
+            // Fusion writes the catalog from compile; Core uses docs.
+            let arguments: &'static [&'static str] = if settings.distribution == "core" {
+                &["docs", "generate"]
+            } else {
+                &["compile", "--write-catalog"]
+            };
+            let catalog = cx
+                .background_spawn(run_dbt(settings.clone(), root.clone(), arguments, None))
+                .await;
+            this.update(cx, |this, cx| {
+                this.lineage_job = None;
+                match catalog {
+                    Ok(output) if output.status.success() => {
+                        log::info!("dbt: catalog refreshed for {root:?}");
+                        this.reload_lineage(cx);
+                    }
+                    // Not the operator's problem: the graph is current, and
+                    // what is missing is the columns of sources.
+                    Ok(output) => log::warn!(
+                        "dbt: catalog refresh failed for {root:?}:\n{}",
+                        crate::lineage::failure_text(&output.stdout, &output.stderr)
+                    ),
+                    Err(error) => log::warn!("dbt: catalog spawn failed: {error:#}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+    }
+
+    /// Looks at the disk, once things have been quiet for a moment: has dbt
+    /// rewritten the manifest the graph was drawn from (then draw it again —
+    /// that costs nothing), and is the code newer than the last parse (then
+    /// say so, and let the operator decide when a parse is worth it).
+    fn check_lineage_freshness(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.lineage_root.clone() else {
+            return;
+        };
+        // Only while someone is looking, and not under a parse that is about
+        // to settle the question anyway.
+        if self.view != ResultsView::Lineage || self.lineage_job.is_some() {
+            return;
+        }
+        self._lineage_freshness = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            let looked = cx
+                .background_spawn(async move {
+                    (
+                        crate::lineage::artifact_mtimes(&root),
+                        crate::lineage::newest_source_mtime(&root),
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let (artifacts, newest_source) = looked;
+                if this.lineage_job.is_some() {
                     return;
                 }
-                this.lineage_tree = tree.map(Arc::new);
-                log::debug!(
-                    "dbt lineage: layout arrived for {:?} ({} nodes)",
-                    this.lineage_model,
-                    this.lineage_layout.as_ref().map_or(0, |l| l.nodes.len()),
+                if artifacts.0.is_some() && artifacts != this.lineage_artifacts {
+                    this.reload_lineage(cx);
+                    return;
+                }
+                let stale = crate::lineage::sources_are_newer(
+                    newest_source,
+                    artifacts.0,
+                    this.lineage_parsed_at,
                 );
-                this.lineage_layout = layout.map(Arc::new);
-                this.expanded.clear();
-                this.collapsed_up.clear();
-                this.collapsed_down.clear();
-                this.selected_column = None;
-                this.pan = (0., 0.);
-                this.node_offsets.clear();
-                this.graph_drag = None;
-                this.view = ResultsView::Lineage;
-                // Centering last: it owns the final pan — nothing below may
-                // reset it (that exact stomp hid the first-open centering).
-                this.pending_center = !this.center_on_model();
-                cx.notify();
+                if stale != this.lineage_stale {
+                    this.lineage_stale = stale;
+                    cx.notify();
+                }
             })
             .ok();
         });
@@ -710,6 +967,10 @@ impl DbtResultsPanel {
         cx.notify();
 
         self.last_root = Some(root.clone());
+        // A selection is not a model: running one used to blank the graph
+        // and leave the view centred on something called "selection".
+        let shows_model = matches!(target, ShowTarget::Model { .. });
+        let lineage_root = root.clone();
         let settings = DbtSettings::get_global(cx).clone();
         let lineage_store = self.lineage_store.clone();
         let http = self.http_client(cx);
@@ -778,16 +1039,28 @@ impl DbtResultsPanel {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok((columns, rows, compiled, lineage_tree, lineage_layout)) => {
-                        this.lineage_layout = lineage_layout;
-                        this.pending_center = !this.center_on_model();
-                        this.lineage_tree = lineage_tree;
-                        this.expanded.clear();
-                        this.collapsed_up.clear();
-                        this.collapsed_down.clear();
-                        this.selected_column = None;
-                        this.pan = (0., 0.);
-                        this.node_offsets.clear();
-                        this.graph_drag = None;
+                        if shows_model {
+                            // dbt show parses on its way: the graph it
+                            // leaves behind is as fresh as a Refresh's.
+                            this.lineage_artifacts =
+                                crate::lineage::artifact_mtimes(&lineage_root);
+                            this.lineage_parsed_at = Some(SystemTime::now());
+                            this.lineage_stale = false;
+                            this.lineage_error = None;
+                            this.lineage_problem = None;
+                            this.lineage_root = Some(lineage_root.clone());
+                            this.lineage_model = Some(model.to_string());
+                            this.lineage_layout = lineage_layout;
+                            this.pending_center = !this.center_on_model();
+                            this.lineage_tree = lineage_tree;
+                            this.expanded.clear();
+                            this.collapsed_up.clear();
+                            this.collapsed_down.clear();
+                            this.selected_column = None;
+                            this.pan = (0., 0.);
+                            this.node_offsets.clear();
+                            this.graph_drag = None;
+                        }
                         this.compiled_editor = compiled.as_ref().map(|sql| {
                             let buffer = cx.new(|cx| {
                                 let mut buffer = language::Buffer::local(sql.clone(), cx);
@@ -800,7 +1073,6 @@ impl DbtResultsPanel {
                                 editor
                             })
                         });
-                        this.lineage_model = Some(model.to_string());
                         this.view = ResultsView::Table;
                         this.sort = None;
                         this.hidden_columns.clear();
@@ -860,10 +1132,13 @@ impl DbtResultsPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                IconButton::new("dbt-show-refresh", IconName::RotateCw)
+                // A play, not a circular arrow: this runs the model's query on
+                // the warehouse, and the lineage view has a Refresh of its own
+                // that does nothing of the kind.
+                IconButton::new("dbt-show-refresh", IconName::PlayOutlined)
                     .icon_size(IconSize::Small)
                     .tooltip(ui::Tooltip::for_action_title(
-                        "Show data for the active model",
+                        "Run the active model and show its rows",
                         &ShowModelData,
                     ))
                     .on_click(|_, window, cx| {
@@ -926,6 +1201,7 @@ impl DbtResultsPanel {
                             .toggle_state(self.view == ResultsView::Lineage)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.view = ResultsView::Lineage;
+                                this.check_lineage_freshness(cx);
                                 cx.notify();
                             })),
                     )
@@ -955,6 +1231,457 @@ impl DbtResultsPanel {
                             }),
                     ),
             )
+    }
+
+    /// The Refresh button, in whichever of its three states applies: at
+    /// rest, asking to be pressed because the code has moved on, or busy.
+    fn render_refresh_button(
+        &self,
+        id: &'static str,
+        idle_label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if let Some(job) = self.lineage_job {
+            return h_flex()
+                .gap_1p5()
+                .items_center()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Accent)
+                        .with_keyed_rotate_animation(id, 2),
+                )
+                .child(
+                    Label::new(match job {
+                        LineageJob::Parsing => "Parsing the project…",
+                        LineageJob::Catalog => "Reading the catalog…",
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+                )
+                .into_any_element();
+        }
+        let stale = self.lineage_stale;
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new(id, idle_label)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                    .style(if stale {
+                        ButtonStyle::Tinted(ui::TintColor::Warning)
+                    } else {
+                        ButtonStyle::Outlined
+                    })
+                    .tooltip(|_window, cx| {
+                        ui::Tooltip::with_meta(
+                            "Reload the lineage from the code",
+                            None,
+                            "Saves the file in front, runs dbt parse and draws the result.\n\
+                             Nothing runs on the warehouse.",
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.refresh_from_code(window, cx);
+                    })),
+            )
+            .when(stale, |row| {
+                row.child(
+                    Label::new("The code changed since the last parse")
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The lineage view's own bar. Left to right, in the order they are
+    /// reached for: what is on screen and whether it is current, what to
+    /// show of it, where to look; on the right, how to read it.
+    fn render_lineage_toolbar(
+        &self,
+        layout: &LayoutGraph,
+        legend: Vec<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors().clone();
+        let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
+            Button::new(id, label)
+                .label_size(LabelSize::Small)
+                .toggle_state(on)
+                .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                .tooltip(ui::Tooltip::text(tip))
+        };
+        let divider = || div().w(px(1.)).h(px(16.)).flex_shrink_0().bg(colors.border);
+        let columns_hidden_by_zoom = self.show_columns && !self.columns_visible_at(self.zoom);
+        let shown = layout.nodes.len();
+        let model = self.lineage_model.clone().unwrap_or_default();
+
+        h_flex()
+            .w_full()
+            .p_1()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(colors.border)
+            // Whose lineage this is. The panel's title says what dbt show
+            // last ran, which stops being this the moment another file is
+            // opened.
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(Label::new(model).size(LabelSize::Default))
+                    .child(
+                        Label::new(format!(
+                            "{shown} {}",
+                            if shown == 1 { "node" } else { "nodes" }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .child(self.render_refresh_button("dbt-lineage-refresh", "Refresh", cx))
+            .child(divider())
+            .child(
+                toggle(
+                    "dbt-toggle-up",
+                    "Upstream",
+                    self.show_upstream,
+                    "What this model is built from",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_upstream = !this.show_upstream;
+                    cx.notify();
+                })),
+            )
+            .child(
+                toggle(
+                    "dbt-toggle-down",
+                    "Downstream",
+                    self.show_downstream,
+                    "What is built from this model",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_downstream = !this.show_downstream;
+                    cx.notify();
+                })),
+            )
+            .child(
+                toggle(
+                    "dbt-toggle-columns",
+                    "Columns",
+                    self.show_columns,
+                    if columns_hidden_by_zoom {
+                        "Columns are on, and hidden at this zoom — zoom in to see them"
+                    } else {
+                        "List each node's columns — click one to trace it across the graph"
+                    },
+                )
+                .when(columns_hidden_by_zoom, |button| button.color(Color::Muted))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_columns = !this.show_columns;
+                    cx.notify();
+                })),
+            )
+            .child(divider())
+            .child(
+                IconButton::new("dbt-lineage-center", IconName::Crosshair)
+                    .icon_size(IconSize::Small)
+                    .tooltip(ui::Tooltip::text("Bring this model back to the middle"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.pending_center = !this.center_on_model();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new("dbt-arrange", IconName::RotateCcw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_window, cx| {
+                        ui::Tooltip::with_meta(
+                            "Reset the layout",
+                            None,
+                            "Puts dragged nodes back, reopens collapsed branches, drops the \
+                             extra depth loaded with +, and returns to 100%",
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.zoom = 1.0;
+                        this.depth_expansions.clear();
+                        if let Some((model, root)) = this.lineage_target(cx) {
+                            this.load_lineage(model, root, false, cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        IconButton::new("dbt-zoom-out", IconName::Dash)
+                            .icon_size(IconSize::Small)
+                            .disabled(self.zoom <= 0.4)
+                            .tooltip(ui::Tooltip::text("Zoom out (⌘-scroll)"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_zoom(this.zoom / 1.2, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(
+                            "dbt-zoom-reset",
+                            format!("{}%", (self.zoom * 100.).round() as i32),
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .tooltip(ui::Tooltip::text("Back to 100%"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_zoom(1.0, cx);
+                        })),
+                    )
+                    .child(
+                        IconButton::new("dbt-zoom-in", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .disabled(self.zoom >= 2.0)
+                            .tooltip(ui::Tooltip::text("Zoom in (⌘-scroll)"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_zoom(this.zoom * 1.2, cx);
+                            })),
+                    ),
+            )
+            .child(div().flex_1())
+            .children(legend.into_iter().map(|materialization| {
+                let color = Self::materialization_color(&materialization, cx);
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().w_2().h_2().rounded_full().bg(color))
+                    .child(
+                        Label::new(materialization)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+            }))
+            .child(
+                // The glyphs on the nodes mean nothing until someone says
+                // what they mean, and the canvas has gestures no button shows.
+                IconButton::new("dbt-lineage-help", IconName::CircleHelp)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(|_window, cx| {
+                        ui::Tooltip::with_meta(
+                            "Reading the graph",
+                            None,
+                            format!(
+                                "{}\n\nClick a node to open its file · drag it to move it\n\
+                                 Drag the background to pan · ⌘-scroll to zoom\n\
+                                 − / + on a node's edge folds or loads that side\n\
+                                 Click a column to trace it · right-click for more",
+                                crate::lineage::NodeOps::BADGE_LEGEND
+                            ),
+                            cx,
+                        )
+                    }),
+            )
+            .child(divider())
+            .child(
+                IconButton::new("dbt-toggle-details", IconName::Info)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.show_details)
+                    .tooltip(ui::Tooltip::text(
+                        "This model's details: relation, description, tags, columns",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_details = !this.show_details;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                IconButton::new(
+                    "dbt-toggle-tree",
+                    if self.show_tree {
+                        IconName::ThreadsSidebarRightOpen
+                    } else {
+                        IconName::ThreadsSidebarRightClosed
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .toggle_state(self.show_tree)
+                .tooltip(ui::Tooltip::text("The same lineage as a tree, on the right"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_tree = !this.show_tree;
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// What went wrong, under the bar, where it has the width to be read: a
+    /// parse dbt refused, or a model the manifest has not heard of.
+    fn render_lineage_banners(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut banners = Vec::new();
+        if let Some(error) = self.lineage_error.clone() {
+            banners.push(
+                ui::Callout::new()
+                    .severity(ui::Severity::Error)
+                    .icon(IconName::XCircle)
+                    .title("dbt could not parse the project — the graph is the last good one")
+                    .description_slot(
+                        div()
+                            .id("dbt-lineage-error-text")
+                            .max_h(px(140.))
+                            .overflow_y_scroll()
+                            .child(
+                                Label::new(error.clone())
+                                    .size(LabelSize::Small)
+                                    .buffer_font(cx),
+                            ),
+                    )
+                    .actions_slot(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                ui::CopyButton::new("dbt-lineage-copy-error", error.to_string())
+                                    .icon_size(IconSize::Small)
+                                    .tooltip_label("Copy what dbt said"),
+                            )
+                            .child(
+                                Button::new("dbt-lineage-retry", "Try again")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.refresh_from_code(window, cx);
+                                    })),
+                            ),
+                    )
+                    .dismiss_action(
+                        IconButton::new("dbt-lineage-dismiss-error", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text("Dismiss"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lineage_error = None;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if self.lineage_problem == Some(LineageProblem::NoManifest) {
+            banners.push(
+                ui::Callout::new()
+                    .severity(ui::Severity::Warning)
+                    .icon(IconName::Warning)
+                    .title("This project has not been parsed yet — the graph is another project's")
+                    .description(
+                        "The lineage is drawn from target/manifest.json, which dbt writes \
+                         when it parses the project.",
+                    )
+                    .actions_slot(self.render_refresh_button(
+                        "dbt-lineage-refresh-unparsed",
+                        "Parse the project",
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(LineageProblem::UnknownModel(model)) = self.lineage_problem.clone() {
+            let shown = self
+                .lineage_layout
+                .as_ref()
+                .and_then(|layout| layout.nodes.iter().find(|node| node.is_center))
+                .map(|node| node.name.clone());
+            let title = match shown {
+                Some(shown) if shown != model.as_ref() => format!(
+                    "{model} is not in the manifest yet — this is still {shown}'s lineage"
+                ),
+                _ => format!("{model} is not in the manifest yet"),
+            };
+            banners.push(
+                ui::Callout::new()
+                    .severity(ui::Severity::Warning)
+                    .icon(IconName::Warning)
+                    .title(title)
+                    .description(
+                        "A model that is new, renamed or disabled shows up once the project \
+                         has been parsed again.",
+                    )
+                    .actions_slot(self.render_refresh_button(
+                        "dbt-lineage-refresh-unknown",
+                        "Parse the project",
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        banners
+    }
+
+    /// The lineage tab with no graph to show, and the way out of it.
+    fn render_lineage_empty(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (title, detail): (SharedString, SharedString) =
+            match (&self.lineage_job, &self.lineage_problem) {
+                (Some(_), _) => (
+                    "Reading the project…".into(),
+                    "dbt is parsing it; the lineage draws itself as soon as that is done.".into(),
+                ),
+                (None, Some(LineageProblem::NoManifest)) => (
+                    "This project has not been parsed yet".into(),
+                    "The lineage is drawn from target/manifest.json, which dbt writes when it \
+                     parses the project."
+                        .into(),
+                ),
+                (None, Some(LineageProblem::UnknownModel(model))) => (
+                    format!("{model} is not in the manifest yet").into(),
+                    "A model that is new, renamed or disabled shows up once the project has \
+                     been parsed again."
+                        .into(),
+                ),
+                (None, None) => (
+                    "Open a dbt model to see its lineage".into(),
+                    "The graph follows the model file in front: what it is built from on the \
+                     left, what is built from it on the right."
+                        .into(),
+                ),
+            };
+        let can_parse = self.lineage_target(cx).is_some();
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(Label::new(title).size(LabelSize::Default))
+            .child(
+                Label::new(detail)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .when(can_parse || self.lineage_job.is_some(), |state| {
+                state.child(
+                    div().pt_1().child(self.render_refresh_button(
+                        "dbt-lineage-refresh-empty",
+                        "Parse the project",
+                        cx,
+                    )),
+                )
+            })
+            .children(self.lineage_error.clone().map(|error| {
+                div()
+                    .id("dbt-lineage-empty-error")
+                    .max_w(px(720.))
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .child(
+                        Label::new(error)
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .buffer_font(cx),
+                    )
+            }))
+            .into_any_element()
     }
 
     fn graph_mouse_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
@@ -1380,7 +2107,7 @@ impl DbtResultsPanel {
                         .gap_0p5()
                         .child(
                             Label::new(format!("Trace · {}", column.to_uppercase()))
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Accent),
                         )
                         .children(steps.into_iter().take(12).map(
@@ -1409,7 +2136,7 @@ impl DbtResultsPanel {
                         .when(total > 12, |this| {
                             this.child(
                                 Label::new(format!("+{} more", total - 12))
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
                         }),
@@ -1670,7 +2397,7 @@ impl DbtResultsPanel {
         let text_color = theme.text;
         let muted_color = theme.text_muted;
         let name_text_size = px((13. * self.zoom).clamp(8., 22.));
-        let column_text_size = px((11. * self.zoom).clamp(7., 18.));
+        let column_text_size = px((12. * self.zoom).clamp(7., 18.));
 
         // Single source of truth: drag offsets are baked into node positions
         // once, and both the edge canvas and the node elements read from the
@@ -1861,9 +2588,15 @@ impl DbtResultsPanel {
                     })
                     .hover(|style| style.border_color(center_border))
                     .cursor_pointer()
-                    // Transformation summary for debugging: what this model does.
-                    .when_some(node.ops.clone(), |this, ops| {
-                        this.tooltip(ui::Tooltip::text(ops_tooltip(&ops)))
+                    // What this node is and what it does to its inputs. Every
+                    // node answers, not only the ones with operations: a node
+                    // that showed nothing on hover read as not hoverable.
+                    .tooltip({
+                        let title = node.name.clone();
+                        let meta = node_tooltip_meta(&node);
+                        move |_window, cx| {
+                            ui::Tooltip::with_meta(title.clone(), None, meta.clone(), cx)
+                        }
                     })
                     .child(
                         v_flex()
@@ -1892,11 +2625,11 @@ impl DbtResultsPanel {
                                             .child(SharedString::from(node.name.clone())),
                                     )
                                     .when_some(
-                                        node.ops.as_ref().map(|ops| ops_badges(ops)).filter(|badges| !badges.is_empty()),
+                                        node.ops.as_ref().map(|ops| ops.badges()).filter(|badges| !badges.is_empty()),
                                         |this, badges| {
                                             this.child(
                                                 div()
-                                                    .text_size(name_text_size * 0.8)
+                                                    .text_size(name_text_size * 0.9)
                                                     .text_color(materialization_color)
                                                     .child(SharedString::from(badges)),
                                             )
@@ -2072,9 +2805,15 @@ impl DbtResultsPanel {
                             .shadow_sm()
                             .cursor_pointer()
                             .hover(|style| style.border_color(center_border))
+                            .tooltip(ui::Tooltip::text(format!(
+                                "{} what is {} of {}",
+                                if collapsed { "Show" } else { "Hide" },
+                                if upstream { "upstream" } else { "downstream" },
+                                node.name
+                            )))
                             .child(
                                 Label::new(if collapsed { "+" } else { "−" })
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
                             // Handle presses must not start a canvas pan.
@@ -2137,9 +2876,13 @@ impl DbtResultsPanel {
                             .shadow_sm()
                             .cursor_pointer()
                             .hover(|style| style.border_color(center_border))
+                            .tooltip(ui::Tooltip::text(format!(
+                                "There is more beyond {} — load it",
+                                node.name
+                            )))
                             .child(
                                 Label::new("+")
-                                    .size(LabelSize::XSmall)
+                                    .size(LabelSize::Small)
                                     .color(Color::Accent),
                             )
                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -2147,12 +2890,7 @@ impl DbtResultsPanel {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.depth_expansions.insert(name.clone());
-                                // Force a lineage recompute for the same model.
-                                if let Some(model) = this.lineage_model.take() {
-                                    if let Some(root) = this.last_root.clone() {
-                                        this.refresh_lineage(model, root, cx);
-                                    }
-                                }
+                                this.reload_lineage(cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
@@ -2224,7 +2962,7 @@ impl DbtResultsPanel {
                         .border_color(materialization_color)
                         .child(
                             Label::new(node.materialization.clone())
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
                 ),
@@ -2255,7 +2993,7 @@ impl DbtResultsPanel {
             }
             body = body.child(
                 Label::new(stats.join(" · "))
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
             );
         }
@@ -2269,7 +3007,7 @@ impl DbtResultsPanel {
                             .px_1p5()
                             .rounded_md()
                             .bg(cx.theme().colors().element_background)
-                            .child(Label::new(tag).size(LabelSize::XSmall).color(Color::Muted))
+                            .child(Label::new(tag).size(LabelSize::Small).color(Color::Muted))
                     })),
             );
         }
@@ -2283,7 +3021,7 @@ impl DbtResultsPanel {
         }
         body = body.child(
             Label::new(format!("Columns ({})", node.columns.len()))
-                .size(LabelSize::XSmall)
+                .size(LabelSize::Small)
                 .color(Color::Accent),
         );
         for (ix, column) in node.columns.iter().enumerate() {
@@ -2456,7 +3194,17 @@ impl DbtResultsPanel {
                     ),
             )
             .when(!collapsed && nodes.is_empty(), |this| {
-                this.child(Label::new("—").color(Color::Muted).size(LabelSize::Small))
+                this.child(
+                    div().pl(px(22.)).child(
+                        Label::new(if title == "Upstream" {
+                            "Built from nothing the project knows of"
+                        } else {
+                            "Nothing is built from this model yet"
+                        })
+                        .color(Color::Muted)
+                        .size(LabelSize::Small),
+                    ),
+                )
             })
             .children(rows)
             .into_any_element()
@@ -2496,7 +3244,7 @@ impl DbtResultsPanel {
                     .w(px(ROWNUM_W))
                     .flex_none()
                     .px_2()
-                    .child(Label::new("#").size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(Label::new("#").size(LabelSize::Small).color(Color::Muted)),
             );
         for &ix in &visible {
             let w = width_of(ix);
@@ -2583,7 +3331,7 @@ impl DbtResultsPanel {
                             .child(
                                 div().w(px(ROWNUM_W)).flex_none().px_2().child(
                                     Label::new(format!("{}", original + 1))
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 ),
                             );
@@ -2833,7 +3581,7 @@ impl DbtResultsPanel {
                 )
                 .child(
                     Label::new("Open a folder containing dbt_project.yml.")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
                 .into_any_element();
@@ -2849,7 +3597,7 @@ impl DbtResultsPanel {
                     div()
                         .w(px(140.))
                         .flex_shrink_0()
-                        .child(Label::new(key).size(LabelSize::XSmall).color(Color::Muted)),
+                        .child(Label::new(key).size(LabelSize::Small).color(Color::Muted)),
                 )
                 .child(
                     div()
@@ -2865,7 +3613,7 @@ impl DbtResultsPanel {
                 .gap_1()
                 .child(
                     Label::new(title.to_owned())
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Accent),
                 )
                 .children(rows)
@@ -2959,7 +3707,7 @@ impl DbtResultsPanel {
                     .child(
                         div().w(px(140.)).flex_shrink_0().child(
                             Label::new("available")
-                                .size(LabelSize::XSmall)
+                                .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
                     )
@@ -2975,7 +3723,7 @@ impl DbtResultsPanel {
                                 } else {
                                     colors.border
                                 })
-                                .child(Label::new(name.clone()).size(LabelSize::XSmall).color(
+                                .child(Label::new(name.clone()).size(LabelSize::Small).color(
                                     if is_active {
                                         Color::Accent
                                     } else {
@@ -3023,13 +3771,13 @@ impl DbtResultsPanel {
                                 .bg(colors.element_background)
                                 .child(
                                     Label::new(name.clone())
-                                        .size(LabelSize::XSmall)
+                                        .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
                         }))
                         .into_any_element(),
                     Label::new("Names only — values are passed to dbt, never displayed.")
-                        .size(LabelSize::XSmall)
+                        .size(LabelSize::Small)
                         .color(Color::Muted)
                         .into_any_element(),
                 ],
@@ -3051,7 +3799,7 @@ impl DbtResultsPanel {
             .children(sections)
             .child(
                 Label::new("Passwords, keys and tokens are masked and never leave profiles.yml.")
-                    .size(LabelSize::XSmall)
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             .into_any_element()
@@ -3086,132 +3834,8 @@ impl DbtResultsPanel {
                                 // legend wraps instead of clipping.
                                 .min_w(px(0.))
                                 .overflow_hidden()
-                                .child(
-                                    h_flex()
-                                        .p_1()
-                                        .gap_2()
-                                        .flex_wrap()
-                                        .border_b_1()
-                                        .border_color(cx.theme().colors().border)
-                                        .child(
-                                            Button::new("dbt-toggle-up", "Upstream")
-                                                .toggle_state(self.show_upstream)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.show_upstream = !this.show_upstream;
-                                                    log::info!(
-                                                        "dbt lineage: global upstream -> {}",
-                                                        this.show_upstream
-                                                    );
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("dbt-toggle-down", "Downstream")
-                                                .toggle_state(self.show_downstream)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.show_downstream =
-                                                        !this.show_downstream;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("dbt-toggle-columns", "Columns")
-                                                .toggle_state(self.show_columns)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.show_columns = !this.show_columns;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("dbt-arrange", "Arrange")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.node_offsets.clear();
-                                                    this.pan = (0., 0.);
-                                                    this.zoom = 1.0;
-                                                    this.graph_drag = None;
-                                                    this.depth_expansions.clear();
-                                                    this.lineage_model = None;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("dbt-zoom-out", "−").on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.set_zoom(this.zoom / 1.2, cx);
-                                                }),
-                                            ),
-                                        )
-                                        .child(
-                                            Label::new(format!(
-                                                "{}%",
-                                                (self.zoom * 100.).round() as i32
-                                            ))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Button::new("dbt-zoom-in", "+").on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.set_zoom(this.zoom * 1.2, cx);
-                                                }),
-                                            ),
-                                        )
-                                        .child(div().flex_1())
-                                        .child(
-                                            IconButton::new(
-                                                "dbt-toggle-tree",
-                                                if self.show_tree {
-                                                    IconName::ThreadsSidebarRightOpen
-                                                } else {
-                                                    IconName::ThreadsSidebarRightClosed
-                                                },
-                                            )
-                                            .icon_size(IconSize::Small)
-                                            .tooltip(ui::Tooltip::text(
-                                                "Show/hide the lineage tree",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_tree = !this.show_tree;
-                                                cx.notify();
-                                            })),
-                                        )
-                                        .child(
-                                            IconButton::new(
-                                                "dbt-toggle-details",
-                                                IconName::Info,
-                                            )
-                                            .icon_size(IconSize::Small)
-                                            .toggle_state(self.show_details)
-                                            .tooltip(ui::Tooltip::text(
-                                                "Show/hide model details",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_details = !this.show_details;
-                                                cx.notify();
-                                            })),
-                                        )
-                                        .children(legend.into_iter().map(|materialization| {
-                                            let color = Self::materialization_color(
-                                                &materialization,
-                                                cx,
-                                            );
-                                            h_flex()
-                                                .gap_1()
-                                                .items_center()
-                                                .child(
-                                                    div()
-                                                        .w_2()
-                                                        .h_2()
-                                                        .rounded_full()
-                                                        .bg(color),
-                                                )
-                                                .child(
-                                                    Label::new(materialization)
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                        })),
-                                )
+                                .child(self.render_lineage_toolbar(&layout, legend, cx))
+                                .children(self.render_lineage_banners(cx))
                                 .when_some(self.column_focus.clone(), |this, column| {
                                     this.child(
                                         h_flex()
@@ -3291,17 +3915,7 @@ impl DbtResultsPanel {
                         )
                     })
                     .into_any_element(),
-                None => v_flex()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Label::new(
-                            "Run a model (cmd-enter) to see its lineage — requires target/manifest.json (dbt parse)",
-                        )
-                        .color(Color::Muted),
-                    )
-                    .into_any_element(),
+                None => self.render_lineage_empty(cx),
             };
         }
 
