@@ -87,6 +87,37 @@ impl NodeOps {
             && self.unions == 0
     }
 
+    /// One-glance badge string for the operations, e.g. "⋈2 Σ σ ƒ". Here
+    /// rather than beside the canvas that draws it: the layout sizes a node
+    /// for its badges, and a width guessed apart from the text it is for is
+    /// how a long badge ends up over the border.
+    pub fn badges(&self) -> String {
+        let mut badges = Vec::new();
+        if !self.joins.is_empty() {
+            badges.push(format!("⋈{}", self.joins.len()));
+        }
+        if self.group_by || !self.aggregations.is_empty() {
+            badges.push("Σ".to_owned());
+        }
+        if !self.filters.is_empty() {
+            badges.push("σ".to_owned());
+        }
+        if self.windows {
+            badges.push("ƒ".to_owned());
+        }
+        if self.distinct {
+            badges.push("D".to_owned());
+        }
+        if self.unions > 0 {
+            badges.push("∪".to_owned());
+        }
+        badges.join(" ")
+    }
+
+    /// What each badge stands for, for the legend: the glyphs are compact
+    /// and mean nothing until someone says what they mean.
+    pub const BADGE_LEGEND: &'static str = "⋈n  joins (n of them)\nΣ  aggregation or group by\nσ  filter: where, having, qualify\nƒ  window function\nD  select distinct\n∪  union";
+
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "joins": self.joins,
@@ -399,6 +430,141 @@ struct Loaded {
     by_name: HashMap<String, i64>,
 }
 
+/// When `target/manifest.json` was last written — what the lineage on
+/// screen can know about. None when the project has never been parsed.
+pub fn manifest_mtime(project_root: &Path) -> Option<SystemTime> {
+    std::fs::metadata(project_root.join("target").join("manifest.json"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// The two files a graph is drawn from, as (manifest, catalog): a change
+/// to either means dbt has been at work and the graph can be drawn again.
+pub fn artifact_mtimes(project_root: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
+    (manifest_mtime(project_root), catalog_mtime(project_root))
+}
+
+/// The most recent change to anything a parse reads: models, macros, tests
+/// and snapshots (`.sql`), properties and the project file (`.yml`), Python
+/// models. Newer than the manifest means the lineage may be out of date.
+///
+/// A walk, because a parse reads the whole project — a macro edit changes
+/// the lineage of every model that calls it. What dbt writes (`target`,
+/// `logs`), what it installs (`dbt_packages`, Fusion's
+/// `dbt_internal_packages`) and hidden folders are left out, and so is a top-level `el/`: pipeline specs live beside
+/// dbt_project.yml and are none of dbt's business. Bounded, so a project
+/// root that turns out to be a home directory costs a moment, not a minute.
+pub fn newest_source_mtime(project_root: &Path) -> Option<SystemTime> {
+    const SKIP_DIRS: &[&str] = &[
+        "target",
+        "dbt_packages",
+        // Fusion unpacks its built-in macros here on its own schedule.
+        "dbt_internal_packages",
+        "dbt_modules",
+        "logs",
+        "node_modules",
+        "venv",
+        "__pycache__",
+    ];
+    const EXTENSIONS: &[&str] = &["sql", "yml", "yaml", "py"];
+    const MAX_ENTRIES: usize = 50_000;
+
+    let mut newest: Option<SystemTime> = None;
+    let mut visited = 0usize;
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                return newest;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let skipped = name.starts_with('.')
+                    || SKIP_DIRS.contains(&name.as_ref())
+                    || (name == "el" && dir == project_root);
+                if !skipped {
+                    stack.push(entry.path());
+                }
+            } else if file_type.is_file() {
+                let is_source = entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| EXTENSIONS.contains(&extension));
+                if is_source {
+                    if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                        newest = newest.max(Some(modified));
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// Whether the code has moved on since the project was last parsed: the
+/// newest source against the newer of the manifest and the last parse this
+/// session ran. The parse time counts because a parse that finds nothing
+/// to change may leave the manifest as it was — and a Refresh that cannot
+/// clear its own "out of date" is a button that looks broken.
+pub fn sources_are_newer(
+    newest_source: Option<SystemTime>,
+    manifest: Option<SystemTime>,
+    parsed_at: Option<SystemTime>,
+) -> bool {
+    let fresh_as_of = manifest.max(parsed_at);
+    match (newest_source, fresh_as_of) {
+        (Some(source), Some(fresh)) => source > fresh,
+        _ => false,
+    }
+}
+
+/// What dbt said when a command failed, fit for a panel: colour codes
+/// stripped, blank lines dropped, the last lines kept — the error is at the
+/// end, under a screenful of "Found 412 models…".
+pub fn failure_text(stdout: &[u8], stderr: &[u8]) -> String {
+    const KEEP_LINES: usize = 24;
+    let mut text = String::from_utf8_lossy(stderr).into_owned();
+    if text.trim().is_empty() {
+        text = String::from_utf8_lossy(stdout).into_owned();
+    } else {
+        let out = String::from_utf8_lossy(stdout);
+        if !out.trim().is_empty() {
+            text = format!("{out}\n{text}");
+        }
+    }
+    // ESC [ ... letter — the only escape dbt emits.
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(KEEP_LINES);
+    lines[start..].join("\n")
+}
+
 fn catalog_mtime(project_root: &Path) -> Option<SystemTime> {
     std::fs::metadata(project_root.join("target").join("catalog.json"))
         .and_then(|metadata| metadata.modified())
@@ -637,13 +803,14 @@ impl LineageStore {
                 let column_width = column
                     .iter()
                     .map(|(_, entity)| {
-                        // Ops badges render beside the name; leave room for them.
-                        let badge_pad = if entity.data.get("ops").is_some_and(|ops| !ops.is_null())
-                        {
-                            36.
-                        } else {
-                            0.
-                        };
+                        // Ops badges render beside the name: room for the
+                        // ones this node has, not a guess at an average.
+                        let badge_pad = entity
+                            .data
+                            .get("ops")
+                            .and_then(NodeOps::from_json)
+                            .map(|ops| ops.badges().chars().count() as f32 * 7.5 + 10.)
+                            .unwrap_or(0.);
                         26. + badge_pad + 8. * entity.name.len() as f32
                     })
                     .fold(80.0_f32, f32::max);
@@ -1420,6 +1587,137 @@ fn build_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A badge string names each kind of operation once, joins with their
+    /// count — and a model that does nothing of the kind has none.
+    #[test]
+    fn badges_name_each_operation_once() {
+        assert_eq!(NodeOps::default().badges(), "");
+        let ops = NodeOps {
+            joins: vec!["left join a".into(), "inner join b".into(), "left join c".into()],
+            aggregations: vec!["sum".into(), "count".into()],
+            group_by: true,
+            filters: vec!["where".into(), "qualify".into()],
+            windows: true,
+            distinct: false,
+            unions: 0,
+        };
+        assert_eq!(ops.badges(), "⋈3 Σ σ ƒ");
+        let set = NodeOps {
+            distinct: true,
+            unions: 2,
+            ..NodeOps::default()
+        };
+        assert_eq!(set.badges(), "D ∪");
+    }
+
+    /// The code is newer when it is newer than BOTH the manifest and the
+    /// last parse: a parse that found nothing to rewrite still counts.
+    #[test]
+    fn code_is_stale_only_against_the_newer_of_manifest_and_last_parse() {
+        use std::time::Duration;
+        let at = |seconds: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+        assert!(sources_are_newer(at(30), at(20), None), "edited after the parse");
+        assert!(!sources_are_newer(at(10), at(20), None), "parsed after the edit");
+        assert!(
+            !sources_are_newer(at(30), at(20), at(40)),
+            "re-parsed since, even though the manifest was left as it was"
+        );
+        assert!(!sources_are_newer(at(30), None, None), "never parsed: nothing to be stale against");
+        assert!(!sources_are_newer(None, at(20), None), "no sources found");
+    }
+
+    /// The walk sees what a parse reads and not what dbt writes or installs.
+    #[test]
+    fn the_newest_source_ignores_what_dbt_writes_and_installs() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |relative: &str, age_secs: u64| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "select 1").unwrap();
+            let when = SystemTime::now() - Duration::from_secs(age_secs);
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(when).unwrap();
+            when
+        };
+        let model = write("models/marts/orders.sql", 500);
+        write("dbt_project.yml", 900);
+        // All newer than the model, and none of them a parse's business.
+        write("target/compiled/orders.sql", 10);
+        write("dbt_packages/dbt_utils/macros/x.sql", 10);
+        write("dbt_internal_packages/dbt-adapters/macros/y.sql", 10);
+        write("logs/dbt.log", 10);
+        write(".venv/lib/thing.py", 10);
+        write("el/pipelines/load.yml", 10);
+        write("models/marts/notes.md", 10);
+
+        let newest = newest_source_mtime(root).expect("found the model");
+        let drift = newest
+            .duration_since(model)
+            .or_else(|_| model.duration_since(newest))
+            .unwrap();
+        assert!(drift < Duration::from_secs(2), "picked something other than the model");
+
+        // A macro edit is a parse's business, wherever it sits.
+        let macro_edit = write("macros/cents_to_euros.sql", 100);
+        let newest = newest_source_mtime(root).unwrap();
+        let drift = newest
+            .duration_since(macro_edit)
+            .or_else(|_| macro_edit.duration_since(newest))
+            .unwrap();
+        assert!(drift < Duration::from_secs(2));
+        // An `el` folder that is NOT the project's top-level one is ordinary.
+        let nested = write("models/el/stg.sql", 50);
+        let newest = newest_source_mtime(root).unwrap();
+        assert!(newest.duration_since(nested).unwrap_or_default() < Duration::from_secs(2));
+    }
+
+    /// What the freshness check sees in a real project, and how long the
+    /// look takes — for "why does it say the code changed?":
+    /// `ZDBT_LINEAGE_PROBE_ROOT=<dbt project> cargo test -p dbt_ui --lib -- \
+    ///  --ignored freshness_probe --nocapture`. Reads, never writes.
+    #[test]
+    #[ignore]
+    fn freshness_probe() {
+        let root = std::env::var("ZDBT_LINEAGE_PROBE_ROOT").expect("set ZDBT_LINEAGE_PROBE_ROOT");
+        let root = Path::new(&root);
+        let started = std::time::Instant::now();
+        let newest = newest_source_mtime(root);
+        let took = started.elapsed();
+        let (manifest, catalog) = artifact_mtimes(root);
+        let local = |at: Option<SystemTime>| {
+            at.map(|at| {
+                chrono::DateTime::<chrono::Local>::from(at)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "none".to_owned())
+        };
+        println!("newest source {} (walk took {took:?})", local(newest));
+        println!("manifest      {}", local(manifest));
+        println!("catalog       {}", local(catalog));
+        println!("code is newer than the last parse: {}", sources_are_newer(newest, manifest, None));
+    }
+
+    /// dbt's failure output, as a panel can show it: no colour codes, no
+    /// blank lines, and the end of it — where the error is.
+    #[test]
+    fn failure_text_keeps_the_end_and_drops_the_colour() {
+        let stderr = b"\x1b[31mCompilation Error\x1b[0m in model orders\n\n  unknown ref 'custmers'\n";
+        assert_eq!(
+            failure_text(b"", stderr),
+            "Compilation Error in model orders\n  unknown ref 'custmers'"
+        );
+        let noisy: String = (0..60).map(|line| format!("line {line}\n")).collect();
+        let kept = failure_text(noisy.as_bytes(), b"");
+        assert_eq!(kept.lines().count(), 24);
+        assert!(kept.ends_with("line 59"));
+        assert!(kept.starts_with("line 36"));
+        // stdout leads, stderr ends: the error stays last.
+        assert_eq!(failure_text(b"Found 3 models", b"boom"), "Found 3 models\nboom");
+    }
 
     #[test]
     fn arithmetic_asterisk_does_not_disable_expressions() {
