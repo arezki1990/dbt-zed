@@ -4426,3 +4426,163 @@ impl Panel for DbtResultsPanel {
         8
     }
 }
+
+/// Draws the lineage view headlessly in each state it can be in. Nothing
+/// here looks at pixels: what it catches is a state that cannot be drawn at
+/// all — a duplicate element id, an unwrap — which would otherwise first
+/// show up as a crash in front of someone.
+#[cfg(test)]
+mod render_tests {
+    use gpui::{TestAppContext, VisualTestContext, size};
+    use project::Project;
+    use workspace::MultiWorkspace;
+
+    use super::*;
+    use crate::lineage::{GraphLayoutNode, ModelNode, NodeOps};
+
+    fn node(name: &str, level: i32, x: f32, ops: Option<NodeOps>) -> GraphLayoutNode {
+        GraphLayoutNode {
+            name: name.to_owned(),
+            kind: "model".to_owned(),
+            materialization: if level == 0 { "table" } else { "view" }.to_owned(),
+            path: None,
+            ops,
+            col_exprs: Default::default(),
+            col_refs: Default::default(),
+            col_lineage: Default::default(),
+            details: None,
+            truncated_up: level < 0,
+            truncated_down: false,
+            columns: vec!["store_id".to_owned(), "opened_on".to_owned()],
+            x,
+            y: 24.,
+            width: 220.,
+            height: GRAPH_NODE_HEIGHT,
+            level,
+            is_center: level == 0,
+        }
+    }
+
+    fn graph() -> (LayoutGraph, LineageTree) {
+        let ops = NodeOps {
+            joins: vec!["left join dim_store_referential".to_owned()],
+            aggregations: vec!["sum".to_owned()],
+            group_by: true,
+            filters: vec!["where".to_owned()],
+            windows: true,
+            ..NodeOps::default()
+        };
+        let layout = LayoutGraph {
+            nodes: vec![
+                node("dim_store_referential", -1, 24., None),
+                node("mnt_stores", 0, 320., Some(ops)),
+                node("mnt_store_parc", 1, 620., None),
+            ],
+            edges: vec![(0, 1), (1, 2)],
+            width: 900.,
+            height: 120.,
+        };
+        let leaf = |name: &str| LineageTreeNode {
+            node: ModelNode {
+                name: name.to_owned(),
+                kind: "model".to_owned(),
+                path: None,
+            },
+            children: Vec::new(),
+            truncated: false,
+        };
+        let tree = LineageTree {
+            up: vec![leaf("dim_store_referential")],
+            down: Vec::new(),
+        };
+        (layout, tree)
+    }
+
+    #[gpui::test]
+    async fn the_lineage_view_draws_in_every_state(cx: &mut TestAppContext) {
+        let app_state = cx.update(|cx| {
+            let app_state = workspace::AppState::test(cx);
+            editor::init(cx);
+            app_state
+        });
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |multi, _| multi.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            DbtResultsPanel::new(workspace, window, cx)
+        });
+
+        let mut draw = |label: &str, cx: &mut VisualTestContext| {
+            cx.draw(
+                gpui::Point::default(),
+                size(px(1280.), px(420.)),
+                |_, _| panel.clone().into_any_element(),
+            );
+            cx.run_until_parked();
+            log::info!("drew: {label}");
+        };
+
+        // Nothing to show yet, in each of its reasons.
+        panel.update(cx, |panel, _| panel.view = ResultsView::Lineage);
+        draw("empty — no model open", cx);
+        panel.update(cx, |panel, _| {
+            panel.lineage_problem = Some(LineageProblem::NoManifest);
+            panel.lineage_model = Some("mnt_stores".to_owned());
+            panel.lineage_root = Some(PathBuf::from("/project"));
+        });
+        draw("empty — never parsed", cx);
+        panel.update(cx, |panel, _| panel.lineage_job = Some(LineageJob::Parsing));
+        draw("empty — parsing", cx);
+        panel.update(cx, |panel, _| {
+            panel.lineage_job = None;
+            panel.lineage_error = Some("Compilation Error\n  unknown ref 'custmers'".into());
+        });
+        draw("empty — the parse failed", cx);
+
+        // A graph, at rest.
+        let (layout, tree) = graph();
+        panel.update(cx, |panel, _| {
+            panel.lineage_error = None;
+            panel.lineage_problem = None;
+            panel.lineage_layout = Some(Arc::new(layout));
+            panel.lineage_tree = Some(Arc::new(tree));
+            panel.show_details = true;
+        });
+        draw("graph — at rest", cx);
+
+        // Columns, a selected one, and a zoom that hides them.
+        panel.update(cx, |panel, _| {
+            panel.show_columns = true;
+            panel.selected_column = Some("store_id".to_owned());
+        });
+        draw("graph — columns, one selected", cx);
+        panel.update(cx, |panel, _| panel.zoom = 0.4);
+        draw("graph — columns on, hidden by the zoom", cx);
+
+        // Every banner at once, both Refresh buttons busy, then stale.
+        panel.update(cx, |panel, _| {
+            panel.zoom = 1.0;
+            panel.lineage_stale = true;
+            panel.lineage_error = Some("boom".into());
+            panel.lineage_problem = Some(LineageProblem::UnknownModel("new_model".into()));
+        });
+        draw("graph — stale, a failed parse, an unknown model", cx);
+        panel.update(cx, |panel, _| panel.lineage_job = Some(LineageJob::Catalog));
+        draw("graph — two spinners on screen", cx);
+        panel.update(cx, |panel, _| {
+            panel.lineage_job = None;
+            panel.lineage_problem = Some(LineageProblem::NoManifest);
+        });
+        draw("graph — another project's, this one never parsed", cx);
+
+        // The other tabs still draw with the lineage state set.
+        for view in [ResultsView::Table, ResultsView::Compiled] {
+            panel.update(cx, |panel, _| panel.view = view);
+            draw("another tab", cx);
+        }
+    }
+}
