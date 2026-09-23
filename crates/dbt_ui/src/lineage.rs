@@ -1594,7 +1594,11 @@ mod tests {
     fn badges_name_each_operation_once() {
         assert_eq!(NodeOps::default().badges(), "");
         let ops = NodeOps {
-            joins: vec!["left join a".into(), "inner join b".into(), "left join c".into()],
+            joins: vec![
+                "left join a".into(),
+                "inner join b".into(),
+                "left join c".into(),
+            ],
             aggregations: vec!["sum".into(), "count".into()],
             group_by: true,
             filters: vec!["where".into(), "qualify".into()],
@@ -1617,13 +1621,22 @@ mod tests {
     fn code_is_stale_only_against_the_newer_of_manifest_and_last_parse() {
         use std::time::Duration;
         let at = |seconds: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
-        assert!(sources_are_newer(at(30), at(20), None), "edited after the parse");
-        assert!(!sources_are_newer(at(10), at(20), None), "parsed after the edit");
+        assert!(
+            sources_are_newer(at(30), at(20), None),
+            "edited after the parse"
+        );
+        assert!(
+            !sources_are_newer(at(10), at(20), None),
+            "parsed after the edit"
+        );
         assert!(
             !sources_are_newer(at(30), at(20), at(40)),
             "re-parsed since, even though the manifest was left as it was"
         );
-        assert!(!sources_are_newer(at(30), None, None), "never parsed: nothing to be stale against");
+        assert!(
+            !sources_are_newer(at(30), None, None),
+            "never parsed: nothing to be stale against"
+        );
         assert!(!sources_are_newer(None, at(20), None), "no sources found");
     }
 
@@ -1658,7 +1671,10 @@ mod tests {
             .duration_since(model)
             .or_else(|_| model.duration_since(newest))
             .unwrap();
-        assert!(drift < Duration::from_secs(2), "picked something other than the model");
+        assert!(
+            drift < Duration::from_secs(2),
+            "picked something other than the model"
+        );
 
         // A macro edit is a parse's business, wherever it sits.
         let macro_edit = write("macros/cents_to_euros.sql", 100);
@@ -1698,14 +1714,18 @@ mod tests {
         println!("newest source {} (walk took {took:?})", local(newest));
         println!("manifest      {}", local(manifest));
         println!("catalog       {}", local(catalog));
-        println!("code is newer than the last parse: {}", sources_are_newer(newest, manifest, None));
+        println!(
+            "code is newer than the last parse: {}",
+            sources_are_newer(newest, manifest, None)
+        );
     }
 
     /// dbt's failure output, as a panel can show it: no colour codes, no
     /// blank lines, and the end of it — where the error is.
     #[test]
     fn failure_text_keeps_the_end_and_drops_the_colour() {
-        let stderr = b"\x1b[31mCompilation Error\x1b[0m in model orders\n\n  unknown ref 'custmers'\n";
+        let stderr =
+            b"\x1b[31mCompilation Error\x1b[0m in model orders\n\n  unknown ref 'custmers'\n";
         assert_eq!(
             failure_text(b"", stderr),
             "Compilation Error in model orders\n  unknown ref 'custmers'"
@@ -1716,7 +1736,10 @@ mod tests {
         assert!(kept.ends_with("line 59"));
         assert!(kept.starts_with("line 36"));
         // stdout leads, stderr ends: the error stays last.
-        assert_eq!(failure_text(b"Found 3 models", b"boom"), "Found 3 models\nboom");
+        assert_eq!(
+            failure_text(b"Found 3 models", b"boom"),
+            "Found 3 models\nboom"
+        );
     }
 
     #[test]

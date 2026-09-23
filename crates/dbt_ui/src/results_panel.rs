@@ -78,11 +78,13 @@ fn sources_toward(
 /// does to its inputs, and what a click does.
 fn node_tooltip_meta(node: &crate::lineage::GraphLayoutNode) -> String {
     let mut lines = Vec::new();
-    lines.push(if node.kind == node.materialization || node.materialization.is_empty() {
-        node.kind.clone()
-    } else {
-        format!("{} · {}", node.kind, node.materialization)
-    });
+    lines.push(
+        if node.kind == node.materialization || node.materialization.is_empty() {
+            node.kind.clone()
+        } else {
+            format!("{} · {}", node.kind, node.materialization)
+        },
+    );
     if let Some(ops) = node.ops.as_ref().filter(|ops| !ops.is_empty()) {
         lines.push(ops_tooltip(ops));
     }
@@ -451,11 +453,14 @@ impl DbtResultsPanel {
         cx.new(|cx| {
             // A save, a checkout, a dbt run in a terminal: anything that
             // moves files may have made the graph older than the code.
-            cx.subscribe(&project, |this: &mut Self, _, event: &project::Event, cx| {
-                if matches!(event, project::Event::WorktreeUpdatedEntries(..)) {
-                    this.check_lineage_freshness(cx);
-                }
-            })
+            cx.subscribe(
+                &project,
+                |this: &mut Self, _, event: &project::Event, cx| {
+                    if matches!(event, project::Event::WorktreeUpdatedEntries(..)) {
+                        this.check_lineage_freshness(cx);
+                    }
+                },
+            )
             .detach();
             let search_editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
@@ -681,8 +686,7 @@ impl DbtResultsPanel {
             let tree = store
                 .lineage_tree(&root, &model, tree_depth, max_nodes)
                 .ok();
-            let layout =
-                store.lineage_layout(&root, &model, graph_depth, max_nodes, &expansions);
+            let layout = store.lineage_layout(&root, &model, graph_depth, max_nodes, &expansions);
             (artifacts, tree, layout, model)
         });
         self._lineage_refresh = cx.spawn(async move |this, cx| {
@@ -759,8 +763,7 @@ impl DbtResultsPanel {
     /// The model and project a refresh is about: what the graph shows, or
     /// failing that the model file in front.
     fn lineage_target(&self, cx: &App) -> Option<(String, PathBuf)> {
-        if let (Some(model), Some(root)) = (self.lineage_model.clone(), self.lineage_root.clone())
-        {
+        if let (Some(model), Some(root)) = (self.lineage_model.clone(), self.lineage_root.clone()) {
             return Some((model, root));
         }
         let workspace = self.workspace.upgrade()?;
@@ -792,9 +795,7 @@ impl DbtResultsPanel {
                 workspace
                     .active_item(cx)
                     .is_some_and(|item| item.is_dirty(cx))
-                    .then(|| {
-                        workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
-                    })
+                    .then(|| workspace.save_active_item(workspace::SaveIntent::Save, window, cx))
             })
             .ok()
             .flatten();
@@ -832,12 +833,8 @@ impl DbtResultsPanel {
         let settings = DbtSettings::get_global(cx).clone();
         let http = self.http_client(cx);
         self._lineage_parse = cx.spawn(async move |this, cx| {
-            let parse = cx.background_spawn(run_dbt(
-                settings.clone(),
-                root.clone(),
-                &["parse"],
-                http,
-            ));
+            let parse =
+                cx.background_spawn(run_dbt(settings.clone(), root.clone(), &["parse"], http));
             let failure = match parse.await {
                 Ok(output) if output.status.success() => None,
                 Ok(output) => Some(crate::lineage::failure_text(&output.stdout, &output.stderr)),
@@ -1042,8 +1039,7 @@ impl DbtResultsPanel {
                         if shows_model {
                             // dbt show parses on its way: the graph it
                             // leaves behind is as fresh as a Refresh's.
-                            this.lineage_artifacts =
-                                crate::lineage::artifact_mtimes(&lineage_root);
+                            this.lineage_artifacts = crate::lineage::artifact_mtimes(&lineage_root);
                             this.lineage_parsed_at = Some(SystemTime::now());
                             this.lineage_stale = false;
                             this.lineage_error = None;
@@ -1511,7 +1507,9 @@ impl DbtResultsPanel {
                 )
                 .icon_size(IconSize::Small)
                 .toggle_state(self.show_tree)
-                .tooltip(ui::Tooltip::text("The same lineage as a tree, on the right"))
+                .tooltip(ui::Tooltip::text(
+                    "The same lineage as a tree, on the right",
+                ))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.show_tree = !this.show_tree;
                     cx.notify();
@@ -1594,9 +1592,9 @@ impl DbtResultsPanel {
                 .and_then(|layout| layout.nodes.iter().find(|node| node.is_center))
                 .map(|node| node.name.clone());
             let title = match shown {
-                Some(shown) if shown != model.as_ref() => format!(
-                    "{model} is not in the manifest yet — this is still {shown}'s lineage"
-                ),
+                Some(shown) if shown != model.as_ref() => {
+                    format!("{model} is not in the manifest yet — this is still {shown}'s lineage")
+                }
                 _ => format!("{model} is not in the manifest yet"),
             };
             banners.push(
@@ -1660,13 +1658,11 @@ impl DbtResultsPanel {
                     .color(Color::Muted),
             )
             .when(can_parse || self.lineage_job.is_some(), |state| {
-                state.child(
-                    div().pt_1().child(self.render_refresh_button(
-                        "dbt-lineage-refresh-empty",
-                        "Parse the project",
-                        cx,
-                    )),
-                )
+                state.child(div().pt_1().child(self.render_refresh_button(
+                    "dbt-lineage-refresh-empty",
+                    "Parse the project",
+                    cx,
+                )))
             })
             .children(self.lineage_error.clone().map(|error| {
                 div()
@@ -3819,8 +3815,7 @@ impl DbtResultsPanel {
                         let layout = self.filtered_layout(&full_layout);
                         let mut legend: Vec<SharedString> = Vec::new();
                         for node in &layout.nodes {
-                            let materialization: SharedString =
-                                node.materialization.clone().into();
+                            let materialization: SharedString = node.materialization.clone().into();
                             if !legend.contains(&materialization) {
                                 legend.push(materialization);
                             }
@@ -3870,15 +3865,11 @@ impl DbtResultsPanel {
                                         .flex_1()
                                         .w_full()
                                         .children(
-                                            self.render_graph_viewport(
-                                                "dbt-lineage-canvas",
-                                                cx,
-                                            ),
+                                            self.render_graph_viewport("dbt-lineage-canvas", cx),
                                         )
-                                        .when_some(
-                                            self.render_column_trace(cx),
-                                            |this, trace| this.child(trace),
-                                        ),
+                                        .when_some(self.render_column_trace(cx), |this, trace| {
+                                            this.child(trace)
+                                        }),
                                 ),
                         )
                     })
@@ -4516,12 +4507,10 @@ mod render_tests {
             DbtResultsPanel::new(workspace, window, cx)
         });
 
-        let mut draw = |label: &str, cx: &mut VisualTestContext| {
-            cx.draw(
-                gpui::Point::default(),
-                size(px(1280.), px(420.)),
-                |_, _| panel.clone().into_any_element(),
-            );
+        let draw = |label: &str, cx: &mut VisualTestContext| {
+            cx.draw(gpui::Point::default(), size(px(1280.), px(420.)), |_, _| {
+                panel.clone().into_any_element()
+            });
             cx.run_until_parked();
             log::info!("drew: {label}");
         };
