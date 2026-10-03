@@ -6334,6 +6334,7 @@ dependencies = [
 [[package]]
 name = "el_engine"
 version = "0.1.0"
+source = "git+ssh://git@github.com/arezki1990/zdbt-el.git?branch=main#5896929abcd479407191078be41bcf7a2b500176"
 dependencies = [
  "age",
  "anyhow",
