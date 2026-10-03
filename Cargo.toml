@@ -339,7 +339,7 @@ editor = { path = "crates/editor" }
 # fetches it with the system git (see .cargo/config.toml), so the SSH key
 # that reaches GitHub is enough locally; CI loads a read-only key from
 # secrets.ZDBT_EL_SSH_KEY into ssh-agent (see zdbt-release.yml).
-el_engine = { git = "ssh://git@github.com/arezki1990/zdbt-el.git", branch = "main" }
+el_engine = { git = "ssh://git@github.com/arezki1990/ellode.git", branch = "main" }
 duckdb = { version = "=1.10505.0", default-features = false, features = ["bundled", "chrono"] }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }

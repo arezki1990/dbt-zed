@@ -72,14 +72,14 @@ cargo test -p dbt_ui
 ## 2b. The extract-load (EL) half lives in another repository
 
 Since 2026-09-08 the EL engine, connector worker and daemon are **not** in
-this repository: they are `arezki1990/zdbt-el` (private, checked out at
-`~/projects/zdbt-el`). This repo's `crates/dbt_ui/src/el/` is the UI over
+this repository: they are `arezki1990/ellode` (private, checked out at
+`~/projects/ellode`). This repo's `crates/dbt_ui/src/el/` is the UI over
 them and depends on `el_engine` as a Git dependency (`Cargo.toml`,
-`ssh://git@github.com/arezki1990/zdbt-el.git`, fetched with the system
+`ssh://git@github.com/arezki1990/ellode.git`, fetched with the system
 git — `.cargo/config.toml` sets `net.git-fetch-with-cli`). Consequences:
 
 - Building the IDE needs read access to that repository. CI has it through
-  the `ZDBT_EL_TOKEN` secret (see `.github/workflows/zdbt-release.yml`).
+  the `ZDBT_EL_SSH_KEY` secret (see `.github/workflows/zdbt-release.yml`).
 - The worker binary (`ellode-worker`) is built from that repository; the
   IDE finds it via `ELLODE_WORKER` or beside its own executable.
 - EL changes: commit and push there, then `cargo update -p el_engine`
