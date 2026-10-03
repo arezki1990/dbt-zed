@@ -46,7 +46,7 @@ pub struct ElRemoteModal {
     editing: Option<String>,
     name: Entity<Editor>,
     url: Entity<Editor>,
-    /// Env var NAME (e.g. ZDBT_EL_TOKEN); stored as "${NAME}".
+    /// Env var NAME (e.g. ELLODE_TOKEN); stored as "${NAME}".
     token_var: Entity<Editor>,
     /// Install over SSH: user@host, the project dir, the profile to run.
     ssh_host: Entity<Editor>,
@@ -80,7 +80,7 @@ fn load_remotes_strict(root: &std::path::Path) -> Result<Remotes> {
     }
 }
 
-/// "${ZDBT_EL_TOKEN}" → "ZDBT_EL_TOKEN" for display.
+/// "${ELLODE_TOKEN}" → "ELLODE_TOKEN" for display.
 fn var_name_of(template: &str) -> String {
     template
         .trim()
@@ -153,7 +153,7 @@ impl ElRemoteModal {
                 .unwrap_or(""),
         );
         let token_var = make(
-            "ZDBT_EL_TOKEN",
+            "ELLODE_TOKEN",
             &existing
                 .as_ref()
                 .and_then(|remote| remote.token.as_deref())
@@ -261,7 +261,7 @@ impl ElRemoteModal {
             {
                 self.fail(
                     "give the NAME of the environment variable holding the token (e.g. \
-                     ZDBT_EL_TOKEN) — put the value itself in .env"
+                     ELLODE_TOKEN) — put the value itself in .env"
                         .into(),
                     cx,
                 );
@@ -281,7 +281,7 @@ impl ElRemoteModal {
 
     /// Generates a token for an existing daemon: random 48 hex chars,
     /// appended to the project's .env under the token variable (defaulting
-    /// to ZDBT_EL_TOKEN_<NAME>), then offered for copying to the server.
+    /// to ELLODE_TOKEN_<NAME>), then offered for copying to the server.
     fn generate_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut var = var_name_of(&self.token_var.read(cx).text(cx));
         if var.is_empty() {
@@ -289,7 +289,7 @@ impl ElRemoteModal {
         }
         if !(var.len() <= 64 && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
             return self.fail(
-                "the token variable must be a plain NAME (e.g. ZDBT_EL_TOKEN)".into(),
+                "the token variable must be a plain NAME (e.g. ELLODE_TOKEN)".into(),
                 cx,
             );
         }
@@ -343,7 +343,7 @@ impl ElRemoteModal {
     fn generated_token_var(&self, cx: &App) -> String {
         let name = self.name.read(cx).text(cx).trim().to_ascii_uppercase();
         format!(
-            "ZDBT_EL_TOKEN_{}",
+            "ELLODE_TOKEN_{}",
             name.chars()
                 .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
                 .collect::<String>()
@@ -382,7 +382,7 @@ impl ElRemoteModal {
             if !looks_like_var {
                 return self.fail(
                     "give the NAME of the environment variable holding the token \
-                     (e.g. ZDBT_EL_TOKEN) — put the value itself in .env"
+                     (e.g. ELLODE_TOKEN) — put the value itself in .env"
                         .into(),
                     cx,
                 );
@@ -784,7 +784,7 @@ impl Render for ElRemoteModal {
                             ]))
                             .child(
                                 Label::new(if self.mode == Mode::Existing {
-                                    "Point at an el serve daemon that is already running."
+                                    "Point at an ellode-serve daemon that is already running."
                                 } else {
                                     "Install the daemon on a Linux server through your own ssh."
                                 })
@@ -848,7 +848,7 @@ impl Render for ElRemoteModal {
                                     Severity::Success,
                                     format!(
                                         "Token written to .env as {var}. Put the same value in \
-                                         the server's /etc/zdbt-el-serve/env."
+                                         the server's /etc/ellode-serve/env."
                                     ),
                                 ))
                                 .child(
@@ -916,8 +916,8 @@ impl Render for ElRemoteModal {
                 ))
                 .child(dialog::notice(
                     Severity::Info,
-                    "Runs the zdbt-el installer on the server through your own ssh (sudo \
-                     needed): builds zdbt-el-serve, creates the service and a systemd unit. \
+                    "Runs the Ellode installer on the server through your own ssh (sudo \
+                     needed): builds ellode-serve, creates the service and a systemd unit. \
                      The token is generated here and sent over stdin.",
                 )),
             (false, Step::Review) => {

@@ -80,8 +80,8 @@ git — `.cargo/config.toml` sets `net.git-fetch-with-cli`). Consequences:
 
 - Building the IDE needs read access to that repository. CI has it through
   the `ZDBT_EL_TOKEN` secret (see `.github/workflows/zdbt-release.yml`).
-- The worker binary (`zdbt-el-worker`) is built from that repository; the
-  IDE finds it via `ZDBT_EL_WORKER` or beside its own executable.
+- The worker binary (`ellode-worker`) is built from that repository; the
+  IDE finds it via `ELLODE_WORKER` or beside its own executable.
 - EL changes: commit and push there, then `cargo update -p el_engine`
   here to move the lock. Daemon releases are its `el-v*` tags.
 

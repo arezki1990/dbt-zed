@@ -27,7 +27,7 @@ const PREVIEW_ROWS_MAX: usize = 200;
 const RECENT_RUNS: usize = 20;
 
 pub fn serve() {
-    crate::mcp::serve_stdio("zdbt-el", tool_descriptors(), call_tool);
+    crate::mcp::serve_stdio("ellode", tool_descriptors(), call_tool);
 }
 
 fn tool_descriptors() -> Value {

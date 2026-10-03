@@ -451,9 +451,9 @@ impl ElPanel {
         let effective = self.profile.clone();
         let message = if effective.as_ref() == Some(&name) {
             format!("Profile: {name}")
-        } else if std::env::var("ZDBT_EL_PROFILE").is_ok() {
+        } else if std::env::var("ELLODE_PROFILE").is_ok() {
             format!(
-                "Saved, but ZDBT_EL_PROFILE overrides the selection — this window                  still runs as {}.",
+                "Saved, but ELLODE_PROFILE overrides the selection — this window                  still runs as {}.",
                 effective.as_deref().unwrap_or("the base connections")
             )
         } else {
@@ -1110,10 +1110,10 @@ impl ElPanel {
         };
         let path = super::el_dir(&root).join("remotes.yml");
         if !path.exists() {
-            let starter = "# el/remotes.yml — el serve daemons the IDE can drive from the \
-Remote tab.\n# Tokens are ${VAR} references, never literals. Non-loopback URLs must be \
+            let starter = "# el/remotes.yml — ellode-serve daemons the IDE can drive from \
+the Remote tab.\n# Tokens are ${VAR} references, never literals. Non-loopback URLs must be \
 https.\nversion: 1\nremotes:\n  # local_daemon:\n  #   url: http://127.0.0.1:7431\n  #   \
-token: \"${ZDBT_EL_TOKEN}\"\n";
+token: \"${ELLODE_TOKEN}\"\n";
             if let Err(error) = std::fs::write(&path, starter) {
                 self.workspace
                     .update(cx, |workspace, cx| {
@@ -2751,8 +2751,8 @@ impl ElPanel {
                     Tooltip::with_meta(
                         "Servers",
                         None,
-                        "el/remotes.yml lists the el serve daemons the IDE deploys to and \
-                         watches. Add server points at a running daemon or installs one over \
+                        "el/remotes.yml lists the ellode-serve daemons the IDE deploys to \
+                         and watches. Add server points at a running daemon or installs one over \
                          SSH (zdbt el install-remote). Tokens are ${VAR} references resolved \
                          from .env.",
                         cx,

@@ -237,11 +237,11 @@ pub async fn start(project_root: &Path, image: &str) -> Result<()> {
         // Passed by name: the value comes from this process's environment,
         // so the token never appears in `ps`.
         "--env",
-        "ZDBT_EL_TOKEN",
+        "ELLODE_TOKEN",
     ])
     .args(&oracle)
     .arg(image)
-    .env("ZDBT_EL_TOKEN", &token);
+    .env("ELLODE_TOKEN", &token);
     let output = run.output().await.context("running docker")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -458,7 +458,7 @@ fn oracle_client_args(project_root: &Path) -> Result<Vec<String>> {
             admin.display()
         ),
         "--env".to_owned(),
-        "ZDBT_EL_ORACLE_CLIENT_DIR=/opt/oracle/instantclient".to_owned(),
+        "ELLODE_ORACLE_CLIENT_DIR=/opt/oracle/instantclient".to_owned(),
         "--env".to_owned(),
         "LD_LIBRARY_PATH=/opt/oracle/instantclient".to_owned(),
         "--env".to_owned(),
@@ -716,12 +716,12 @@ mod tests {
     #[test]
     fn a_server_already_at_the_runner_address_is_adopted() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ZDBT_EL_TOKEN}\n  docker_test:\n    url: http://127.0.0.1:7432\n    token: ${ZDBT_EL_TOKEN_DOCKER_TEST}\n";
+        let yaml = "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ELLODE_TOKEN}\n  docker_test:\n    url: http://127.0.0.1:7432\n    token: ${ELLODE_TOKEN_DOCKER_TEST}\n";
         let path = remotes_file(dir.path(), yaml);
 
         let remote = runner_remote(dir.path()).unwrap();
         assert_eq!(remote.name, "local_daemon");
-        assert_eq!(remote.token_var, "ZDBT_EL_TOKEN");
+        assert_eq!(remote.token_var, "ELLODE_TOKEN");
         declare_remote(dir.path(), &remote).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
     }
@@ -731,7 +731,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         remotes_file(
             dir.path(),
-            "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ZDBT_EL_TOKEN}\n  localhost:\n    url: http://127.0.0.1:7431\n    token: ${EL_RUNNER_TOKEN}\n",
+            "version: 1\nremotes:\n  local_daemon:\n    url: http://127.0.0.1:7431\n    token: ${ELLODE_TOKEN}\n  localhost:\n    url: http://127.0.0.1:7431\n    token: ${EL_RUNNER_TOKEN}\n",
         );
         let remote = runner_remote(dir.path()).unwrap();
         assert_eq!(

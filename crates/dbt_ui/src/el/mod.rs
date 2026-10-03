@@ -176,7 +176,7 @@ pub fn db_worker(project_root: &Path, connection: &str) -> anyhow::Result<DbWork
     }
 }
 
-pub const WORKER_MISSING: &str = "Connector worker not found — build zdbt-el-worker or set ZDBT_EL_WORKER, or pick a \
+pub const WORKER_MISSING: &str = "Connector worker not found — build ellode-worker or set ELLODE_WORKER, or pick a \
      remote's worker in the EL panel.";
 
 fn local_connection(
@@ -323,7 +323,7 @@ pub fn preview_stream(
 /// override, then a sibling of the running executable (dev builds and
 /// bundles), then the managed install dir (the future download target).
 pub fn find_worker() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("ZDBT_EL_WORKER") {
+    if let Some(path) = std::env::var_os("ELLODE_WORKER") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
@@ -331,13 +331,13 @@ pub fn find_worker() -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join("zdbt-el-worker");
+            let sibling = dir.join("ellode-worker");
             if sibling.is_file() {
                 return Some(sibling);
             }
         }
     }
-    let managed = paths::data_dir().join("el-worker").join("zdbt-el-worker");
+    let managed = paths::data_dir().join("el-worker").join("ellode-worker");
     managed.is_file().then_some(managed)
 }
 

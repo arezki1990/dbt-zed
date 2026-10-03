@@ -27,7 +27,7 @@ pub fn main(args: &[String]) -> i32 {
 }
 
 /// `zdbt el serve`: the scheduling daemon with the JSON API. Token from
-/// ZDBT_EL_TOKEN; non-loopback binds require the token AND TLS.
+/// ELLODE_TOKEN; non-loopback binds require the token AND TLS.
 fn serve(args: &[String]) -> i32 {
     let Some(root) = project_root(args) else {
         eprintln!("no project found — run inside an EL project or pass --project");
@@ -259,8 +259,8 @@ fn install_remote(args: &[String]) -> i32 {
     if !run_ssh(
         &host_spec,
         &with_port(&[]),
-        "sudo mkdir -p /etc/zdbt-el-serve && sudo tee /etc/zdbt-el-serve/token >/dev/null \
-         && sudo chmod 600 /etc/zdbt-el-serve/token",
+        "sudo mkdir -p /etc/ellode-serve && sudo tee /etc/ellode-serve/token >/dev/null \
+         && sudo chmod 600 /etc/ellode-serve/token",
         Some(&token),
     ) {
         eprintln!("could not place the token on {host_spec}");
@@ -281,7 +281,7 @@ fn install_remote(args: &[String]) -> i32 {
 
     // Declare it locally: token in .env (never in YAML), server in remotes.yml.
     let var = format!(
-        "ZDBT_EL_TOKEN_{}",
+        "ELLODE_TOKEN_{}",
         name.to_ascii_uppercase()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -355,9 +355,9 @@ fn install_remote(args: &[String]) -> i32 {
     println!(
         "\nDeclared {name} → {url} in el/remotes.yml; token stored as {var} in .env.\n\
          On the server: copy el/connections.yml under {remote_project}/el/, fill \
-         /etc/zdbt-el-serve/env (profile + database URLs), add TLS to the unit \
+         /etc/ellode-serve/env (profile + database URLs), add TLS to the unit \
          (or keep --insecure-http behind your TLS proxy), then\n  \
-         systemctl enable --now zdbt-el-serve\n\
+         systemctl enable --now ellode-serve\n\
          Back in the IDE, open the Remote tab and deploy a pipeline from its canvas."
     );
     0
