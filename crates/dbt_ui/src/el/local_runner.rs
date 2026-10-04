@@ -402,6 +402,7 @@ fn declare_remote(project_root: &Path, remote: &RunnerRemote) -> Result<()> {
                 el_engine::spec::RemoteSpec {
                     url: format!("http://127.0.0.1:{PORT}"),
                     token: Some(template),
+                    live: true,
                     extra: Default::default(),
                 },
             );
@@ -466,12 +467,13 @@ fn oracle_client_args(project_root: &Path) -> Result<Vec<String>> {
     ])
 }
 
-/// Checks `.env` can safely hold a token, before one is written. A tracked
-/// `.env` is refused. An unignored one is to be added to `.git/info/exclude`
-/// — local to this clone rather than the team's `.gitignore` — and that path
-/// is returned for the caller to write once the runner is up. Outside a git
+/// Checks `.env` can safely hold a token (the runner's, or a console
+/// remote's access token), before one is written. A tracked `.env` is
+/// refused. An unignored one is to be added to `.git/info/exclude` — local
+/// to this clone rather than the team's `.gitignore` — and that path is
+/// returned for the caller to write once the token is. Outside a git
 /// checkout there is nothing to protect against.
-async fn dotenv_exclusion(project_root: &Path) -> Result<Option<PathBuf>> {
+pub(super) async fn dotenv_exclusion(project_root: &Path) -> Result<Option<PathBuf>> {
     let git = |args: &[&str]| {
         let mut command = util::command::new_command("git");
         command.arg("-C").arg(project_root).args(args);
@@ -492,8 +494,8 @@ async fn dotenv_exclusion(project_root: &Path) -> Result<Option<PathBuf>> {
         .is_ok_and(|output| output.status.success());
     if tracked {
         bail!(
-            ".env is tracked by git, so the runner token can't be written there — \
-             set the token in your environment instead"
+            ".env is tracked by git, so a token can't be written there — set it in \
+             your environment instead"
         );
     }
     let ignored = git(&["check-ignore", "--quiet", ".env"])
@@ -513,7 +515,7 @@ fn append_dotenv(project_root: &Path, key: &str, value: &str) -> Result<()> {
 }
 
 /// Appends a line, first ending the file's last line if it has no newline.
-fn append_line(path: &Path, line: &str) -> Result<()> {
+pub(super) fn append_line(path: &Path, line: &str) -> Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let separator = if existing.is_empty() || existing.ends_with('\n') {
         ""

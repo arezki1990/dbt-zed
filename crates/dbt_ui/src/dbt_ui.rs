@@ -50,6 +50,8 @@ actions!(
         ToggleElPanelFocus,
         /// Toggles focus on the EL runs panel.
         ToggleElRunsFocus,
+        /// Pushes the dbt project to an Ellode platform project, as the bundle its dbt runs take.
+        PushDbtProject,
     ]
 );
 
@@ -75,6 +77,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &ToggleElRunsFocus, window, cx| {
             workspace.toggle_panel_focus::<el::ElRunsPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &PushDbtProject, window, cx| {
+            el::push_dbt_project(workspace, window, cx);
         });
     })
     .detach();

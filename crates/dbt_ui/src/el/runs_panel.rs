@@ -117,10 +117,15 @@ pub struct ElRunsPanel {
     _query_tick: Task<()>,
     // Remote surface state (from el/remotes.yml).
     remotes: Vec<SharedString>,
+    /// The remotes that are platform projects reached through a console:
+    /// polled, with no connections to send.
+    platform_remotes: HashMap<SharedString, super::platform::PlatformRemote>,
     selected_remote: Option<usize>,
     remote_pipelines: Vec<el_engine::server::RemotePipeline>,
     remote_runs: Vec<el_engine::server::RemoteRun>,
     remote_error: Option<SharedString>,
+    /// Whether `remote_error` is a console refusing the access token.
+    remote_token_refused: bool,
     /// A failed Run/Cancel action — kept visible until the next action
     /// or remote switch (the 2s poll must not wipe it).
     remote_action_error: Option<SharedString>,
@@ -692,10 +697,12 @@ impl ElRunsPanel {
                 _query: Task::ready(()),
                 _query_tick: Task::ready(()),
                 remotes: Vec::new(),
+                platform_remotes: HashMap::new(),
                 selected_remote: None,
                 remote_pipelines: Vec::new(),
                 remote_runs: Vec::new(),
                 remote_error: None,
+                remote_token_refused: false,
                 remote_action_error: None,
                 remote_status: None,
                 remote_logs: Vec::new(),
@@ -913,21 +920,40 @@ impl ElRunsPanel {
         {
             self.selected = (!self.connections.is_empty()).then_some(0);
         }
-        self.remotes = el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
-            .map(|remotes| {
-                remotes
-                    .remotes
-                    .keys()
-                    .map(|name| name.clone().into())
-                    .collect()
-            })
+        let declared = el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
+            .map(|remotes| remotes.remotes)
             .unwrap_or_default();
+        self.remotes = declared.keys().map(|name| name.clone().into()).collect();
+        self.platform_remotes = declared
+            .iter()
+            .filter_map(|(name, remote)| {
+                super::platform::platform_remote(&remote.url)
+                    .map(|platform| (SharedString::from(name.clone()), platform))
+            })
+            .collect();
         if self
             .selected_remote
             .map_or(true, |ix| ix >= self.remotes.len())
         {
             self.selected_remote = (!self.remotes.is_empty()).then_some(0);
         }
+    }
+
+    /// The selected remote's console and project, when it is a platform
+    /// project reached through a console.
+    fn selected_platform(&self) -> Option<&super::platform::PlatformRemote> {
+        self.selected_remote
+            .and_then(|ix| self.remotes.get(ix))
+            .and_then(|name| self.platform_remotes.get(name))
+    }
+
+    /// A failure on the selected remote, as the panel says it: a console's
+    /// refusal names the token or the role, anything else reads as it is.
+    fn remote_failure(&self, error: &anyhow::Error) -> SharedString {
+        self.selected_platform()
+            .and_then(|platform| super::platform::refusal_text(platform, error))
+            .unwrap_or_else(|| format!("{error:#}"))
+            .into()
     }
 
     /// The remote currently selected, as (project root, remote name).
@@ -1015,6 +1041,7 @@ impl ElRunsPanel {
                                     status.live = false;
                                 }
                                 this.remote_error = Some(error);
+                                this.remote_token_refused = false;
                             }
                             RemoteFeed::Unsupported => {
                                 // Not worth a word to the operator: the
@@ -1118,7 +1145,7 @@ impl ElRunsPanel {
                         }
                         this.remote_run_events.insert(run_id, page.events);
                     }
-                    Err(error) => this.remote_run_error = Some(format!("{error:#}").into()),
+                    Err(error) => this.remote_run_error = Some(this.remote_failure(&error)),
                 }
                 cx.notify();
             })
@@ -1211,6 +1238,7 @@ impl ElRunsPanel {
                                 this.remote_pipelines = pipelines;
                                 this.remote_runs = runs;
                                 this.remote_error = None;
+                                this.remote_token_refused = false;
                                 // The server has now said what it holds.
                                 this.remote_detail_pending = false;
                                 this.remote_status = health.map(|value| {
@@ -1247,7 +1275,9 @@ impl ElRunsPanel {
                             }
                             Err(error) => {
                                 this.remote_status = None;
-                                this.remote_error = Some(format!("{error:#}").into());
+                                this.remote_token_refused =
+                                    super::platform::is_token_refused(&error);
+                                this.remote_error = Some(this.remote_failure(&error));
                             }
                         }
                         cx.notify();
@@ -1272,11 +1302,15 @@ impl ElRunsPanel {
         };
         self.remote_action(
             move |client| {
-                let (key, _) = client.pubkey().map_err(|error| {
-                    anyhow::anyhow!(
-                        "this server can't be sent connections ({error}) — update the daemon"
-                    )
-                })?;
+                use el_engine::server::Sealing;
+                let key = match client.sealing()? {
+                    Sealing::Key { public_key, .. } => public_key,
+                    // The platform says where its connections are set.
+                    Sealing::KeepsItsOwn(reason) => anyhow::bail!("{reason}"),
+                    Sealing::Unsupported => {
+                        anyhow::bail!("this server can't be sent connections — update the daemon")
+                    }
+                };
                 let bundle = el_engine::secrets::ConnectionsBundle::read(&root)?;
                 let sealed = bundle.seal(&key)?;
                 client.send_connections(&sealed).map(|_| ())
@@ -1695,7 +1729,7 @@ impl ElRunsPanel {
                     Ok(()) if this.remote_is_live() => {}
                     Ok(()) => this.start_remote_feed(cx),
                     Err(error) => {
-                        this.remote_action_error = Some(format!("{error:#}").into());
+                        this.remote_action_error = Some(this.remote_failure(&error));
                     }
                 }
                 cx.notify();
@@ -2263,14 +2297,21 @@ impl ElRunsPanel {
                         cx.notify();
                     })),
             )
+            // A console's project takes them sealed to its own key, from its
+            // admins; a platform without the secrets key says it keeps its
+            // own when asked.
             .child(
                 Button::new("el-remote-send-connections", "Send connections")
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Lock).size(IconSize::XSmall))
-                    .tooltip(ui::Tooltip::text(
+                    .tooltip(ui::Tooltip::text(if self.selected_platform().is_some() {
+                        "Encrypt this project's connections to the console project's own key: \
+                         its connections.yml and the secrets they name are replaced (project \
+                         admins)"
+                    } else {
                         "Encrypt this project's connections to this server's own key and \
-                         replace the ones it holds",
-                    ))
+                         replace the ones it holds"
+                    }))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.send_connections_to_remote(cx);
                     })),
@@ -2342,23 +2383,37 @@ impl ElRunsPanel {
                 .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
                 .into_any_element();
         };
-        let (dot, how, how_tip) = if self.remote_error.is_some() {
+        let (dot, how, how_tip): (Color, &str, SharedString) = if self.remote_error.is_some() {
             (
                 Color::Error,
                 "Offline",
-                "The connection dropped — what is shown is the last known state",
+                "The connection dropped — what is shown is the last known state".into(),
             )
         } else if status.live {
             (
                 Color::Success,
                 "Live",
-                "Attached to the server's socket: runs, progress and log lines arrive as they happen",
+                "Attached to the server's socket: runs, progress and log lines arrive as they happen"
+                    .into(),
+            )
+        } else if let Some(platform) = self.selected_platform() {
+            // Polling is how a console is reached, not a fault: no warning.
+            (
+                Color::Success,
+                "Polling",
+                format!(
+                    "Project {} through the console at {}, which has no live socket: the panel \
+                     asks it every two seconds",
+                    platform.project, platform.host
+                )
+                .into(),
             )
         } else {
             (
                 Color::Warning,
                 "Polling",
-                "This server predates the live socket, so the panel asks it every two seconds",
+                "This server predates the live socket, so the panel asks it every two seconds"
+                    .into(),
             )
         };
         let running = self
@@ -2378,7 +2433,9 @@ impl ElRunsPanel {
                     .items_center()
                     .child(ui::Indicator::dot().color(dot))
                     .child(Label::new(how).size(LabelSize::Small))
-                    .tooltip(move |_window, cx| ui::Tooltip::with_meta(how, None, how_tip, cx)),
+                    .tooltip(move |_window, cx| {
+                        ui::Tooltip::with_meta(how, None, how_tip.clone(), cx)
+                    }),
             )
             .children(profile.map(|profile| {
                 // A production profile is dressed as a warning: the same
@@ -2531,11 +2588,29 @@ impl ElRunsPanel {
         let local = ["127.0.0.1", "localhost", "[::1]"]
             .iter()
             .any(|host| error.contains(host));
-        let hint = if local {
-            "This remote is a port on this machine — a tunnel, or a local runner. Check that \
-             it is up, then retry."
+        let (title, hint): (SharedString, &str) = if self.remote_token_refused {
+            (
+                format!("{remote} refused the token").into(),
+                "Edit this server in the EL sidebar (its pencil) to paste the new token, then \
+                 retry.",
+            )
+        } else if self.selected_platform().is_some() {
+            (
+                format!("Can't reach {remote}").into(),
+                "Check the console's address and that it is up — it is the way to the \
+                 platform — then retry.",
+            )
+        } else if local {
+            (
+                format!("Can't reach {remote}").into(),
+                "This remote is a port on this machine — a tunnel, or a local runner. Check \
+                 that it is up, then retry.",
+            )
         } else {
-            "Check that the server is running and reachable from this machine, then retry."
+            (
+                format!("Can't reach {remote}").into(),
+                "Check that the server is running and reachable from this machine, then retry.",
+            )
         };
         v_flex()
             .flex_1()
@@ -2546,11 +2621,15 @@ impl ElRunsPanel {
                     .gap_1p5()
                     .items_center()
                     .child(
-                        Icon::new(IconName::Disconnected)
-                            .size(IconSize::Small)
-                            .color(Color::Error),
+                        Icon::new(if self.remote_token_refused {
+                            IconName::Lock
+                        } else {
+                            IconName::Disconnected
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Error),
                     )
-                    .child(Label::new(format!("Can't reach {remote}")).size(LabelSize::Small)),
+                    .child(Label::new(title).size(LabelSize::Small)),
             )
             .child(
                 Label::new(error.clone())

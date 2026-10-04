@@ -125,8 +125,8 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             to: map_node_ix,
         });
 
-        // This stream's warehouse table, completing the row.
-        let target_table = stream.target_table(&pipeline.target);
+        // Where this stream loads — a warehouse table, or a file store's
+        // directory — completing the row.
         let target_id = NodeId::TargetTable(stream.name.clone());
         let (target_x, target_y) = position(pipeline, &target_id)
             .unwrap_or((PADDING + 2. * (NODE_WIDTH + COL_GAP), row_y));
@@ -135,12 +135,20 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             .and_then(|connections| connections.connections.get(&pipeline.target.connection))
             .map(Connection::kind)
             .unwrap_or("warehouse");
+        let target_table = stream.target_location(&pipeline.target, target_kind);
         let target_node_ix = nodes.len();
         nodes.push(ElNode {
             id: target_id,
             kind: ElNodeKind::TargetTable { stream_ix },
             label: target_table.into(),
-            sublabel: if target_db.is_empty() {
+            sublabel: if el_engine::spec::is_file_kind(target_kind) {
+                let format = pipeline.target.format.unwrap_or(el_engine::spec::FileFormat::Parquet);
+                let layout = match pipeline.target.layout.unwrap_or_default() {
+                    el_engine::spec::FileLayout::Replace => "",
+                    el_engine::spec::FileLayout::Append => ", appended",
+                };
+                format!("{target_kind}: {}{layout}", format_name(format)).into()
+            } else if target_db.is_empty() {
                 format!("{target_kind}: {}", pipeline.target.schema).into()
             } else {
                 format!("{target_kind}: {target_db}.{}", pipeline.target.schema).into()
@@ -171,6 +179,15 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
         edges,
         width,
         height,
+    }
+}
+
+/// A file format as the YAML spells it.
+fn format_name(format: el_engine::spec::FileFormat) -> &'static str {
+    match format {
+        el_engine::spec::FileFormat::Csv => "csv",
+        el_engine::spec::FileFormat::Parquet => "parquet",
+        el_engine::spec::FileFormat::Ndjson => "ndjson",
     }
 }
 

@@ -270,6 +270,18 @@ impl BuilderForm {
                         window,
                         cx,
                     ),
+                    // A file store's, in place of the three above.
+                    field(
+                        "Path",
+                        "s3://bucket/gold/{stream}/",
+                        Some(
+                            "Each stream's directory: {stream} becomes its name. Parquet, \
+                             replaced each run, unless the YAML says format or layout.",
+                        ),
+                        target.and_then(|t| t.path.as_deref()).unwrap_or(""),
+                        window,
+                        cx,
+                    ),
                 ]
             }
         };
@@ -341,6 +353,15 @@ impl BuilderForm {
             && matches!(self.tables, TablesPick::Loading | TablesPick::Loaded { .. })
     }
 
+    /// Whether the target picked is a file store: it takes a path, not a
+    /// schema.
+    fn target_writes_files(&self) -> bool {
+        self.picked_connection
+            .as_ref()
+            .and_then(|picked| self.connection_names.iter().find(|(name, _)| name == picked))
+            .is_some_and(|(_, kind)| el_engine::spec::is_file_kind(kind))
+    }
+
     /// The fields the form shows for its kind and connection type.
     fn visible_fields(&self) -> Vec<&Field> {
         self.fields
@@ -348,7 +369,8 @@ impl BuilderForm {
             .enumerate()
             .filter(|(ix, _)| match self.kind {
                 BuilderKind::Source => !self.list_driven(),
-                BuilderKind::Target => true,
+                // A database's schema and names, or a file store's path.
+                BuilderKind::Target => (*ix == 3) == self.target_writes_files(),
                 BuilderKind::Connection => match ix {
                     0 => true,
                     1 => matches!(
@@ -767,20 +789,39 @@ impl BuilderForm {
             }
             BuilderKind::Target => {
                 let mut pipeline = pipeline.ok_or_else(|| anyhow::anyhow!("no pipeline open"))?;
-                let schema = self.text(1, cx);
-                if schema.is_empty() {
-                    bail!("the target needs a schema");
-                }
-                let database = self.text(0, cx);
-                let table = self.text(2, cx);
                 if let Some(picked) = &self.picked_connection {
                     pipeline.target.connection = picked.to_string();
                 }
-                pipeline.target = TargetSpec {
-                    connection: pipeline.target.connection.clone(),
-                    database: (!database.is_empty()).then_some(database),
-                    schema,
-                    table: (!table.is_empty()).then_some(table),
+                pipeline.target = if self.target_writes_files() {
+                    let path = self.text(3, cx);
+                    if path.is_empty() {
+                        bail!("a file target needs a path: where each stream's files go");
+                    }
+                    TargetSpec {
+                        connection: pipeline.target.connection.clone(),
+                        database: None,
+                        schema: String::new(),
+                        table: None,
+                        path: Some(path),
+                        format: pipeline.target.format,
+                        layout: pipeline.target.layout,
+                    }
+                } else {
+                    let schema = self.text(1, cx);
+                    if schema.is_empty() {
+                        bail!("the target needs a schema");
+                    }
+                    let database = self.text(0, cx);
+                    let table = self.text(2, cx);
+                    TargetSpec {
+                        connection: pipeline.target.connection.clone(),
+                        database: (!database.is_empty()).then_some(database),
+                        schema,
+                        table: (!table.is_empty()).then_some(table),
+                        path: None,
+                        format: None,
+                        layout: None,
+                    }
                 };
                 Ok(BuilderOutcome {
                     pipeline: Some(pipeline),

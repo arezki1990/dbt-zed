@@ -342,16 +342,21 @@ impl ElPanel {
                     .remotes
                     .iter()
                     .map(|(name, remote)| {
-                        // Host only: scheme stripped, path/query dropped.
-                        let host = remote
-                            .url
-                            .split_once("://")
-                            .map(|(_, rest)| rest)
-                            .unwrap_or(&remote.url)
-                            .split(['/', '?'])
-                            .next()
-                            .unwrap_or("")
-                            .to_owned();
+                        // A platform project through its console reads as
+                        // the project on the console; any other server as
+                        // its host only: scheme stripped, path/query dropped.
+                        let host = match super::platform::platform_remote(&remote.url) {
+                            Some(platform) => format!("{} · {}", platform.project, platform.host),
+                            None => remote
+                                .url
+                                .split_once("://")
+                                .map(|(_, rest)| rest)
+                                .unwrap_or(&remote.url)
+                                .split(['/', '?'])
+                                .next()
+                                .unwrap_or("")
+                                .to_owned(),
+                        };
                         let name: SharedString = name.clone().into();
                         let mut refs = Vec::new();
                         if let Some(token) = &remote.token {
@@ -1687,7 +1692,8 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             index += 1;
         };
         // Seed source/target from the project's real connections so the
-        // starter validates immediately.
+        // starter validates immediately: a database to load into, else a
+        // file store, which takes a path where a database takes a schema.
         let source = self
             .connections
             .iter()
@@ -1695,16 +1701,26 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             .or(self.connections.first())
             .map(|(name, _, _)| name.to_string())
             .unwrap_or_else(|| "files".to_owned());
-        let target = self
-            .connections
-            .iter()
-            .find(|(_, kind, _)| super::loadable(kind.as_ref()))
-            .map(|(name, _, _)| name.to_string())
-            .unwrap_or_else(|| "warehouse".to_owned());
+        let loadable = |files: bool| {
+            self.connections.iter().find(|(_, kind, _)| {
+                super::loadable(kind.as_ref()) && el_engine::spec::is_file_kind(kind.as_ref()) == files
+            })
+        };
+        let target = match loadable(false) {
+            Some((name, _, _)) => format!("  connection: {name}\n  schema: LANDING\n  table: '{{stream}}'\n"),
+            None => match loadable(true) {
+                Some((name, kind, _)) => {
+                    let scheme = el_engine::spec::file_schemes(kind.as_ref()).first().copied();
+                    let path = scheme.map_or_else(|| "exports/{stream}/".to_owned(), |scheme| format!("{scheme}bucket/gold/{{stream}}/"));
+                    format!("  connection: {name}\n  path: '{path}'\n")
+                }
+                None => "  connection: warehouse\n  schema: LANDING\n  table: '{stream}'\n".to_owned(),
+            },
+        };
         let starter = format!(
             "# yaml-language-server: $schema=../.zdbt/el-pipeline.schema.json\n\
              version: 1\npipeline: pipeline_{index}\nsource: {source}\n\
-             target:\n  connection: {target}\n  schema: LANDING\n  table: '{{stream}}'\nstreams: []\n"
+             target:\n{target}streams: []\n"
         );
         if std::fs::write(&path, starter).is_ok() {
             self.refresh(cx);
@@ -2751,10 +2767,11 @@ impl ElPanel {
                     Tooltip::with_meta(
                         "Servers",
                         None,
-                        "el/remotes.yml lists the ellode-serve daemons the IDE deploys to \
-                         and watches. Add server points at a running daemon or installs one over \
-                         SSH (zdbt el install-remote). Tokens are ${VAR} references resolved \
-                         from .env.",
+                        "el/remotes.yml lists the servers the IDE deploys to and watches. Add \
+                         server points at a running daemon, installs one over SSH (zdbt el \
+                         install-remote), or reaches a project of the Ellode platform through \
+                         its console with your access token. Tokens are ${VAR} references \
+                         resolved from .env.",
                         cx,
                     )
                 })

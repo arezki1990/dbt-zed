@@ -1,7 +1,9 @@
 //! The remote editor: add, edit, or delete a server in el/remotes.yml
 //! from the sidebar. A remote is a name, an https URL, and the NAME of
 //! the environment variable holding its token — the token value itself
-//! never enters the form or the file.
+//! never enters the form or the file. A project of the Ellode platform is
+//! one too, reached through its console with a personal access token,
+//! which is taken from the clipboard straight into `.env`.
 
 use std::path::PathBuf;
 
@@ -20,6 +22,7 @@ use el_engine::spec::{RemoteSpec, Remotes, SpecError};
 
 use super::dialog;
 use super::panel::ElPanel;
+use super::platform;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Step {
@@ -34,6 +37,9 @@ enum Mode {
     Existing,
     /// Install one on a Linux server over ssh, then declare it.
     Install,
+    /// A project of the Ellode platform, through its web console, with a
+    /// personal access token.
+    Platform,
 }
 
 pub struct ElRemoteModal {
@@ -52,6 +58,15 @@ pub struct ElRemoteModal {
     ssh_host: Entity<Editor>,
     ssh_project: Entity<Editor>,
     ssh_profile: Entity<Editor>,
+    /// A platform remote: the console's address and the project.
+    console: Entity<Editor>,
+    platform_project: Entity<Editor>,
+    /// An access token taken from the clipboard, written to .env on save.
+    /// Only its prefix is ever displayed.
+    pasted: Option<String>,
+    /// Whether the remote being edited has a live socket (`live`), kept
+    /// unless its URL turns out to be a console's.
+    live: bool,
     /// Wizard position (add mode only; edit is a single page).
     step: Step,
     mode: Mode,
@@ -88,6 +103,48 @@ fn var_name_of(template: &str) -> String {
         .and_then(|rest| rest.strip_suffix('}'))
         .unwrap_or(template.trim())
         .to_owned()
+}
+
+/// A variable's NAME, never a value: no spaces, no quotes, not long.
+fn is_var_name(var: &str) -> bool {
+    !var.is_empty() && var.len() <= 64 && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Puts an access token in the project's `.env` under `var` — its line
+/// rewritten when it has one — readable by its owner only, once git is
+/// known never to carry the file.
+async fn store_token(root: &std::path::Path, var: &str, value: &str) -> Result<()> {
+    use std::io::Write as _;
+    let exclude = super::local_runner::dotenv_exclusion(root).await?;
+    if let Some(exclude) = exclude {
+        super::local_runner::append_line(&exclude, ".env")
+            .map_err(|error| anyhow::anyhow!("could not exclude .env from git: {error:#}"))?;
+    }
+    let path = root.join(".env");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => bail!("could not read .env: {error}"),
+    };
+    let write = || -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            options.mode(0o600);
+            let mut file = options.open(&path)?;
+            // An existing file keeps its mode through a truncate: tighten it.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(platform::with_env_line(&existing, var, value).as_bytes())
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = options.open(&path)?;
+            file.write_all(platform::with_env_line(&existing, var, value).as_bytes())
+        }
+    };
+    write().map_err(|error| anyhow::anyhow!("could not write .env: {error}"))
 }
 
 impl ElRemoteModal {
@@ -163,6 +220,31 @@ impl ElRemoteModal {
         let ssh_host = make("deploy@el.example.com", "");
         let ssh_project = make("/srv/el-project", "");
         let ssh_profile = make("prod", "");
+        // A console remote is edited as one: its console and project, not
+        // the URL they make.
+        let console_remote = existing
+            .as_ref()
+            .filter(|remote| platform::platform_remote(&remote.url).is_some())
+            .and_then(|remote| platform::console_address(&remote.url).ok());
+        let console = make(
+            "https://el-console.example.com",
+            console_remote
+                .as_ref()
+                .map(|(console, _)| console.as_str())
+                .unwrap_or(""),
+        );
+        let platform_project = make(
+            "shop",
+            console_remote
+                .as_ref()
+                .and_then(|(_, project)| project.as_deref())
+                .unwrap_or(""),
+        );
+        let mode = if console_remote.is_some() {
+            Mode::Platform
+        } else {
+            Mode::Existing
+        };
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -176,8 +258,12 @@ impl ElRemoteModal {
             ssh_host,
             ssh_project,
             ssh_profile,
+            console,
+            platform_project,
+            pasted: None,
+            live: existing.as_ref().is_none_or(|remote| remote.live),
             step: Step::Details,
-            mode: Mode::Existing,
+            mode,
             generated: None,
             copied: false,
             delete_armed: false,
@@ -191,10 +277,14 @@ impl ElRemoteModal {
         cx.notify();
     }
 
+    /// Writes remotes.yml — after `token` (variable, value), when there is
+    /// one, has gone into `.env`: never into a `.env` git tracks, and one
+    /// git does not ignore yet is excluded from this clone first.
     fn write(
         &mut self,
         remotes: Remotes,
         done: String,
+        token: Option<(String, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -203,16 +293,26 @@ impl ElRemoteModal {
         let workspace = self.workspace.clone();
         let panel = self.panel.clone();
         let project = self.project.clone();
+        let root = self.root.clone();
         let path = super::el_dir(&self.root).join("remotes.yml");
         cx.spawn_in(window, async move |this, cx| {
-            let result = super::spec_io::write_text(
-                workspace.clone(),
-                project,
-                path,
-                el_engine::spec::to_canonical_remotes_yaml(&remotes),
-                cx,
-            )
-            .await;
+            let stored = match token {
+                Some((var, value)) => store_token(&root, &var, &value).await,
+                None => Ok(()),
+            };
+            let result = match stored {
+                Ok(()) => {
+                    super::spec_io::write_text(
+                        workspace.clone(),
+                        project,
+                        path,
+                        el_engine::spec::to_canonical_remotes_yaml(&remotes),
+                        cx,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             if result.is_ok() {
                 panel.update(cx, |panel, cx| panel.remotes_changed(cx)).ok();
                 workspace
@@ -232,8 +332,61 @@ impl ElRemoteModal {
         .detach();
     }
 
+    /// A platform remote's URL and project, from the console and project
+    /// fields — the project read from the console's address when that
+    /// names one and the field is empty.
+    fn platform_target(&self, cx: &App) -> std::result::Result<(String, String), String> {
+        let (console, named) = platform::console_address(&self.console.read(cx).text(cx))
+            .map_err(|error| format!("{error:#}"))?;
+        let typed = self.platform_project.read(cx).text(cx).trim().to_owned();
+        let project = if typed.is_empty() {
+            named.unwrap_or_default()
+        } else {
+            typed
+        };
+        if !platform::is_project_name(&project) {
+            return Err(
+                "give the project's name in the console: lower-case letters, digits and -".into(),
+            );
+        }
+        let url = platform::remote_url(&console, &project);
+        el_engine::server::check_remote_url(&url).map_err(|error| format!("{error:#}"))?;
+        Ok((url, project))
+    }
+
+    /// The variable a platform remote's token goes in: the one typed, or
+    /// `ELLODE_PAT_<PROJECT>`.
+    fn platform_token_var(&self, project: &str, cx: &App) -> String {
+        let typed = var_name_of(&self.token_var.read(cx).text(cx));
+        if typed.is_empty() {
+            platform::token_var_for(project)
+        } else {
+            typed
+        }
+    }
+
+    /// Takes an access token from the clipboard, where the console's dialog
+    /// put it, to write to .env on save. It is never displayed.
+    fn paste_token(&mut self, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        match text.as_deref().and_then(platform::access_token) {
+            Some(token) => {
+                self.pasted = Some(token.to_owned());
+                self.error = None;
+            }
+            None => {
+                self.error = Some(
+                    "The clipboard holds no access token: copy it in the console's dialog \
+                 (ellode_pat_…), then paste again."
+                        .into(),
+                )
+            }
+        }
+        cx.notify();
+    }
+
     /// The details step's checks, without writing anything.
-    fn details_valid(&mut self, cx: &mut Context<Self>) -> bool {
+    fn details_valid(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let name = self.name.read(cx).text(cx).trim().to_owned();
         if name.is_empty()
             || !name
@@ -245,6 +398,35 @@ impl ElRemoteModal {
                 cx,
             );
             return false;
+        }
+        if self.mode == Mode::Platform {
+            let project = match self.platform_target(cx) {
+                Ok((_, project)) => project,
+                Err(message) => {
+                    self.fail(message, cx);
+                    return false;
+                }
+            };
+            // What was read from a pasted address shows in the fields.
+            if self.platform_project.read(cx).text(cx).trim().is_empty() {
+                self.platform_project.update(cx, |editor, cx| {
+                    editor.set_text(project.clone(), window, cx)
+                });
+            }
+            let token_var = self.platform_token_var(&project, cx);
+            if !is_var_name(&token_var) {
+                self.fail(
+                    "give the NAME of the environment variable for the token (e.g. \
+                     ELLODE_PAT_SHOP) — the token itself is pasted, never typed"
+                        .into(),
+                    cx,
+                );
+                return false;
+            }
+            self.token_var
+                .update(cx, |editor, cx| editor.set_text(token_var, window, cx));
+            self.error = None;
+            return true;
         }
         let url = self.url.read(cx).text(cx).trim().to_owned();
         if let Err(error) = el_engine::server::check_remote_url(&url) {
@@ -365,11 +547,25 @@ impl ElRemoteModal {
                 cx,
             );
         }
-        let url = self.url.read(cx).text(cx).trim().to_owned();
-        if let Err(error) = el_engine::server::check_remote_url(&url) {
-            return self.fail(format!("{error:#}"), cx);
-        }
-        let token_var = var_name_of(&self.token_var.read(cx).text(cx));
+        let (url, live, project) = if self.mode == Mode::Platform {
+            match self.platform_target(cx) {
+                Ok((url, project)) => (url, false, Some(project)),
+                Err(message) => return self.fail(message, cx),
+            }
+        } else {
+            let url = self.url.read(cx).text(cx).trim().to_owned();
+            if let Err(error) = el_engine::server::check_remote_url(&url) {
+                return self.fail(format!("{error:#}"), cx);
+            }
+            // A console's URL typed in by hand is a console remote all the
+            // same: it has no socket to attach to.
+            let live = self.live && platform::platform_remote(&url).is_none();
+            (url, live, None)
+        };
+        let token_var = match &project {
+            Some(project) => self.platform_token_var(project, cx),
+            None => var_name_of(&self.token_var.read(cx).text(cx)),
+        };
         let token = if token_var.is_empty() {
             None
         } else {
@@ -406,7 +602,12 @@ impl ElRemoteModal {
             .and_then(|original| remotes.remotes.get(original))
             .map(|remote| remote.extra.clone())
             .unwrap_or_default();
-        let value = RemoteSpec { url, token, extra };
+        let value = RemoteSpec {
+            url,
+            token,
+            live,
+            extra,
+        };
         match &self.editing {
             None => {
                 if remotes.remotes.contains_key(&name) {
@@ -438,7 +639,14 @@ impl ElRemoteModal {
             None => format!("Server {name} added."),
             Some(_) => format!("Server {name} saved."),
         };
-        self.write(remotes, done, window, cx);
+        // A token pasted for a console goes to .env; one left over from
+        // before switching to another kind of server does not.
+        let pasted = self
+            .pasted
+            .clone()
+            .filter(|_| project.is_some())
+            .map(|value| (token_var, value));
+        self.write(remotes, done, pasted, window, cx);
     }
 
     /// Runs `zdbt el install-remote` in a terminal tab: the daemon gets
@@ -542,7 +750,13 @@ impl ElRemoteModal {
         if remotes.remotes.shift_remove(&original).is_none() {
             return self.fail("the server is gone from remotes.yml".into(), cx);
         }
-        self.write(remotes, format!("Server {original} removed."), window, cx);
+        self.write(
+            remotes,
+            format!("Server {original} removed."),
+            None,
+            window,
+            cx,
+        );
     }
 }
 
@@ -574,6 +788,12 @@ impl ElRemoteModal {
     /// The editors the current step shows, in the order Tab walks them.
     fn step_editors(&self) -> Vec<Entity<Editor>> {
         match (self.editing.is_some(), self.step, self.mode) {
+            (true, _, Mode::Platform) | (false, Step::Details, Mode::Platform) => vec![
+                self.name.clone(),
+                self.console.clone(),
+                self.platform_project.clone(),
+                self.token_var.clone(),
+            ],
             (true, _, _) | (false, Step::Details, Mode::Existing) => {
                 vec![self.name.clone(), self.url.clone(), self.token_var.clone()]
             }
@@ -616,7 +836,7 @@ impl ElRemoteModal {
         }
         match self.step {
             Step::Details => {
-                if self.details_valid(cx) {
+                if self.details_valid(window, cx) {
                     self.step = if self.mode == Mode::Install {
                         Step::Install
                     } else {
@@ -636,7 +856,7 @@ impl ElRemoteModal {
                 self.focus_step(window, cx);
             }
             Step::Review => match self.mode {
-                Mode::Existing => self.save(window, cx),
+                Mode::Existing | Mode::Platform => self.save(window, cx),
                 Mode::Install => self.install_over_ssh(window, cx),
             },
         }
@@ -651,6 +871,97 @@ impl ElRemoteModal {
         self.error = None;
         self.focus_step(window, cx);
         cx.notify();
+    }
+}
+
+impl ElRemoteModal {
+    /// A platform remote's fields: the console, the project, and the
+    /// token's variable — the token itself taken from the clipboard.
+    fn render_platform_details(
+        &self,
+        body: Div,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let token_var = match self.platform_target(cx) {
+            Ok((_, project)) => self.platform_token_var(&project, cx),
+            Err(_) => var_name_of(&self.token_var.read(cx).text(cx)),
+        };
+        let body = body
+            .child(dialog::field(
+                "Console",
+                &self.console,
+                Some("Its address, as you open it in a browser.".into()),
+                window,
+                cx,
+            ))
+            .child(dialog::field(
+                "Project",
+                &self.platform_project,
+                Some("Its name in the console: a token reaches that project only.".into()),
+                window,
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(dialog::field(
+                        "Token variable",
+                        &self.token_var,
+                        Some(
+                            "ELLODE_PAT_<PROJECT> when left empty. The token goes in .env.".into(),
+                        ),
+                        window,
+                        cx,
+                    )))
+                    .child(
+                        Button::new(
+                            "el-remote-paste-token",
+                            if self.pasted.is_some() {
+                                "Paste again"
+                            } else {
+                                "Paste token"
+                            },
+                        )
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Lock).size(IconSize::Small))
+                        .tooltip(Tooltip::text(
+                            "Take the access token from the clipboard, where the console's \
+                             dialog copies it. It goes to this project's .env, never into \
+                             remotes.yml, and is never shown.",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| this.paste_token(cx))),
+                    ),
+            );
+        body.child(match &self.pasted {
+            Some(token) => dialog::notice(
+                Severity::Success,
+                format!(
+                    "Token {}… taken from the clipboard: it goes to .env as {} when you save.",
+                    platform::token_prefix(token),
+                    if token_var.is_empty() {
+                        "the variable above"
+                    } else {
+                        &token_var
+                    },
+                ),
+            )
+            .into_any_element(),
+            None if self.editing.is_some() => dialog::notice(
+                Severity::Info,
+                "The token stays as .env has it. To replace one that expired or was revoked, \
+                 make a new one on the console's Access tokens page, copy it, then Paste token.",
+            )
+            .into_any_element(),
+            None => dialog::notice(
+                Severity::Info,
+                "Make a token on the console's Access tokens page, for this project — Operator \
+                 to run pipelines, Admin to deploy them too — copy it, then Paste token.",
+            )
+            .into_any_element(),
+        })
     }
 }
 
@@ -781,35 +1092,56 @@ impl Render for ElRemoteModal {
                                         cx.notify();
                                     },
                                 )),
+                                dialog::chip(
+                                    "el-remote-mode-platform",
+                                    "Ellode platform",
+                                    self.mode == Mode::Platform,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.mode = Mode::Platform;
+                                        cx.notify();
+                                    },
+                                )),
                             ]))
                             .child(
-                                Label::new(if self.mode == Mode::Existing {
-                                    "Point at an ellode-serve daemon that is already running."
-                                } else {
-                                    "Install the daemon on a Linux server through your own ssh."
+                                Label::new(match self.mode {
+                                    Mode::Existing => {
+                                        "Point at an ellode-serve daemon that is already running."
+                                    }
+                                    Mode::Install => {
+                                        "Install the daemon on a Linux server through your own \
+                                         ssh."
+                                    }
+                                    Mode::Platform => {
+                                        "A project of the Ellode platform, through its web \
+                                         console, with an access token of your own."
+                                    }
                                 })
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                             ),
                     ));
                 }
-                body = body
-                    .child(dialog::field(
-                        "Name",
-                        &self.name,
-                        Some("Letters, digits, _ and -.".into()),
-                        window,
-                        cx,
-                    ))
-                    .child(dialog::field(
+                body = body.child(dialog::field(
+                    "Name",
+                    &self.name,
+                    Some("Letters, digits, _ and -.".into()),
+                    window,
+                    cx,
+                ));
+                if self.mode == Mode::Platform {
+                    body = self.render_platform_details(body, window, cx);
+                } else {
+                    body = body.child(dialog::field(
                         "URL",
                         &self.url,
                         Some("https is required beyond localhost.".into()),
                         window,
                         cx,
                     ));
-                if editing || self.mode == Mode::Existing {
-                    body = body.child(
+                    if editing || self.mode == Mode::Existing {
+                        body = body.child(
                         h_flex()
                             .w_full()
                             .gap_2()
@@ -839,56 +1171,59 @@ impl Render for ElRemoteModal {
                                     })),
                             ),
                     );
-                    if let Some((var, value)) = self.generated.clone() {
-                        body = body.child(
-                            v_flex()
-                                .w_full()
-                                .gap_1()
-                                .child(dialog::notice(
-                                    Severity::Success,
-                                    format!(
-                                        "Token written to .env as {var}. Put the same value in \
+                        if let Some((var, value)) = self.generated.clone() {
+                            body = body.child(
+                                v_flex()
+                                    .w_full()
+                                    .gap_1()
+                                    .child(dialog::notice(
+                                        Severity::Success,
+                                        format!(
+                                            "Token written to .env as {var}. Put the same value in \
                                          the server's /etc/ellode-serve/env."
-                                    ),
-                                ))
-                                .child(
-                                    h_flex().pl_5().child(
-                                        Button::new(
-                                            "el-remote-copy-token",
-                                            if self.copied { "Copied" } else { "Copy token" },
-                                        )
-                                        .label_size(LabelSize::Small)
-                                        .start_icon(
-                                            Icon::new(if self.copied {
-                                                IconName::Check
-                                            } else {
-                                                IconName::Copy
-                                            })
-                                            .size(IconSize::Small),
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.write_to_clipboard(
-                                                    gpui::ClipboardItem::new_string(value.clone()),
-                                                );
-                                                this.copied = true;
-                                                cx.notify();
-                                            }),
+                                        ),
+                                    ))
+                                    .child(
+                                        h_flex().pl_5().child(
+                                            Button::new(
+                                                "el-remote-copy-token",
+                                                if self.copied { "Copied" } else { "Copy token" },
+                                            )
+                                            .label_size(LabelSize::Small)
+                                            .start_icon(
+                                                Icon::new(if self.copied {
+                                                    IconName::Check
+                                                } else {
+                                                    IconName::Copy
+                                                })
+                                                .size(IconSize::Small),
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        gpui::ClipboardItem::new_string(
+                                                            value.clone(),
+                                                        ),
+                                                    );
+                                                    this.copied = true;
+                                                    cx.notify();
+                                                }),
+                                            ),
                                         ),
                                     ),
-                                ),
-                        );
+                            );
+                        }
+                    } else {
+                        body = body.child(dialog::labeled(
+                            "Token variable",
+                            Label::new(format!(
+                                "{} — generated during the install",
+                                self.generated_token_var(cx)
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ));
                     }
-                } else {
-                    body = body.child(dialog::labeled(
-                        "Token variable",
-                        Label::new(format!(
-                            "{} — generated during the install",
-                            self.generated_token_var(cx)
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    ));
                 }
                 body
             }
@@ -922,20 +1257,36 @@ impl Render for ElRemoteModal {
                 )),
             (false, Step::Review) => {
                 let name = self.name.read(cx).text(cx).trim().to_owned();
-                let url = self.url.read(cx).text(cx).trim().to_owned();
-                let token_var = if self.mode == Mode::Install {
-                    self.generated_token_var(cx)
-                } else {
-                    var_name_of(&self.token_var.read(cx).text(cx))
+                let platform_target = (self.mode == Mode::Platform)
+                    .then(|| self.platform_target(cx).ok())
+                    .flatten();
+                let url = match &platform_target {
+                    Some((url, _)) => url.clone(),
+                    None => self.url.read(cx).text(cx).trim().to_owned(),
+                };
+                let token_var = match (&platform_target, self.mode) {
+                    (Some((_, project)), _) => self.platform_token_var(project, cx),
+                    (None, Mode::Install) => self.generated_token_var(cx),
+                    (None, _) => var_name_of(&self.token_var.read(cx).text(cx)),
                 };
                 let mut yaml = format!("# el/remotes.yml\nremotes:\n  {name}:\n    url: {url}\n");
                 if !token_var.is_empty() {
                     yaml.push_str(&format!("    token: \"${{{token_var}}}\"\n"));
                 }
+                if platform_target.is_some() {
+                    yaml.push_str("    live: false\n");
+                }
                 let env_line = if token_var.is_empty() {
                     "# .env — no token (loopback only)".to_owned()
                 } else if self.mode == Mode::Install {
                     format!("# .env\n{token_var}=<generated on install>")
+                } else if let Some(token) =
+                    self.pasted.as_deref().filter(|_| platform_target.is_some())
+                {
+                    format!(
+                        "# .env, readable by you only\n{token_var}=<the pasted token, {}…>",
+                        platform::token_prefix(token)
+                    )
                 } else {
                     format!("# .env\n{token_var}=<your token — set it yourself>")
                 };
@@ -961,6 +1312,16 @@ impl Render for ElRemoteModal {
                         );
                     }
                     body = body.child(pre);
+                }
+                if let Some((_, project)) = &platform_target {
+                    body = body.child(dialog::notice(
+                        Severity::Info,
+                        format!(
+                            "Runs, deploys and explore calls go through the console as you, in \
+                             project {project}, with at most the token's role. The console has \
+                             no live socket, so the panel asks it every two seconds."
+                        ),
+                    ));
                 }
                 if self.mode == Mode::Install {
                     let host = self.ssh_host.read(cx).text(cx).trim().to_owned();
@@ -1016,7 +1377,7 @@ impl Render for ElRemoteModal {
             }
             .into(),
             (false, Step::Review, Mode::Install) => "Install & add server".into(),
-            (false, Step::Review, Mode::Existing) => if self.writing {
+            (false, Step::Review, Mode::Existing | Mode::Platform) => if self.writing {
                 "Saving…"
             } else {
                 "Add server"

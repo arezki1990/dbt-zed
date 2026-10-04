@@ -12,6 +12,8 @@ pub mod local_runner;
 pub mod mapping_editor;
 pub mod mcp;
 pub mod panel;
+pub mod platform;
+pub mod push_dbt_modal;
 pub mod remote_modal;
 pub mod rename_stream_modal;
 pub mod run_view;
@@ -58,10 +60,10 @@ pub(crate) fn browsable(kind: &str) -> bool {
 }
 
 /// Kinds a pipeline extracts from, so their tables can become streams: the
-/// canvas invites a drag from these. Snowflake is browsable but only ever a
-/// destination.
+/// canvas invites a drag from these. Snowflake among them: a warehouse's gold
+/// tables are exported from it.
 pub(crate) fn extractable(kind: &str) -> bool {
-    matches!(kind, "duckdb" | "postgres" | "oracle" | "mssql")
+    matches!(kind, "duckdb" | "postgres" | "oracle" | "mssql" | "snowflake")
 }
 
 /// The vertical scrollbar of an EL scroll area: always on screen rather
@@ -72,10 +74,12 @@ pub(crate) fn scrollbar<T: ui::ScrollableHandle>(handle: &T) -> ui::Scrollbars<T
     ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(handle)
 }
 
-/// Kinds a pipeline loads INTO: the warehouses with a loader. A source
-/// kind that is not here can still be browsed and queried.
+/// Kinds a pipeline loads INTO: the databases with a loader, and the file
+/// stores a target writes files to (`el_engine::spec::is_file_kind`). A
+/// source kind that is not here can still be browsed and queried.
 pub(crate) fn loadable(kind: &str) -> bool {
-    matches!(kind, "snowflake" | "duckdb" | "oracle" | "mssql")
+    matches!(kind, "snowflake" | "duckdb" | "oracle" | "mssql" | "postgres")
+        || el_engine::spec::is_file_kind(kind)
 }
 
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or
@@ -412,6 +416,16 @@ fn open_active_pipeline(
 
 /// `el::InitializeWorkspace`: scaffolds `el/` and opens the example
 /// pipeline on the canvas.
+/// Pushes the project's dbt code to one of its Ellode platform remotes, as
+/// the bundle that project's dbt runs take.
+pub fn push_dbt_project(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(root) = discover_el_root(workspace, cx) else {
+        toast(workspace, "No project folder open in this workspace.", cx);
+        return;
+    };
+    push_dbt_modal::ElPushDbtModal::deploy(workspace, root, window, cx);
+}
+
 pub fn initialize_workspace(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -558,6 +572,20 @@ pub(crate) fn thousands(count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Which way data moves through each kind: Snowflake gold is exported,
+    /// Postgres and the file stores are loaded into.
+    #[test]
+    fn kinds_say_which_way_data_moves() {
+        for kind in ["duckdb", "postgres", "oracle", "mssql", "snowflake"] {
+            assert!(super::extractable(kind), "{kind}");
+        }
+        for kind in ["snowflake", "duckdb", "oracle", "mssql", "postgres", "s3", "gcs", "azure", "local"] {
+            assert!(super::loadable(kind), "{kind}");
+        }
+        assert!(!super::loadable("mysql"));
+        assert!(!super::extractable("s3"));
+    }
+
     /// What the toolbar asks on every render, and what a deploy resolves
     /// the project root from.
     #[test]

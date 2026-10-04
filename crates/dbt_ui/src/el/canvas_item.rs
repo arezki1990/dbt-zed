@@ -1119,6 +1119,10 @@ impl ElPipelineCanvas {
         let Some(stream) = pipeline.streams.get(stream_ix) else {
             return;
         };
+        // A file store's directory is no table to query.
+        if pipeline.target.path.is_some() {
+            return;
+        }
         let connection: SharedString = pipeline.target.connection.clone().into();
         let schema = pipeline.target.schema.clone();
         let table = stream.target_table(&pipeline.target);
@@ -1519,14 +1523,24 @@ impl ElPipelineCanvas {
         else {
             return;
         };
-        let table = stream.target_table(&loaded.pipeline.target);
         let file_name = self.spec_file_name();
+        let left = match loaded.pipeline.target.path {
+            Some(_) => format!(
+                "its files in {} stay",
+                el_engine::load::files_sidecar::stream_dir(
+                    loaded.pipeline.target.path.as_deref().unwrap_or_default(),
+                    &stream.name
+                )
+            ),
+            None => format!(
+                "the warehouse table {} is not dropped",
+                stream.target_table(&loaded.pipeline.target)
+            ),
+        };
         let answer = window.prompt(
             gpui::PromptLevel::Warning,
             &format!("Remove stream {name}?"),
-            Some(&format!(
-                "It leaves {file_name}; the warehouse table {table} is not dropped."
-            )),
+            Some(&format!("It leaves {file_name}; {left}.")),
             &["Remove stream", "Cancel"],
             cx,
         );

@@ -342,6 +342,7 @@ fn install_remote(args: &[String]) -> i32 {
         el_engine::spec::RemoteSpec {
             url: url.clone(),
             token: Some(format!("${{{var}}}")),
+            live: true,
             extra: Default::default(),
         },
     );

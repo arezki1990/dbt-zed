@@ -10,7 +10,13 @@
 //! connections file and the variables it names — sealed to the key that
 //! server publishes, which no one else can open. The popup names the
 //! variables and shows the key's fingerprint; it never shows a value.
+//!
+//! A project of the Ellode platform keeps its connections itself, and
+//! keeps drafts: there the file is saved as the project's draft of the
+//! pipeline and deployed from it — the console then shows who deployed
+//! which draft — or, by choice, deployed directly under a pinned profile.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,8 +30,9 @@ use ui::prelude::*;
 use workspace::{ModalView, Workspace};
 
 use super::dialog;
+use super::platform::{self, PlatformRemote};
 
-use el_engine::server::RemotePipeline;
+use el_engine::server::{RemoteDraft, RemotePipeline, RemoteRefusal, Sealing};
 use el_engine::spec::Pipeline;
 
 /// What the selected remote reports about itself.
@@ -40,12 +47,25 @@ enum RemoteFacts {
         pipelines: Vec<RemotePipeline>,
         /// The daemon tracks a git checkout and refuses /deploy.
         tracks_checkout: bool,
-        /// The key credentials travel sealed to, with the fingerprint a
-        /// person compares. None = a daemon older than /pubkey, which can
-        /// only take the pipeline.
-        pubkey: Option<(String, SharedString)>,
+        /// How the server takes the project's connections: sealed to a
+        /// key whose fingerprint a person compares, never (the platform
+        /// keeps its own), or not at all (a daemon older than /pubkey).
+        sealing: Sealing,
+        /// On the platform, the pipeline's draft in the project's
+        /// workspace — None when it has none — or why the workspace can't
+        /// be used. None for a daemon, which has no workspace.
+        workspace: Option<Result<Option<RemoteDraft>, SharedString>>,
     },
     Failed(SharedString),
+}
+
+/// How a platform deploy ships the file.
+#[derive(Clone, Copy, PartialEq)]
+enum Route {
+    /// Saved as the project's draft, then deployed from it.
+    Draft,
+    /// As it is, to `/deploy`, under the profile chosen.
+    Direct,
 }
 
 pub struct ElDeployModal {
@@ -57,11 +77,17 @@ pub struct ElDeployModal {
     project: Entity<Project>,
     /// The spec as parsed from disk when the popup opened.
     local: Option<Arc<Pipeline>>,
+    /// Its text, to tell whether the project's draft already is this file.
+    local_text: Option<String>,
     /// Why the local spec can't ship (unsaved edits, parse error).
     refusal: Option<SharedString>,
     remotes: Vec<SharedString>,
+    /// The remotes that are platform projects reached through a console.
+    platforms: HashMap<SharedString, PlatformRemote>,
     selected_remote: usize,
     facts: RemoteFacts,
+    /// On the platform: from the project's draft, or directly.
+    route: Route,
     /// None = run under the server's own profile.
     selected_profile: Option<String>,
     /// The connections file and the variables it names, read from the
@@ -89,16 +115,17 @@ impl ElDeployModal {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let remotes: Vec<SharedString> =
-            el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
-                .map(|remotes| {
-                    remotes
-                        .remotes
-                        .keys()
-                        .map(|name| name.clone().into())
-                        .collect()
-                })
-                .unwrap_or_default();
+        let declared = el_engine::spec::load_remotes(&super::el_dir(&root).join("remotes.yml"))
+            .map(|remotes| remotes.remotes)
+            .unwrap_or_default();
+        let remotes: Vec<SharedString> = declared.keys().map(|name| name.clone().into()).collect();
+        let platforms: HashMap<SharedString, PlatformRemote> = declared
+            .iter()
+            .filter_map(|(name, remote)| {
+                platform::platform_remote(&remote.url)
+                    .map(|platform| (SharedString::from(name.clone()), platform))
+            })
+            .collect();
         if remotes.is_empty() {
             // Same action name as the panel's "+": open the Add server
             // wizard right away instead of pointing at a file to hand-edit.
@@ -115,6 +142,10 @@ impl ElDeployModal {
             }
             return;
         }
+        // A console project's connections are its admins': sent only when asked.
+        let send_connections = remotes
+            .first()
+            .is_none_or(|first| !platforms.contains_key(first));
         let workspace_handle = cx.entity().downgrade();
         workspace.toggle_modal(window, cx, move |_, cx| {
             let mut this = Self {
@@ -125,14 +156,17 @@ impl ElDeployModal {
                 spec_path,
                 project,
                 local: None,
+                local_text: None,
                 refusal: None,
                 remotes,
+                platforms,
                 selected_remote: 0,
                 facts: RemoteFacts::Loading,
+                route: Route::Direct,
                 selected_profile: None,
                 connections: None,
                 connections_error: None,
-                send_connections: true,
+                send_connections,
                 deploying: false,
                 error: None,
                 epoch: 0,
@@ -170,15 +204,19 @@ impl ElDeployModal {
     /// the file on the background executor. Reads only; never writes.
     fn check_local(&mut self, cx: &mut Context<Self>) {
         self.local = None;
+        self.local_text = None;
         self.refusal = self.unsaved_refusal(cx);
         if self.refusal.is_some() {
             cx.notify();
             return;
         }
         let spec_path = self.spec_path.clone();
-        let parse = cx.background_spawn(async move { el_engine::spec::load_pipeline(&spec_path) });
+        let parse = cx.background_spawn(async move {
+            let text = std::fs::read_to_string(&spec_path).ok();
+            (el_engine::spec::load_pipeline(&spec_path), text)
+        });
         self._check = cx.spawn(async move |this, cx| {
-            let result = parse.await;
+            let (result, text) = parse.await;
             this.update(cx, |this, cx| {
                 let file = this.file_name();
                 match result {
@@ -191,7 +229,10 @@ impl ElDeployModal {
                             .into(),
                         );
                     }
-                    Ok(pipeline) => this.local = Some(Arc::new(pipeline)),
+                    Ok(pipeline) => {
+                        this.local = Some(Arc::new(pipeline));
+                        this.local_text = text;
+                    }
                     Err(error) => {
                         this.refusal = Some(
                             format!("Can't deploy: {error} — fix {file}, then deploy again.")
@@ -235,17 +276,26 @@ impl ElDeployModal {
         self.facts = RemoteFacts::Loading;
         self.selected_profile = None;
         let root = self.root.clone();
+        let pipeline = self.pipeline.clone();
         let Some(remote) = self.remotes.get(self.selected_remote).cloned() else {
             return;
         };
+        let is_platform = self.selected_platform().is_some();
         let task = cx.background_spawn(async move {
             let client = el_engine::server::RemoteClient::connect(&root, remote.as_ref())?;
             let health = client.health()?;
             let pipelines = client.pipelines()?;
-            // Older daemons have no /pubkey; that is a missing feature,
-            // not a failed deploy.
-            let pubkey = client.pubkey().ok();
-            anyhow::Ok((health, pipelines, pubkey))
+            // A daemon older than /pubkey, or the platform keeping its own
+            // connections, is an answer; anything else is a failure to say.
+            let sealing = client.sealing()?;
+            // Only the platform keeps drafts: a console's project, or a
+            // platform reached directly that keeps its connections itself.
+            let workspace = (is_platform || matches!(sealing, Sealing::KeepsItsOwn(_))).then(|| {
+                client
+                    .draft(&pipeline)
+                    .map_err(|error| SharedString::from(format!("{error:#}")))
+            });
+            anyhow::Ok((health, pipelines, sealing, workspace))
         });
         self._fetch = cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -254,7 +304,7 @@ impl ElDeployModal {
                     return;
                 }
                 this.facts = match result {
-                    Ok((health, pipelines, pubkey)) => {
+                    Ok((health, pipelines, sealing, workspace)) => {
                         let profiles: Vec<String> = health
                             .get("profiles")
                             .and_then(|names| names.as_array())
@@ -274,11 +324,20 @@ impl ElDeployModal {
                             .get("tracks_checkout")
                             .and_then(|flag| flag.as_bool())
                             .unwrap_or(false);
+                        // On the platform, the project's draft is the way
+                        // when its workspace answers.
+                        this.route = if matches!(workspace, Some(Ok(_))) {
+                            Route::Draft
+                        } else {
+                            Route::Direct
+                        };
                         // A deploy that carries connections leaves the
                         // pin empty: "the server's own" then names the
                         // environment and keeps naming it if the server's
-                        // choice moves. Otherwise pin what it runs today.
-                        this.selected_profile = if this.send_connections {
+                        // choice moves. So does one from a draft, which
+                        // pins nothing. Otherwise pin what it runs today.
+                        let sends = this.send_connections && matches!(sealing, Sealing::Key { .. });
+                        this.selected_profile = if sends || this.route == Route::Draft {
                             None
                         } else {
                             active
@@ -290,16 +349,65 @@ impl ElDeployModal {
                             active,
                             pipelines,
                             tracks_checkout,
-                            pubkey: pubkey
-                                .map(|(key, print)| (key, SharedString::from(print))),
+                            sealing,
+                            workspace,
                         }
                     }
-                    Err(error) => RemoteFacts::Failed(format!("{error:#}").into()),
+                    Err(error) => RemoteFacts::Failed(this.failure_text(&error).into()),
                 };
                 cx.notify();
             })
             .ok();
         });
+    }
+
+    /// The selected remote's console and project, when it is a platform
+    /// project reached through a console.
+    fn selected_platform(&self) -> Option<&PlatformRemote> {
+        self.remotes
+            .get(self.selected_remote)
+            .and_then(|name| self.platforms.get(name))
+    }
+
+    /// A failure as the popup says it: a console's refusal names the token
+    /// or the role, after the step it stopped — "saved as the project's
+    /// draft, but not deployed"; anything else reads as it is.
+    fn failure_text(&self, error: &anyhow::Error) -> String {
+        let refusal = self
+            .selected_platform()
+            .and_then(|platform| platform::refusal_text(platform, error));
+        match refusal {
+            Some(text) if error.chain().count() > 1 => format!("{error}: {text}"),
+            Some(text) => text,
+            None => format!("{error:#}"),
+        }
+    }
+
+    /// Whether this deploy carries the project's connections: chosen, not
+    /// through the project's draft, and the server takes them sealed.
+    fn sends_connections(&self) -> bool {
+        self.send_connections
+            && !self.through_draft()
+            && matches!(
+                self.facts,
+                RemoteFacts::Loaded {
+                    sealing: Sealing::Key { .. },
+                    ..
+                }
+            )
+    }
+
+    /// Whether this deploy goes through the project's draft: chosen, and
+    /// the platform's workspace answered.
+    fn through_draft(&self) -> bool {
+        self.route == Route::Draft
+            && matches!(
+                self.facts,
+                RemoteFacts::Loaded {
+                    workspace: Some(Ok(_)),
+                    ..
+                }
+            )
     }
 
     /// Which profiles this deploy can pin, and which one the server falls
@@ -309,7 +417,7 @@ impl ElDeployModal {
     /// will be running — so its profiles are the ones to offer, not the
     /// ones the server declares this second. Otherwise the server's own.
     fn profile_choices(&self) -> (Vec<String>, Option<String>, bool) {
-        if self.send_connections {
+        if self.sends_connections() {
             if let Some(bundle) = &self.connections {
                 return (
                     bundle.profiles.clone(),
@@ -375,14 +483,31 @@ impl ElDeployModal {
         // What the credentials travel sealed to, and what travels — None
         // for either means this deploy carries the pipeline alone.
         let sealing = self
-            .send_connections
+            .sends_connections()
             .then(|| match (&self.facts, &self.connections) {
-                (RemoteFacts::Loaded { pubkey: Some((key, _)), .. }, Some(bundle)) => {
-                    Some((key.clone(), bundle.clone()))
-                }
+                (
+                    RemoteFacts::Loaded {
+                        sealing: Sealing::Key { public_key, .. },
+                        ..
+                    },
+                    Some(bundle),
+                ) => Some((public_key.clone(), bundle.clone())),
                 _ => None,
             })
             .flatten();
+        // Through the project's draft: the one there when the popup looked,
+        // which a save replaces only if it is still that one.
+        let draft = match (&self.facts, self.through_draft()) {
+            (
+                RemoteFacts::Loaded {
+                    workspace: Some(Ok(draft)),
+                    ..
+                },
+                true,
+            ) => Some(draft.clone()),
+            _ => None,
+        };
+        let through_draft = draft.is_some();
         cx.spawn_in(window, async move |this, cx| {
             let task_root = root.clone();
             let task_name = name.clone();
@@ -408,6 +533,10 @@ impl ElDeployModal {
                     }
                     let client =
                         el_engine::server::RemoteClient::connect(&task_root, &task_remote)?;
+                    if let Some(base) = draft {
+                        return deploy_through_draft(&client, &task_name, &yaml, base)
+                            .map(Shipped::Draft);
+                    }
                     // Credentials first: a pipeline deployed against
                     // connections the server does not have can only fail
                     // its next run.
@@ -423,11 +552,48 @@ impl ElDeployModal {
                         None => None,
                     };
                     client.deploy(&[(task_name, yaml, task_profile)])?;
-                    anyhow::Ok(sent)
+                    anyhow::Ok(Shipped::Direct(sent))
                 })
                 .await;
             match result {
-                Ok(sent) => {
+                Ok(Shipped::Draft(saved)) => {
+                    this.update_in(cx, |this, _, cx| {
+                        this.deploying = false;
+                        cx.emit(DismissEvent);
+                        cx.notify();
+                    })
+                    .ok();
+                    let how = if saved {
+                        "saved as the project's draft and deployed from it"
+                    } else {
+                        "deployed from the project's draft, which already was this file"
+                    };
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            super::toast(
+                                workspace,
+                                &format!(
+                                    "{name} on {remote}: {how} — it runs under the project's \
+                                     profile."
+                                ),
+                                cx,
+                            );
+                            workspace.focus_panel::<super::ElRunsPanel>(window, cx);
+                        })
+                        .ok();
+                    let console = workspace
+                        .read_with(cx, |workspace, cx| {
+                            workspace.panel::<super::ElRunsPanel>(cx)
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(console) = console {
+                        console.update(cx, |panel, cx| {
+                            panel.show_remote_pipeline(remote.clone(), name.clone().into(), cx)
+                        });
+                    }
+                }
+                Ok(Shipped::Direct(sent)) => {
                     // Dismiss first: hiding the modal restores the focus it
                     // took, which would otherwise steal the console back.
                     this.update_in(cx, |this, _, cx| {
@@ -487,7 +653,12 @@ impl ElDeployModal {
                 Err(error) => {
                     this.update_in(cx, |this, _, cx| {
                         this.deploying = false;
-                        this.error = Some(format!("{error:#}").into());
+                        this.error = Some(this.failure_text(&error).into());
+                        // The project's draft may have moved, or been saved
+                        // before the deploy was refused: look again.
+                        if through_draft {
+                            this.fetch_facts(cx);
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -502,22 +673,52 @@ impl ElDeployModal {
     fn render_connections(
         &self,
         remote: &SharedString,
-        pubkey: Option<&(String, SharedString)>,
+        sealing: &Sealing,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some((_, fingerprint)) = pubkey else {
+        let fingerprint = match sealing {
+            Sealing::Key { fingerprint, .. } => fingerprint,
+            Sealing::KeepsItsOwn(_) => {
+                return dialog::labeled(
+                    "Connections",
+                    dialog::notice(
+                        Severity::Info,
+                        format!(
+                            "{remote} keeps the project's connections and secrets itself: they \
+                             are set in the console, never sent from here, and the pipeline \
+                             runs against them."
+                        ),
+                    ),
+                );
+            }
+            Sealing::Unsupported => {
+                return dialog::labeled(
+                    "Connections",
+                    dialog::notice(
+                        Severity::Warning,
+                        format!(
+                            "{remote} is older than sealed connections — this deploy carries \
+                             the pipeline only, and the server runs it against whatever \
+                             connections it already has."
+                        ),
+                    ),
+                );
+            }
+        };
+        let platform = self.selected_platform().is_some();
+        if self.through_draft() {
             return dialog::labeled(
                 "Connections",
                 dialog::notice(
-                    Severity::Warning,
+                    Severity::Info,
                     format!(
-                        "{remote} is older than sealed connections — this deploy carries the \
-                         pipeline only, and the server runs it against whatever connections \
-                         it already has."
+                        "A deploy from the project's draft sends no connections: the pipeline \
+                         runs against the ones {remote}'s project has. Directly sends them, and \
+                         so does Send connections on the Remote tab."
                     ),
                 ),
             );
-        };
+        }
         if let Some(error) = &self.connections_error {
             return dialog::labeled(
                 "Connections",
@@ -548,7 +749,7 @@ impl ElDeployModal {
                 })),
             dialog::chip(
                 "el-deploy-conn-keep",
-                "Leave the server's",
+                if platform { "Leave the project's" } else { "Leave the server's" },
                 !self.send_connections,
             )
             .disabled(self.deploying)
@@ -559,7 +760,17 @@ impl ElDeployModal {
             })),
         ]);
         let mut control = v_flex().w_full().gap_1().child(chips);
-        if self.send_connections {
+        if self.send_connections && platform {
+            control = control.child(dialog::notice(
+                Severity::Info,
+                format!(
+                    "Encrypted to the key of {remote}'s project alone — {fingerprint}; the \
+                     console passes it on unread. The platform checks connections.yml as its \
+                     settings do, and keeps the variables as the project's secrets. Sending \
+                     takes a project admin."
+                ),
+            ));
+        } else if self.send_connections {
             control = control.child(dialog::notice(
                 Severity::Info,
                 format!(
@@ -567,13 +778,27 @@ impl ElDeployModal {
                      unreadable in transit and to anything between here and the daemon."
                 ),
             ));
+        }
+        if self.send_connections {
             if !bundle.variables.is_empty() {
                 control = control.child(dialog::notice(
                     Severity::Info,
                     format!("Variables sent: {}", bundle.variables.join(", ")),
                 ));
             }
-            if !bundle.file_valued.is_empty() {
+            if !bundle.file_valued.is_empty() && platform {
+                control = control.child(dialog::notice(
+                    Severity::Info,
+                    format!(
+                        "{} name{} a file here — a key pair or a wallet. The platform's jobs \
+                         read their files from the volumes its chart mounts, so {} the value \
+                         the project has there (the path), and the file stays here.",
+                        bundle.file_valued.join(", "),
+                        if bundle.file_valued.len() == 1 { "s" } else { "" },
+                        if bundle.file_valued.len() == 1 { "it keeps" } else { "they keep" },
+                    ),
+                ));
+            } else if !bundle.file_valued.is_empty() {
                 control = control.child(dialog::notice(
                     Severity::Info,
                     format!(
@@ -616,6 +841,103 @@ impl ElDeployModal {
             ));
         }
         dialog::labeled("Connections", control)
+    }
+
+    /// The platform's two ways to ship the file, and what the chosen one
+    /// does to the project's draft.
+    fn render_route(
+        &self,
+        remote: &SharedString,
+        workspace: &Result<Option<RemoteDraft>, SharedString>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = &self.pipeline;
+        let file = self.file_name();
+        let through_draft = self.through_draft();
+        let chips = dialog::chips([
+            dialog::chip(
+                "el-deploy-route-draft",
+                "From the project's draft",
+                through_draft,
+            )
+            .disabled(self.deploying || workspace.is_err())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.route = Route::Draft;
+                // A draft deploys unpinned.
+                this.selected_profile = None;
+                cx.notify();
+            })),
+            dialog::chip("el-deploy-route-direct", "Directly", !through_draft)
+                .disabled(self.deploying)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.route = Route::Direct;
+                    cx.notify();
+                })),
+        ]);
+        let (severity, text) = match (workspace, through_draft) {
+            (Err(reason), _) => (
+                Severity::Warning,
+                format!(
+                    "{remote}'s drafts can't be used ({reason}): this deploy ships {file} \
+                     directly."
+                ),
+            ),
+            (Ok(_), false) => (
+                Severity::Info,
+                format!(
+                    "Ships {file} as it is, under the profile chosen below. The project's draft \
+                     of {name}, if any, stays as it is."
+                ),
+            ),
+            (Ok(None), true) => (
+                Severity::Info,
+                format!(
+                    "Saves {file} as the project's draft of {name}, then deploys it: the console \
+                     shows who deployed which draft."
+                ),
+            ),
+            (Ok(Some(draft)), true)
+                if self.local_text.as_deref() == Some(draft.content.as_str()) =>
+            {
+                (
+                    Severity::Info,
+                    format!(
+                        "The project's draft of {name} is this file already: deployed from it."
+                    ),
+                )
+            }
+            (Ok(Some(draft)), true) => {
+                let by = draft
+                    .updated_by
+                    .as_deref()
+                    .map(|who| format!(" by {who}"))
+                    .unwrap_or_default();
+                let when = draft
+                    .updated_unix
+                    .map(|unix| {
+                        format!(
+                            " {}",
+                            super::runs_panel::relative_time(unix.max(0) as u64, false)
+                        )
+                    })
+                    .unwrap_or_default();
+                (
+                    Severity::Warning,
+                    format!(
+                        "Replaces the project's draft of {name}, saved{by}{when}, with {file}, \
+                         then deploys it."
+                    ),
+                )
+            }
+        };
+        dialog::labeled(
+            "Deploy",
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(chips)
+                .child(dialog::notice(severity, text)),
+        )
     }
 
     /// The consequence lines: what pressing Deploy would do on `remote`.
@@ -767,6 +1089,49 @@ impl ElDeployModal {
     }
 }
 
+/// What a deploy shipped: through the project's draft (and whether the file
+/// had to be saved there first), or directly, with the connections it
+/// carried — how many connections, variables and files — if any.
+enum Shipped {
+    Draft(bool),
+    Direct(Option<(usize, usize, usize)>),
+}
+
+/// Saves `yaml` as the project's draft of `name` — unless the draft is
+/// already it — while the draft is still `base` (or there is none, when it
+/// is None), then deploys the pipeline from it. Returns whether it saved.
+fn deploy_through_draft(
+    client: &el_engine::server::RemoteClient,
+    name: &str,
+    yaml: &str,
+    base: Option<RemoteDraft>,
+) -> anyhow::Result<bool> {
+    let saved = match &base {
+        Some(draft) if draft.content == yaml => false,
+        _ => {
+            client
+                .save_draft(name, yaml, base.as_ref().map(|draft| draft.sha.as_str()))
+                .map_err(|error| match RemoteRefusal::of(&error) {
+                    // Saved, or made, by someone else since the popup looked.
+                    Some(refusal) if refusal.status == 409 => anyhow::anyhow!(
+                        "the project's draft of {name} changed since this opened — look at it \
+                         again before deploying over it"
+                    ),
+                    _ => error.context("saving the project's draft"),
+                })?;
+            true
+        }
+    };
+    client.deploy_drafts(&[name.to_owned()]).map_err(|error| {
+        if saved {
+            error.context("saved as the project's draft, but not deployed")
+        } else {
+            error
+        }
+    })?;
+    Ok(saved)
+}
+
 impl EventEmitter<DismissEvent> for ElDeployModal {}
 impl ModalView for ElDeployModal {
     fn on_before_dismiss(
@@ -805,11 +1170,21 @@ impl Render for ElDeployModal {
                 .disabled(self.deploying)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.selected_remote = ix;
+                    this.send_connections = this.selected_platform().is_none();
                     this.fetch_facts(cx);
                     cx.notify();
                 }))
             });
             body = body.child(dialog::labeled("Server", dialog::chips(chips)));
+        }
+
+        // On the platform: through the project's draft, or directly.
+        if let RemoteFacts::Loaded {
+            workspace: Some(workspace),
+            ..
+        } = &self.facts
+        {
+            body = body.child(self.render_route(&remote, workspace, cx));
         }
 
         body = body.child(match &self.facts {
@@ -833,6 +1208,24 @@ impl Render for ElDeployModal {
                         })),
                 )
                 .into_any_element(),
+            RemoteFacts::Loaded { .. } if self.through_draft() => {
+                // A draft deploys unpinned, like the console's builder.
+                let (_, fallback, _) = self.profile_choices();
+                let own = match fallback {
+                    Some(fallback) => format!("{remote}'s own ({fallback})"),
+                    None => format!("{remote}'s own"),
+                };
+                dialog::labeled(
+                    "Profile",
+                    dialog::notice(
+                        Severity::Info,
+                        format!(
+                            "{own}: a deploy from the project's draft pins none. Directly pins \
+                             one."
+                        ),
+                    ),
+                )
+            }
             RemoteFacts::Loaded { .. } => {
                 let (profiles, fallback, from_local) = self.profile_choices();
                 // A pipeline that pins nothing runs under the server's own
@@ -900,8 +1293,8 @@ impl Render for ElDeployModal {
             }
         });
 
-        if let RemoteFacts::Loaded { pubkey, .. } = &self.facts {
-            body = body.child(self.render_connections(&remote, pubkey.as_ref(), cx));
+        if let RemoteFacts::Loaded { sealing, .. } = &self.facts {
+            body = body.child(self.render_connections(&remote, sealing, cx));
         }
 
         // What the deploy changes on the server, or why it can't ship.
