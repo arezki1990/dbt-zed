@@ -373,6 +373,7 @@ impl ElRunView {
                 rows_written,
                 cast_failures,
                 column_failures,
+                ..
             } => {
                 if let Some(row) = run
                     .streams

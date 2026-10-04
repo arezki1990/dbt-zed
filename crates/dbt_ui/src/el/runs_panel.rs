@@ -606,6 +606,7 @@ pub(crate) fn fold_stream_events(
                 rows_written,
                 cast_failures,
                 column_failures,
+                ..
             } => {
                 let entry = agg.entry(stream.clone()).or_default();
                 entry.phase = None;
@@ -5700,6 +5701,7 @@ mod tests {
                 rows_written: 500_000,
                 cast_failures: 0,
                 column_failures: Vec::new(),
+                columns: Vec::new(),
             },
             stream("lines"),
             chunk("lines", el_engine::Phase::Stage, 700_000, 700_000),
