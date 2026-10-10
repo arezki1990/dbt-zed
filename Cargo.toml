@@ -340,6 +340,9 @@ editor = { path = "crates/editor" }
 # that reaches GitHub is enough locally; CI loads a read-only key from
 # secrets.ZDBT_EL_SSH_KEY into ssh-agent (see zdbt-release.yml).
 el_engine = { git = "ssh://git@github.com/arezki1990/ellode.git", branch = "main" }
+# Other ETL tools' projects (Semarchy xDI) read for lineage and an inventory,
+# from the same repository and commit as the engine.
+el_import = { git = "ssh://git@github.com/arezki1990/ellode.git", branch = "main" }
 duckdb = { version = "=1.10505.0", default-features = false, features = ["bundled", "chrono"] }
 encoding_selector = { path = "crates/encoding_selector" }
 env_var = { path = "crates/env_var" }
@@ -1038,6 +1041,11 @@ wasmtime-environ = { opt-level = 3 }
 wasmtime-internal-cranelift = { opt-level = 3 }
 minidumper = { opt-level = 3 }
 serde_json = { opt-level = 3 }
+# xDI projects are read in the background: parsed fast in debug builds too.
+el_import = { opt-level = 3 }
+roxmltree = { opt-level = 3 }
+sqlparser = { opt-level = 3 }
+pest = { opt-level = 3 }
 # Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
 activity_indicator = { codegen-units = 1 }
 assets = { codegen-units = 1 }

@@ -2,6 +2,7 @@ mod dbt_button;
 mod el_button;
 mod preview;
 mod repl_menu;
+mod xdi_button;
 
 use agent_settings::AgentSettings;
 use editor::actions::{
@@ -712,6 +713,7 @@ impl Render for QuickActionBar {
             .children(self.render_preview_button(cx))
             .children(self.render_dbt_button(cx))
             .children(self.render_el_canvas_button(cx))
+            .children(self.render_xdi_lineage_button(cx))
             .children(search_button)
             .when(
                 AgentSettings::get_global(cx).enabled(cx) && AgentSettings::get_global(cx).button,

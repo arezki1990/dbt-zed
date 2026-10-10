@@ -1,6 +1,7 @@
 //! Native dbt UI for Zed: a bottom-dock results panel that runs
 //! `dbt show --select <model>` and renders the returned rows as a data table,
-//! plus a left-dock database explorer built from the dbt artifacts.
+//! plus a left-dock database explorer built from the dbt artifacts. Also the
+//! EL pipelines, and the lineage and inventory of Semarchy xDI projects.
 
 pub mod connection;
 pub mod database;
@@ -8,10 +9,12 @@ pub mod database_panel;
 pub mod dbt_install;
 pub mod dbt_settings;
 pub mod el;
+pub mod graph_layout;
 pub mod lineage;
 pub mod lineage_sql;
 pub mod mcp;
 pub mod results_panel;
+pub mod xdi;
 
 use gpui::{App, actions};
 use workspace::Workspace;
@@ -80,6 +83,18 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &PushDbtProject, window, cx| {
             el::push_dbt_project(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &xdi::TogglePanelFocus, window, cx| {
+            workspace.toggle_panel_focus::<xdi::XdiPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &xdi::OpenInventory, window, cx| {
+            xdi::open_inventory(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &xdi::ShowLineage, window, cx| {
+            xdi::show_lineage_for_active_editor(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &xdi::Refresh, window, cx| {
+            xdi::refresh(workspace, window, cx);
         });
     })
     .detach();
