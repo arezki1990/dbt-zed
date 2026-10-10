@@ -159,9 +159,10 @@ impl XdiPanel {
     }
 
     fn show_lineage(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                super::show_lineage(workspace, focus, window, cx)
+                super::show_lineage(workspace, store, focus, window, cx)
             })
             .ok();
     }
@@ -1106,6 +1107,40 @@ mod render_tests {
             store.set_snapshot(root.clone(), Some(snapshot), cx);
         });
         draw("read", cx);
+
+        // Docked, as in the app: a row's click opens the lineage from
+        // inside the panel's own update, which must not read the panel
+        // back from the workspace (that once panicked on a double lease).
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.show_lineage(
+                Focus::Node("job:xdi:Orders/Mappings/LOAD_ORDERS.map".to_owned()),
+                window,
+                cx,
+            );
+            panel.show_lineage(
+                Focus::Process("process:xdi:Orders/Processes/RUN_ORDERS.proc".to_owned()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let tabs = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<super::super::XdiLineageView>(cx)
+                .count()
+        });
+        assert_eq!(tabs, 1, "one lineage tab, recentered");
+        panel.update_in(cx, |panel, window, cx| panel.open_inventory(window, cx));
+        cx.run_until_parked();
+        let inventories = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .items_of_type::<super::super::XdiInventoryView>(cx)
+                .count()
+        });
+        assert_eq!(inventories, 1);
 
         // Every section open, every folder and process too.
         panel.update(cx, |panel, cx| {

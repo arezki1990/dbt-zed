@@ -106,16 +106,16 @@ pub fn store(workspace: &Workspace, cx: &gpui::App) -> Option<Entity<XdiStore>> 
         .map(|panel| panel.read(cx).store.clone())
 }
 
-/// Opens (or recenters) the project's lineage tab on `focus`.
+/// Opens (or recenters) the lineage tab of `store`'s project on `focus`.
+/// The store is passed, not looked up: the panel calls this while it is
+/// itself being updated, and reading it back then would panic.
 pub fn show_lineage(
     workspace: &mut Workspace,
+    store: Entity<XdiStore>,
     focus: Focus,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let Some(store) = store(workspace, cx) else {
-        return;
-    };
     XdiLineageView::deploy(workspace, store, focus, window, cx);
 }
 

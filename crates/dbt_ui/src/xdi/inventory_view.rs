@@ -124,9 +124,10 @@ impl XdiInventoryView {
     }
 
     fn show_lineage(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                super::show_lineage(workspace, focus, window, cx)
+                super::show_lineage(workspace, store, focus, window, cx)
             })
             .ok();
     }
