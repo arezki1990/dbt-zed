@@ -1325,6 +1325,21 @@ pub struct DbtSettingsContent {
     ///
     /// Default: 500
     pub lineage_max_nodes: Option<u64>,
+    /// The schema of the dbt target an xDI project converted to Ellode
+    /// builds in, for a model that names none of its own.
+    ///
+    /// Default: "DBT_XDI"
+    pub xdi_dbt_schema: Option<String>,
+    /// Where an xDI project converted to Ellode lands the tables of other
+    /// servers in the warehouse; `{server}` stands for the server's name.
+    ///
+    /// Default: "RAW_{server}"
+    pub xdi_raw_schema: Option<String>,
+    /// The xDI server an xDI project converted to Ellode builds its dbt
+    /// models on; empty takes the Snowflake server its mappings write most.
+    ///
+    /// Default: ""
+    pub xdi_warehouse: Option<String>,
 }
 
 /// The settings for the image viewer.

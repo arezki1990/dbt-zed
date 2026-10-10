@@ -8823,7 +8823,7 @@ fn ai_page(cx: &App) -> SettingsPage {
 }
 
 fn dbt_page() -> SettingsPage {
-    fn dbt_section() -> [SettingsPageItem; 15] {
+    fn dbt_section() -> [SettingsPageItem; 18] {
         [
             SettingsPageItem::SectionHeader("dbt"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -8852,7 +8852,10 @@ fn dbt_page() -> SettingsPage {
                     organization_override: None,
                     json_path: Some("dbt.binary"),
                     pick: |settings_content| {
-                        settings_content.dbt.as_ref().and_then(|dbt| dbt.binary.as_ref())
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.binary.as_ref())
                     },
                     write: |settings_content, value, _| {
                         settings_content.dbt.get_or_insert_default().binary = value;
@@ -8957,7 +8960,10 @@ fn dbt_page() -> SettingsPage {
                     organization_override: None,
                     json_path: Some("dbt.target"),
                     pick: |settings_content| {
-                        settings_content.dbt.as_ref().and_then(|dbt| dbt.target.as_ref())
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.target.as_ref())
                     },
                     write: |settings_content, value, _| {
                         settings_content.dbt.get_or_insert_default().target = value;
@@ -9089,7 +9095,10 @@ fn dbt_page() -> SettingsPage {
                             .and_then(|dbt| dbt.lineage_tree_depth.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content.dbt.get_or_insert_default().lineage_tree_depth = value;
+                        settings_content
+                            .dbt
+                            .get_or_insert_default()
+                            .lineage_tree_depth = value;
                     },
                 }),
                 metadata: None,
@@ -9108,7 +9117,73 @@ fn dbt_page() -> SettingsPage {
                             .and_then(|dbt| dbt.lineage_max_nodes.as_ref())
                     },
                     write: |settings_content, value, _| {
-                        settings_content.dbt.get_or_insert_default().lineage_max_nodes = value;
+                        settings_content
+                            .dbt
+                            .get_or_insert_default()
+                            .lineage_max_nodes = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "xDI Conversion: dbt Schema",
+                description: "The schema of the dbt target an xDI project converted to Ellode builds in, for a model that names none of its own.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.xdi_dbt_schema"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.xdi_dbt_schema.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().xdi_dbt_schema = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("DBT_XDI"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "xDI Conversion: Raw Schema",
+                description: "Where an xDI project converted to Ellode lands the tables of other servers in the warehouse; {server} stands for the server's name.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.xdi_raw_schema"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.xdi_raw_schema.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().xdi_raw_schema = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("RAW_{server}"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "xDI Conversion: Warehouse",
+                description: "The xDI server an xDI project converted to Ellode builds its dbt models on; empty takes the Snowflake server its mappings write most.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("dbt.xdi_warehouse"),
+                    pick: |settings_content| {
+                        settings_content
+                            .dbt
+                            .as_ref()
+                            .and_then(|dbt| dbt.xdi_warehouse.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.dbt.get_or_insert_default().xdi_warehouse = value;
                     },
                 }),
                 metadata: None,

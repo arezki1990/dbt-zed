@@ -38,6 +38,9 @@ fn headless_settings() -> DbtSettings {
         lineage_depth: 4,
         lineage_tree_depth: 8,
         lineage_max_nodes: 500,
+        xdi_dbt_schema: "DBT_XDI".to_owned(),
+        xdi_raw_schema: "RAW_{server}".to_owned(),
+        xdi_warehouse: None,
     }
 }
 

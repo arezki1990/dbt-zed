@@ -189,6 +189,15 @@ impl XdiPanel {
             .ok();
     }
 
+    fn convert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                super::convert_project(workspace, store, window, cx);
+            })
+            .ok();
+    }
+
     fn open_inventory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let store = self.store.clone();
         self.workspace
@@ -774,6 +783,13 @@ impl XdiPanel {
                             .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                                 this.deploy_metadata_menu(event.position(), window, cx)
                             })),
+                    )
+                    .child(
+                        IconButton::new("xdi-convert", IconName::ArrowUpRight)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Convert to Ellode…"))
+                            .disabled(snapshot.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| this.convert(window, cx))),
                     ),
             );
         if let Some(snapshot) = snapshot {

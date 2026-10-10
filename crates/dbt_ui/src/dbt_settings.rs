@@ -36,6 +36,14 @@ pub struct DbtSettings {
     pub lineage_tree_depth: u64,
     /// Node cap per lineage computation.
     pub lineage_max_nodes: u64,
+    /// The dbt target's schema of an xDI project converted to Ellode.
+    pub xdi_dbt_schema: String,
+    /// Where such a conversion lands other servers' tables, `{server}`
+    /// standing for the server's name.
+    pub xdi_raw_schema: String,
+    /// The xDI server such a conversion builds its models on; None picks
+    /// the Snowflake server its mappings write most.
+    pub xdi_warehouse: Option<String>,
 }
 
 impl Settings for DbtSettings {
@@ -74,6 +82,17 @@ impl Settings for DbtSettings {
             lineage_depth: content.lineage_depth.unwrap_or(4).max(1),
             lineage_tree_depth: content.lineage_tree_depth.unwrap_or(8).max(1),
             lineage_max_nodes: content.lineage_max_nodes.unwrap_or(500).max(10),
+            xdi_dbt_schema: content
+                .xdi_dbt_schema
+                .filter(|schema| !schema.trim().is_empty())
+                .unwrap_or_else(|| "DBT_XDI".to_owned()),
+            xdi_raw_schema: content
+                .xdi_raw_schema
+                .filter(|schema| !schema.trim().is_empty())
+                .unwrap_or_else(|| "RAW_{server}".to_owned()),
+            xdi_warehouse: content
+                .xdi_warehouse
+                .filter(|server| !server.trim().is_empty()),
         }
     }
 }
