@@ -1204,6 +1204,7 @@ impl ElPipelineCanvas {
             target_table: None,
             select: None,
             columns: vec![],
+            share: None,
             extra: Default::default(),
         });
         self.write_pipeline(pipeline, window, cx);
@@ -1325,6 +1326,7 @@ impl ElPipelineCanvas {
                 target_table: None,
                 select: None,
                 columns: vec![],
+                share: None,
                 extra: Default::default(),
             });
         }

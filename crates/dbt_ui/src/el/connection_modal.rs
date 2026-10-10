@@ -62,6 +62,12 @@ pub struct ElConnectionModal {
     conn_type: ConnType,
     /// Snowflake: password auth instead of key pair.
     auth_password: bool,
+    /// Snowflake key pair: the field holds the key itself (a ${VAR}, its
+    /// `private_key`) rather than the key's file.
+    key_as_text: bool,
+    /// Snowflake key pair: the encrypted key's passphrase, kept as the file
+    /// has it — the form does not edit it.
+    key_passphrase: Option<String>,
     /// SQL Server: accept the server's certificate without validating it.
     mssql_trust_cert: bool,
     /// The optional settings are unfolded — from the start when one of
@@ -124,6 +130,9 @@ fn load_connections_strict(root: &std::path::Path) -> Result<Connections> {
                 connections: IndexMap::new(),
                 profiles: IndexMap::new(),
                 default_profile: None,
+                dbt_targets: IndexMap::new(),
+                default_dbt_target: None,
+                shared_datasets: IndexMap::new(),
                 extra: IndexMap::new(),
             })
         }
@@ -266,6 +275,8 @@ impl ElConnectionModal {
         let mut database = String::new();
         let mut secret = String::new();
         let mut auth_password = false;
+        let mut key_as_text = false;
+        let mut key_passphrase = None;
         let mut oracle_user = String::new();
         let mut oracle_password = String::new();
         let mut oracle_connect = String::new();
@@ -331,8 +342,19 @@ impl ElConnectionModal {
                 warehouse = conn.warehouse.clone().unwrap_or_default();
                 database = conn.database.clone().unwrap_or_default();
                 match &conn.auth {
-                    SnowflakeAuth::KeyPair { private_key_path } => {
-                        secret = private_key_path.clone();
+                    SnowflakeAuth::KeyPair {
+                        private_key,
+                        private_key_path,
+                        private_key_passphrase,
+                    } => {
+                        // The key itself (a ${VAR}) or its file: the one
+                        // field holds whichever the file has.
+                        key_as_text = private_key.is_some() && private_key_path.is_none();
+                        secret = private_key
+                            .clone()
+                            .or_else(|| private_key_path.clone())
+                            .unwrap_or_default();
+                        key_passphrase = private_key_passphrase.clone();
                     }
                     SnowflakeAuth::Password { password } => {
                         auth_password = true;
@@ -409,6 +431,8 @@ impl ElConnectionModal {
                 .unwrap_or(ConnType::Duckdb),
             editing,
             auth_password,
+            key_as_text,
+            key_passphrase,
             mssql_trust_cert,
             show_optional: false,
             name,
@@ -565,6 +589,8 @@ impl ElConnectionModal {
                          like ${{SNOWFLAKE_ACCOUNT}}",
                         if self.auth_password {
                             "a password reference"
+                        } else if self.key_as_text {
+                            "a private-key reference"
                         } else {
                             "a private-key path"
                         }
@@ -578,9 +604,23 @@ impl ElConnectionModal {
                         );
                     }
                     SnowflakeAuth::Password { password: secret }
+                } else if self.key_as_text {
+                    if !secret.starts_with("${") {
+                        bail!(
+                            "store the private key in the environment and reference it \
+                             like ${{SNOWFLAKE_PRIVATE_KEY}} — never a literal in YAML"
+                        );
+                    }
+                    SnowflakeAuth::KeyPair {
+                        private_key: Some(secret),
+                        private_key_path: None,
+                        private_key_passphrase: self.key_passphrase.clone(),
+                    }
                 } else {
                     SnowflakeAuth::KeyPair {
-                        private_key_path: secret,
+                        private_key: None,
+                        private_key_path: Some(secret),
+                        private_key_passphrase: self.key_passphrase.clone(),
                     }
                 };
                 let optional = |text: String| (!text.is_empty()).then_some(text);
@@ -1377,6 +1417,8 @@ impl Render for ElConnectionModal {
                             6,
                             if self.auth_password {
                                 "Password"
+                            } else if self.key_as_text {
+                                "Private key"
                             } else {
                                 "Private key path"
                             },
@@ -1618,6 +1660,9 @@ mod tests {
             connections: map,
             profiles: IndexMap::new(),
             default_profile: None,
+            dbt_targets: IndexMap::new(),
+            default_dbt_target: None,
+            shared_datasets: IndexMap::new(),
             extra: IndexMap::new(),
         };
         let yaml = el_engine::spec::to_canonical_connections_yaml(&connections);

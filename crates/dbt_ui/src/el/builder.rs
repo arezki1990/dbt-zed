@@ -591,6 +591,7 @@ impl BuilderForm {
                                 target_table: None,
                                 select: None,
                                 columns: vec![],
+                                share: None,
                                 extra: IndexMap::new(),
                             });
                             added += 1;
@@ -642,6 +643,7 @@ impl BuilderForm {
                     target_table: None,
                     select: None,
                     columns: vec![],
+                    share: None,
                     extra: IndexMap::new(),
                 });
                 Ok(BuilderOutcome {
@@ -655,6 +657,9 @@ impl BuilderForm {
                     connections: IndexMap::new(),
                     profiles: IndexMap::new(),
                     default_profile: None,
+                    dbt_targets: IndexMap::new(),
+                    default_dbt_target: None,
+                    shared_datasets: IndexMap::new(),
                     extra: IndexMap::new(),
                 });
                 let name = self.text(0, cx);
@@ -775,7 +780,9 @@ impl BuilderForm {
                             database: None,
                             workspace: None,
                             auth: SnowflakeAuth::KeyPair {
-                                private_key_path: key_path,
+                                private_key: None,
+                                private_key_path: Some(key_path),
+                                private_key_passphrase: None,
                             },
                             extra: Default::default(),
                         })
