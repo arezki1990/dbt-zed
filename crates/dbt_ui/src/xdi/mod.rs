@@ -1,28 +1,28 @@
 //! Semarchy xDI projects in the IDE: their lineage and an inventory, read
 //! by `el_import` from the engine's repository. A left-dock panel lists the
 //! mappings, processes, tables and problems; a tab draws the lineage around
-//! a mapping, a table or a process; another tab holds the inventory. A
-//! project converts to an Ellode workspace in a folder beside it. Its own
-//! files are never written, and a server's credentials are never read.
+//! a mapping, a table or a process; another tab holds the inventory; a
+//! third migrates the project to Ellode a flow at a time, into a folder
+//! beside it. Its own files are never written, and a server's credentials
+//! are never read.
 
 pub mod inventory_view;
 pub mod layout;
 pub mod lineage_view;
+pub mod migration_view;
 pub mod panel;
 pub mod store;
 
 pub use inventory_view::XdiInventoryView;
 pub use lineage_view::XdiLineageView;
+pub use migration_view::XdiMigrationView;
 pub use panel::XdiPanel;
 pub use store::XdiStore;
 
 use std::path::{Path, PathBuf};
 
-use gpui::{Entity, PromptLevel, Window, actions};
-use settings::Settings as _;
+use gpui::{Entity, Window, actions};
 use workspace::Workspace;
-
-use crate::dbt_settings::DbtSettings;
 
 actions!(
     xdi,
@@ -35,9 +35,9 @@ actions!(
         ShowLineage,
         /// Reads the xDI project again.
         Refresh,
-        /// Converts the xDI project to an Ellode workspace, in a folder
-        /// beside it.
-        ConvertToEllode,
+        /// Opens the migration of the xDI project to Ellode, a flow at a
+        /// time.
+        MigrateToEllode,
     ]
 );
 
@@ -172,7 +172,8 @@ pub fn refresh(workspace: &mut Workspace, _window: &mut Window, cx: &mut gpui::C
     }
 }
 
-/// Where `project` converts to: a folder beside it, `<name>_ellode`.
+/// Where `project` migrates to unless another folder is chosen: a folder
+/// beside it, `<name>_ellode`.
 pub fn ellode_folder(project: &Path) -> PathBuf {
     let name = project
         .file_name()
@@ -181,164 +182,28 @@ pub fn ellode_folder(project: &Path) -> PathBuf {
     project.with_file_name(format!("{name}_ellode"))
 }
 
-/// What a conversion wrote.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Converted {
-    pub folder: PathBuf,
-    pub models: usize,
-    pub pipelines: usize,
-    pub flows: usize,
-    /// The mappings it did not convert.
-    pub left: usize,
-}
-
-impl Converted {
-    /// `Converted to Sales_ellode: 4 dbt models, 4 pipelines, 2 flows; 1
-    /// mapping left to convert by hand.`
-    pub fn summary(&self) -> String {
-        let folder = self
-            .folder
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let plural = |count: usize, one: &str, many: &str| {
-            format!("{} {}", grouped(count), if count == 1 { one } else { many })
-        };
-        let mut summary = format!(
-            "Converted to {folder}: {}, {}, {}",
-            plural(self.models, "dbt model", "dbt models"),
-            plural(self.pipelines, "pipeline", "pipelines"),
-            plural(self.flows, "flow", "flows"),
-        );
-        if self.left > 0 {
-            summary.push_str(&format!(
-                "; {} left to convert by hand",
-                plural(self.left, "mapping", "mappings")
-            ));
-        }
-        summary.push('.');
-        summary
-    }
-}
-
-/// Converts `project` into `folder`, as `options` say: what `el_import`
-/// makes of it, written there over the files of the same name.
-pub fn convert(
-    project: &el_import::model::Project,
-    options: &el_import::convert::Options,
-    folder: &Path,
-) -> std::io::Result<Converted> {
-    let conversion = el_import::convert::convert(project, options);
-    el_import::convert::write(&conversion, folder)?;
-    let count = |prefix: &str, suffix: &str| {
-        conversion
-            .files
-            .iter()
-            .filter(|file| file.path.starts_with(prefix) && file.path.ends_with(suffix))
-            .count()
-    };
-    Ok(Converted {
-        folder: folder.to_path_buf(),
-        models: count("models/", ".sql"),
-        pipelines: count("el/pipelines/", ".yml"),
-        flows: count("el/flows/", ".yml"),
-        left: conversion.report.count(el_import::convert::Outcome::is_gap),
-    })
-}
-
-/// The `ConvertToEllode` action.
-pub fn convert_to_ellode(
+/// The `MigrateToEllode` action.
+pub fn migrate_to_ellode(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
     if let Some(store) = store(workspace, cx) {
-        convert_project(workspace, store, window, cx);
+        open_migration(workspace, store, None, window, cx);
     }
 }
 
-/// Converts `store`'s project, as last read, into the folder beside it —
-/// asked first when that folder holds files — and opens its CONVERSION.md.
+/// Opens (or brings forward) the migration tab of `store`'s project, on the
+/// page of the flux at `flux` (a process's or a mapping's path) when given.
 /// The store is passed, not looked up, as for [`show_lineage`].
-pub fn convert_project(
+pub fn open_migration(
     workspace: &mut Workspace,
     store: Entity<XdiStore>,
+    flux: Option<String>,
     window: &mut Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let store = store.read(cx);
-    let (Some(project), Some(snapshot)) = (
-        store.active().map(Path::to_path_buf),
-        store.snapshot().cloned(),
-    ) else {
-        crate::el::toast(workspace, "The xDI project is not read yet.", cx);
-        return;
-    };
-    let settings = DbtSettings::get_global(cx);
-    let options = el_import::convert::Options {
-        warehouse: settings.xdi_warehouse.clone(),
-        dbt_schema: settings.xdi_dbt_schema.clone(),
-        raw_schema: settings.xdi_raw_schema.clone(),
-    };
-    let folder = ellode_folder(&project);
-    cx.spawn_in(window, async move |workspace, cx| {
-        let probe = folder.clone();
-        let occupied = cx
-            .background_executor()
-            .spawn(async move {
-                std::fs::read_dir(&probe).is_ok_and(|mut entries| entries.next().is_some())
-            })
-            .await;
-        if occupied {
-            let Ok(answer) = workspace.update_in(cx, |_, window, cx| {
-                window.prompt(
-                    PromptLevel::Warning,
-                    &format!("Convert into {}?", folder.display()),
-                    Some(
-                        "The folder holds files already: the conversion writes its own over \
-                         those of the same name, and leaves the others.",
-                    ),
-                    &["Convert", "Cancel"],
-                    cx,
-                )
-            }) else {
-                return;
-            };
-            if answer.await != Ok(0) {
-                return;
-            }
-        }
-        let target = folder.clone();
-        let converted = cx
-            .background_executor()
-            .spawn(async move { convert(&snapshot.project, &options, &target) })
-            .await;
-        workspace
-            .update_in(cx, |workspace, window, cx| match converted {
-                Ok(converted) => {
-                    crate::el::toast(workspace, &converted.summary(), cx);
-                    workspace
-                        .open_abs_path(
-                            converted.folder.join("CONVERSION.md"),
-                            workspace::OpenOptions {
-                                focus: Some(true),
-                                ..Default::default()
-                            },
-                            window,
-                            cx,
-                        )
-                        .detach();
-                }
-                Err(error) => crate::el::toast_error(
-                    workspace,
-                    &format!("The conversion could not be written: {error}"),
-                    None,
-                    cx,
-                ),
-            })
-            .ok();
-    })
-    .detach();
+    XdiMigrationView::deploy(workspace, store, flux, window, cx);
 }
 
 #[cfg(test)]
@@ -346,34 +211,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_project_converts_into_a_folder_beside_it() {
+    fn a_project_migrates_into_a_folder_beside_it_or_the_next_free_one() {
         let dir = tempfile::tempdir().unwrap();
-        let (root, snapshot) = store::fixture_snapshot(dir.path());
-        let folder = ellode_folder(&root);
-        assert_eq!(folder, root.with_file_name("Sales_ellode"));
-        let converted = convert(
-            &snapshot.project,
-            &el_import::convert::Options::default(),
-            &folder,
-        )
-        .unwrap();
+        let fixture = el_import::fixtures::write(dir.path()).unwrap();
+        let folder = ellode_folder(&fixture.project);
+        assert_eq!(folder, fixture.project.with_file_name("Sales_ellode"));
+        assert_eq!(store::suggest_folder(&fixture.project), folder);
+        // A project converted at once there: the next.
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("CONVERSION.md"), "# converted\n").unwrap();
         assert_eq!(
-            (
-                converted.models,
-                converted.pipelines,
-                converted.flows,
-                converted.left
-            ),
-            (4, 4, 2, 1)
+            store::suggest_folder(&fixture.project),
+            fixture.project.with_file_name("Sales_ellode_2")
         );
-        assert!(folder.join("CONVERSION.md").is_file());
-        assert!(folder.join("el/connections.yml").is_file());
-        assert!(folder.join("el/flows/run_orders.yml").is_file());
-        assert_eq!(
-            converted.summary(),
-            "Converted to Sales_ellode: 4 dbt models, 4 pipelines, 2 flows; 1 mapping left to \
-             convert by hand."
-        );
+        // A migration there: that one.
+        std::fs::write(folder.join(el_import::migrate::STATE_FILE), "version: 1\n").unwrap();
+        assert_eq!(store::suggest_folder(&fixture.project), folder);
     }
 
     #[test]

@@ -36,12 +36,13 @@ pub struct DbtSettings {
     pub lineage_tree_depth: u64,
     /// Node cap per lineage computation.
     pub lineage_max_nodes: u64,
-    /// The dbt target's schema of an xDI project converted to Ellode.
+    /// The dbt target's schema of an xDI project migrated to Ellode, for
+    /// its first flow: a migration keeps it.
     pub xdi_dbt_schema: String,
-    /// Where such a conversion lands other servers' tables, `{server}`
+    /// Where such a migration lands other servers' tables, `{server}`
     /// standing for the server's name.
     pub xdi_raw_schema: String,
-    /// The xDI server such a conversion builds its models on; None picks
+    /// The xDI server such a migration builds its models on; None picks
     /// the Snowflake server its mappings write most.
     pub xdi_warehouse: Option<String>,
 }

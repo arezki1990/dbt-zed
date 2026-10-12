@@ -96,8 +96,8 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &xdi::Refresh, window, cx| {
             xdi::refresh(workspace, window, cx);
         });
-        workspace.register_action(|workspace, _: &xdi::ConvertToEllode, window, cx| {
-            xdi::convert_to_ellode(workspace, window, cx);
+        workspace.register_action(|workspace, _: &xdi::MigrateToEllode, window, cx| {
+            xdi::migrate_to_ellode(workspace, window, cx);
         });
     })
     .detach();

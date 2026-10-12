@@ -161,14 +161,17 @@
     "lineage_tree_depth": 8,
     // Maximum number of nodes gathered per lineage computation.
     "lineage_max_nodes": 500,
-    // The schema of the dbt target an xDI project converted to Ellode builds
-    // in, for a model that names none of its own.
+    // The schema of the dbt target an xDI project migrated to Ellode builds
+    // in, for a model that names none of its own. A migration keeps what its
+    // first flow used.
     "xdi_dbt_schema": "DBT_XDI",
-    // Where an xDI project converted to Ellode lands the tables of other
-    // servers in the warehouse; {server} stands for the server's name.
+    // Where an xDI project migrated to Ellode lands the tables of other
+    // servers in the warehouse; {server} stands for the server's name. A
+    // migration keeps what its first flow used.
     "xdi_raw_schema": "RAW_{server}",
-    // The xDI server an xDI project converted to Ellode builds its dbt models
-    // on; empty takes the Snowflake server its mappings write most.
+    // The xDI server an xDI project migrated to Ellode builds its dbt models
+    // on; empty takes the Snowflake server its mappings write most. A
+    // migration keeps what its first flow used.
     "xdi_warehouse": "",
   },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.

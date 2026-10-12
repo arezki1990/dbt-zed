@@ -1,13 +1,15 @@
 //! The xDI panel, in the left dock when the workspace holds an xDI project:
 //! its mappings by folder, its processes and their steps in the order they
-//! run, its tables by use, and what could not be read. A click opens the
-//! lineage around the item.
+//! run — each process with where its migration to Ellode is — its tables by
+//! use, and what could not be read. A click opens the lineage around the
+//! item.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use editor::Editor;
+use el_import::migrate::Progress;
 use el_import::model::{IssueKind, LinkOn, Severity, StepKind};
 use gpui::{
     App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
@@ -189,11 +191,16 @@ impl XdiPanel {
             .ok();
     }
 
-    fn convert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_migration(
+        &mut self,
+        flux: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let store = self.store.clone();
         self.workspace
             .update(cx, |workspace, cx| {
-                super::convert_project(workspace, store, window, cx);
+                super::open_migration(workspace, store, flux, window, cx);
             })
             .ok();
     }
@@ -214,6 +221,17 @@ impl XdiPanel {
         let matches = |text: &str| !filtering || text.to_lowercase().contains(&query);
         let project = &snapshot.project;
         let mut rows = Vec::new();
+        let migration = self.store.read(cx).migration().cloned();
+        // Where a process's migration is, once it was migrated or is done.
+        let progress = |path: &str| {
+            let migration = migration.as_ref()?;
+            let progress = migration.status(path)?.progress;
+            let migrated = migration
+                .state
+                .as_ref()
+                .is_some_and(|state| state.flows.iter().any(|flow| flow.path == path));
+            (migrated || progress == Progress::Done).then_some(progress)
+        };
 
         // Which files have issues, and how bad the worst is.
         let mut worst: BTreeMap<&str, Severity> = BTreeMap::new();
@@ -291,15 +309,21 @@ impl XdiPanel {
             for process in processes {
                 let key: SharedString = format!("p/{}", process.id).into();
                 let open = self.expanded.contains(&key);
+                // Where its migration is, after its steps.
+                let (migrated, migrated_dot) = match progress(&process.path) {
+                    Some(Progress::Done) => (" · done", Some(Color::Success)),
+                    Some(Progress::ToFinish { .. }) => (" · to finish", Some(Color::Accent)),
+                    _ => ("", None),
+                };
                 rows.push(Row {
                     depth: 1,
                     expanded: Some(open),
                     icon: Some(IconName::PlayOutlined),
                     label: process.name.clone().into(),
-                    detail: Some(format!("{} steps", process.steps.len()).into()),
+                    detail: Some(format!("{} steps{migrated}", process.steps.len()).into()),
                     tooltip: Some(process.path.clone().into()),
                     muted: process.copy_like,
-                    dot: dot(&process.path),
+                    dot: dot(&process.path).or(migrated_dot),
                     action: RowAction::Process {
                         process: process.id.clone(),
                         path: process.path.clone(),
@@ -471,6 +495,16 @@ impl XdiPanel {
         cx: &mut Context<Self>,
     ) {
         let panel = cx.entity().downgrade();
+        // A process or a mapping the migration takes as a flow of its own.
+        let flux = match &action {
+            RowAction::Mapping { path, .. } | RowAction::Process { path, .. } => self
+                .store
+                .read(cx)
+                .migration()
+                .filter(|migration| migration.plan.flux(path).is_some())
+                .map(|_| path.clone()),
+            _ => None,
+        };
         let menu = ContextMenu::build(window, cx, |menu, _, _| {
             let menu = menu.context(self.focus_handle.clone());
             match action {
@@ -485,6 +519,19 @@ impl XdiPanel {
                         Focus::Node(job)
                     };
                     let open = path.clone();
+                    let menu = match flux {
+                        Some(flux) => menu.entry("Migrate…", None, {
+                            let panel = panel.clone();
+                            move |window, cx| {
+                                panel
+                                    .update(cx, |this, cx| {
+                                        this.open_migration(Some(flux.clone()), window, cx)
+                                    })
+                                    .ok();
+                            }
+                        }),
+                        None => menu,
+                    };
                     menu.entry("Open file", None, {
                         let panel = panel.clone();
                         move |window, cx| {
@@ -722,6 +769,7 @@ impl XdiPanel {
             .unwrap_or_default();
         let several = store.projects().len() > 1;
         let loading = store.loading();
+        let pinned = store.has_pinned();
         let mut header = v_flex()
             .w_full()
             .px_2()
@@ -785,11 +833,13 @@ impl XdiPanel {
                             })),
                     )
                     .child(
-                        IconButton::new("xdi-convert", IconName::ArrowUpRight)
+                        IconButton::new("xdi-migrate", IconName::ArrowUpRight)
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Convert to Ellode…"))
+                            .tooltip(Tooltip::text("Migrate to Ellode…"))
                             .disabled(snapshot.is_none())
-                            .on_click(cx.listener(|this, _, window, cx| this.convert(window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_migration(None, window, cx)
+                            })),
                     ),
             );
         if let Some(snapshot) = snapshot {
@@ -834,7 +884,8 @@ impl XdiPanel {
                     "Metadata: none found beside the project".to_owned()
                 } else {
                     format!(
-                        "Metadata: {} · {}/{} resolved",
+                        "Metadata{}: {} · {}/{} resolved",
+                        if pinned { " (the migration's)" } else { "" },
                         roots.join(", "),
                         super::grouped(resolved),
                         super::grouped(total)

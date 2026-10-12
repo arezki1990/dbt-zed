@@ -9127,8 +9127,8 @@ fn dbt_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "xDI Conversion: dbt Schema",
-                description: "The schema of the dbt target an xDI project converted to Ellode builds in, for a model that names none of its own.",
+                title: "xDI Migration: dbt Schema",
+                description: "The schema of the dbt target an xDI project migrated to Ellode builds in, for a model that names none of its own. A migration keeps what its first flow used.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("dbt.xdi_dbt_schema"),
@@ -9149,8 +9149,8 @@ fn dbt_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "xDI Conversion: Raw Schema",
-                description: "Where an xDI project converted to Ellode lands the tables of other servers in the warehouse; {server} stands for the server's name.",
+                title: "xDI Migration: Raw Schema",
+                description: "Where an xDI project migrated to Ellode lands the tables of other servers in the warehouse; {server} stands for the server's name. A migration keeps what its first flow used.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("dbt.xdi_raw_schema"),
@@ -9171,8 +9171,8 @@ fn dbt_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "xDI Conversion: Warehouse",
-                description: "The xDI server an xDI project converted to Ellode builds its dbt models on; empty takes the Snowflake server its mappings write most.",
+                title: "xDI Migration: Warehouse",
+                description: "The xDI server an xDI project migrated to Ellode builds its dbt models on; empty takes the Snowflake server its mappings write most. A migration keeps what its first flow used.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("dbt.xdi_warehouse"),
