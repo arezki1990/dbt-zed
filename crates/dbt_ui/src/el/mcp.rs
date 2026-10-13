@@ -285,6 +285,12 @@ fn pipeline_info(root: &Path, name: &str) -> Result<Value> {
                 SourceObject::Path { path, format, .. } => {
                     json!({ "path": path, "format": format })
                 }
+                SourceObject::Rest(rest) => json!({
+                    "endpoint": rest.endpoint,
+                    "method": rest.method.as_str(),
+                    "records": rest.records,
+                    "pagination": rest.pagination.kind(),
+                }),
             };
             json!({
                 "name": stream.name,
@@ -292,7 +298,13 @@ fn pipeline_info(root: &Path, name: &str) -> Result<Value> {
                 "mode": stream.mode(pipeline.defaults.as_ref()),
                 "primary_key": stream.primary_key,
                 "update_key": stream.update_key,
-                "target_table": stream.target_table(&pipeline.target),
+                // An API target's is the endpoint the stream's rows go to.
+                "target_table": match kind_of(&pipeline.target.connection) {
+                    Some(kind) if el_engine::spec::is_rest_kind(kind) => {
+                        stream.target_location(&pipeline.target, kind)
+                    }
+                    _ => stream.target_table(&pipeline.target),
+                },
                 "columns_mapped": stream.columns.len(),
             })
         })
@@ -774,6 +786,32 @@ streams:
                 json!({ "pipeline": "nope" })
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn an_api_pipeline_says_its_endpoints() {
+        let dir = project(
+            "version: 1\nconnections:\n  crm:\n    type: rest\n    base_url: https://api.example.com/v2\n    \
+             auth: { method: bearer, token: '${CRM_TOKEN}' }\n  hooks: { type: rest, base_url: https://hooks.example.com }\n",
+            &[(
+                "crm_push.yml",
+                "version: 1\npipeline: crm_push\nsource: crm\n\
+                 target: { connection: hooks, endpoint: '/import/{stream}' }\n\
+                 streams:\n- name: orders\n  source: { endpoint: /orders, records: data, pagination: { type: next_link } }\n",
+            )],
+        );
+        let info = call(
+            dir.path(),
+            "el_pipeline_info",
+            json!({ "pipeline": "crm_push" }),
+        )
+        .expect("info");
+        assert!(info.contains("\"endpoint\": \"/orders\""), "{info}");
+        assert!(info.contains("\"pagination\": \"next_link\""), "{info}");
+        assert!(
+            info.contains("\"target_table\": \"/import/orders\""),
+            "{info}"
         );
     }
 

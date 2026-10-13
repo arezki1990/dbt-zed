@@ -74,12 +74,14 @@ pub(crate) fn scrollbar<T: ui::ScrollableHandle>(handle: &T) -> ui::Scrollbars<T
     ui::Scrollbars::always_visible(ui::ScrollAxes::Vertical).tracked_scroll_handle(handle)
 }
 
-/// Kinds a pipeline loads INTO: the databases with a loader, and the file
-/// stores a target writes files to (`el_engine::spec::is_file_kind`). A
+/// Kinds a pipeline loads INTO: the databases with a loader, the file
+/// stores a target writes files to (`el_engine::spec::is_file_kind`), and
+/// the APIs a target sends rows to (`el_engine::spec::is_rest_kind`). A
 /// source kind that is not here can still be browsed and queried.
 pub(crate) fn loadable(kind: &str) -> bool {
     matches!(kind, "snowflake" | "duckdb" | "oracle" | "mssql" | "postgres")
         || el_engine::spec::is_file_kind(kind)
+        || el_engine::spec::is_rest_kind(kind)
 }
 
 /// The EL directory for a project root — `el/` beside dbt_project.yml, or
@@ -584,6 +586,10 @@ mod tests {
         }
         assert!(!super::loadable("mysql"));
         assert!(!super::extractable("s3"));
+        // A target sends rows to an API, but its streams read endpoints: it
+        // has no tables to list.
+        assert!(super::loadable("rest"));
+        assert!(!super::extractable("rest"));
     }
 
     /// What the toolbar asks on every render, and what a deploy resolves

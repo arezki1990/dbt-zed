@@ -88,6 +88,10 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
                 let name = path.rsplit('/').next().unwrap_or(path);
                 format!("file: {name}").into()
             }
+            SourceObject::Rest(rest) => match rest.method {
+                el_engine::spec::ReadMethod::Get => format!("api: {}", rest.endpoint).into(),
+                method => format!("api: {} {}", method.as_str(), rest.endpoint).into(),
+            },
         };
         let stream_node_ix = nodes.len();
         nodes.push(ElNode {
@@ -125,8 +129,8 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             to: map_node_ix,
         });
 
-        // Where this stream loads — a warehouse table, or a file store's
-        // directory — completing the row.
+        // Where this stream loads — a warehouse table, a file store's
+        // directory, or an API's endpoint — completing the row.
         let target_id = NodeId::TargetTable(stream.name.clone());
         let (target_x, target_y) = position(pipeline, &target_id)
             .unwrap_or((PADDING + 2. * (NODE_WIDTH + COL_GAP), row_y));
@@ -141,7 +145,17 @@ pub fn build_layout(pipeline: &Pipeline, connections: Option<&Connections>) -> E
             id: target_id,
             kind: ElNodeKind::TargetTable { stream_ix },
             label: target_table.into(),
-            sublabel: if el_engine::spec::is_file_kind(target_kind) {
+            sublabel: if el_engine::spec::is_rest_kind(target_kind) {
+                format!(
+                    "{target_kind}: {}, {} a request",
+                    pipeline.target.method.unwrap_or_default().as_str(),
+                    pipeline
+                        .target
+                        .batch
+                        .unwrap_or(el_engine::spec::rest::DEFAULT_BATCH)
+                )
+                .into()
+            } else if el_engine::spec::is_file_kind(target_kind) {
                 let format = pipeline.target.format.unwrap_or(el_engine::spec::FileFormat::Parquet);
                 let layout = match pipeline.target.layout.unwrap_or_default() {
                     el_engine::spec::FileLayout::Replace => "",
@@ -235,5 +249,31 @@ canvas:
         assert_eq!(layout.nodes[5].label.as_ref(), "B");
         assert!(layout.width > 0. && layout.height > 0.);
         assert_eq!(layout.nodes[3].sublabel.as_ref(), "file: b.csv");
+    }
+
+    #[test]
+    fn api_streams_and_targets_say_their_endpoints() {
+        let pipeline: el_engine::spec::Pipeline = serde_yaml_ng::from_str(
+            "version: 1\npipeline: t\nsource: crm\n\
+             target: { connection: hooks, endpoint: '/import/{stream}', method: PUT, batch: 500 }\n\
+             streams:\n- name: orders\n  source: { endpoint: /orders, records: data }\n\
+             - name: search\n  source: { endpoint: /search, method: POST, body: { q: 1 } }\n",
+        )
+        .unwrap();
+        let connections: el_engine::spec::Connections = serde_yaml_ng::from_str(
+            "version: 1\nconnections:\n  crm: { type: rest, base_url: https://api.example.com }\n  \
+             hooks: { type: rest, base_url: https://hooks.example.com }\n",
+        )
+        .unwrap();
+        let layout = build_layout(&pipeline, Some(&connections));
+        assert_eq!(layout.nodes[0].sublabel.as_ref(), "api: /orders");
+        assert_eq!(layout.nodes[3].sublabel.as_ref(), "api: POST /search");
+        // Each stream's rows go to its own endpoint.
+        assert_eq!(layout.nodes[2].label.as_ref(), "/import/orders");
+        assert_eq!(
+            layout.nodes[2].sublabel.as_ref(),
+            "rest: PUT, 500 a request"
+        );
+        assert_eq!(layout.nodes[5].label.as_ref(), "/import/search");
     }
 }

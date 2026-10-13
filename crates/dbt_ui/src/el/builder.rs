@@ -16,7 +16,7 @@ use ui::{Checkbox, HighlightedLabel, Tooltip, WithScrollbar as _, prelude::*};
 
 use el_engine::spec::{
     Connection, Connections, DbConn, DuckdbConn, FileFormat, MssqlConn, OracleConn, Pipeline,
-    SnowflakeAuth, SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
+    RestSource, SnowflakeAuth, SnowflakeConn, SourceObject, StreamSpec, TargetSpec,
 };
 
 use super::canvas_item::ElPipelineCanvas;
@@ -186,9 +186,24 @@ impl BuilderForm {
                     cx,
                 ),
                 field(
-                    "Table or path",
+                    "Table, path or endpoint",
                     "orders",
-                    Some("A table, or a file path or glob such as exports/*.parquet."),
+                    Some(
+                        "A table; a file path or glob such as exports/*.parquet; or an API's \
+                         endpoint such as /orders.",
+                    ),
+                    "",
+                    window,
+                    cx,
+                ),
+                // An API's, in place of the schema.
+                field(
+                    "Records at",
+                    "data",
+                    Some(
+                        "Where a response's records are: data, result.items; empty, the \
+                         response itself. Its pages and incremental settings are the YAML's.",
+                    ),
                     "",
                     window,
                     cx,
@@ -282,6 +297,19 @@ impl BuilderForm {
                         window,
                         cx,
                     ),
+                    // An API's, in place of the others.
+                    field(
+                        "Endpoint",
+                        "/import/{stream}",
+                        Some(
+                            "Where each stream's rows are sent as JSON, under the connection's \
+                             base URL: {stream} becomes its name. POST, 100 rows a request, \
+                             unless the YAML says method or batch.",
+                        ),
+                        target.and_then(|t| t.endpoint.as_deref()).unwrap_or(""),
+                        window,
+                        cx,
+                    ),
                 ]
             }
         };
@@ -353,13 +381,30 @@ impl BuilderForm {
             && matches!(self.tables, TablesPick::Loading | TablesPick::Loaded { .. })
     }
 
+    /// The kind of the connection picked, as connections.yml has it.
+    fn picked_kind(&self) -> Option<&str> {
+        self.picked_connection
+            .as_ref()
+            .and_then(|picked| {
+                self.connection_names
+                    .iter()
+                    .find(|(name, _)| name == picked)
+            })
+            .map(|(_, kind)| kind.as_ref())
+    }
+
     /// Whether the target picked is a file store: it takes a path, not a
     /// schema.
     fn target_writes_files(&self) -> bool {
-        self.picked_connection
-            .as_ref()
-            .and_then(|picked| self.connection_names.iter().find(|(name, _)| name == picked))
-            .is_some_and(|(_, kind)| el_engine::spec::is_file_kind(kind))
+        self.picked_kind()
+            .is_some_and(|kind| el_engine::spec::is_file_kind(kind))
+    }
+
+    /// Whether the connection picked is an API: a stream reads one of its
+    /// endpoints, a target sends rows to one.
+    fn picked_is_rest(&self) -> bool {
+        self.picked_kind()
+            .is_some_and(|kind| el_engine::spec::is_rest_kind(kind))
     }
 
     /// The fields the form shows for its kind and connection type.
@@ -368,9 +413,26 @@ impl BuilderForm {
             .iter()
             .enumerate()
             .filter(|(ix, _)| match self.kind {
-                BuilderKind::Source => !self.list_driven(),
-                // A database's schema and names, or a file store's path.
-                BuilderKind::Target => (*ix == 3) == self.target_writes_files(),
+                // A database's schema, or an API's records.
+                BuilderKind::Source => {
+                    !self.list_driven()
+                        && match ix {
+                            1 => !self.picked_is_rest(),
+                            3 => self.picked_is_rest(),
+                            _ => true,
+                        }
+                }
+                // A database's schema and names, a file store's path, or an
+                // API's endpoint.
+                BuilderKind::Target => {
+                    if self.picked_is_rest() {
+                        *ix == 4
+                    } else if self.target_writes_files() {
+                        *ix == 3
+                    } else {
+                        *ix <= 2
+                    }
+                }
                 BuilderKind::Connection => match ix {
                     0 => true,
                     1 => matches!(
@@ -616,7 +678,7 @@ impl BuilderForm {
                 let schema = self.text(1, cx);
                 let table_or_path = self.text(2, cx);
                 if table_or_path.is_empty() {
-                    bail!("give the source a table or a file path");
+                    bail!("give the source a table, a file path or an endpoint");
                 }
                 let source_kind = connections
                     .as_ref()
@@ -628,6 +690,14 @@ impl BuilderForm {
                         format: self.format,
                         csv: None,
                     },
+                    Some(kind) if el_engine::spec::is_rest_kind(kind) => {
+                        let records = self.text(3, cx);
+                        SourceObject::Rest(Box::new(RestSource {
+                            endpoint: format!("/{}", table_or_path.trim_start_matches('/')),
+                            records: (!records.is_empty()).then_some(records),
+                            ..Default::default()
+                        }))
+                    }
                     _ => SourceObject::Table {
                         schema: (!schema.is_empty()).then_some(schema),
                         table: table_or_path,
@@ -799,19 +869,36 @@ impl BuilderForm {
                 if let Some(picked) = &self.picked_connection {
                     pipeline.target.connection = picked.to_string();
                 }
-                pipeline.target = if self.target_writes_files() {
+                // Keys the form does not know stay as the YAML has them.
+                let extra = pipeline.target.extra.clone();
+                pipeline.target = if self.picked_is_rest() {
+                    let endpoint = self.text(4, cx);
+                    if endpoint.is_empty() {
+                        bail!("an API target needs an endpoint: where each stream's rows go");
+                    }
+                    // An API target already: its method, batch and wrap stay.
+                    let was_rest = pipeline.target.endpoint.is_some();
+                    TargetSpec {
+                        connection: pipeline.target.connection.clone(),
+                        endpoint: Some(endpoint),
+                        method: pipeline.target.method.filter(|_| was_rest),
+                        batch: pipeline.target.batch.filter(|_| was_rest),
+                        wrap: pipeline.target.wrap.clone().filter(|_| was_rest),
+                        extra,
+                        ..Default::default()
+                    }
+                } else if self.target_writes_files() {
                     let path = self.text(3, cx);
                     if path.is_empty() {
                         bail!("a file target needs a path: where each stream's files go");
                     }
                     TargetSpec {
                         connection: pipeline.target.connection.clone(),
-                        database: None,
-                        schema: String::new(),
-                        table: None,
                         path: Some(path),
                         format: pipeline.target.format,
                         layout: pipeline.target.layout,
+                        extra,
+                        ..Default::default()
                     }
                 } else {
                     let schema = self.text(1, cx);
@@ -825,9 +912,8 @@ impl BuilderForm {
                         database: (!database.is_empty()).then_some(database),
                         schema,
                         table: (!table.is_empty()).then_some(table),
-                        path: None,
-                        format: None,
-                        layout: None,
+                        extra,
+                        ..Default::default()
                     }
                 };
                 Ok(BuilderOutcome {
@@ -1058,6 +1144,15 @@ impl BuilderForm {
                 .child(div().flex_1().min_w_0().child(self.search.clone()))
         };
         match &self.tables {
+            // An API's stream is its endpoint: no file format to choose.
+            TablesPick::Manual if self.picked_is_rest() => dialog::notice(
+                Severity::Info,
+                format!(
+                    "{connection} is an API: a stream reads one of its endpoints, page by \
+                     page. Its pages, columns and incremental settings are set in the YAML."
+                ),
+            )
+            .into_any_element(),
             TablesPick::Manual => {
                 let formats = [
                     (FileFormat::Csv, "csv"),

@@ -1693,7 +1693,8 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         };
         // Seed source/target from the project's real connections so the
         // starter validates immediately: a database to load into, else a
-        // file store, which takes a path where a database takes a schema.
+        // file store, which takes a path where a database takes a schema,
+        // else an API, which takes an endpoint.
         let source = self
             .connections
             .iter()
@@ -1701,20 +1702,28 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             .or(self.connections.first())
             .map(|(name, _, _)| name.to_string())
             .unwrap_or_else(|| "files".to_owned());
-        let loadable = |files: bool| {
-            self.connections.iter().find(|(_, kind, _)| {
-                super::loadable(kind.as_ref()) && el_engine::spec::is_file_kind(kind.as_ref()) == files
-            })
+        let loadable = |wanted: fn(&str) -> bool| {
+            self.connections
+                .iter()
+                .find(|(_, kind, _)| super::loadable(kind.as_ref()) && wanted(kind.as_ref()))
         };
-        let target = match loadable(false) {
+        let database: fn(&str) -> bool =
+            |kind| !el_engine::spec::is_file_kind(kind) && !el_engine::spec::is_rest_kind(kind);
+        let target = match loadable(database) {
             Some((name, _, _)) => format!("  connection: {name}\n  schema: LANDING\n  table: '{{stream}}'\n"),
-            None => match loadable(true) {
+            None => match loadable(el_engine::spec::is_file_kind) {
                 Some((name, kind, _)) => {
                     let scheme = el_engine::spec::file_schemes(kind.as_ref()).first().copied();
                     let path = scheme.map_or_else(|| "exports/{stream}/".to_owned(), |scheme| format!("{scheme}bucket/gold/{{stream}}/"));
                     format!("  connection: {name}\n  path: '{path}'\n")
                 }
-                None => "  connection: warehouse\n  schema: LANDING\n  table: '{stream}'\n".to_owned(),
+                None => match loadable(el_engine::spec::is_rest_kind) {
+                    Some((name, _, _)) => {
+                        format!("  connection: {name}\n  endpoint: '/import/{{stream}}'\n")
+                    }
+                    None => "  connection: warehouse\n  schema: LANDING\n  table: '{stream}'\n"
+                        .to_owned(),
+                },
             },
         };
         let starter = format!(
