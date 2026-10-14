@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use el_import::migrate::{FileState, Flux, Kind, Place, Progress, StepBecomes};
+use el_import::model::StepKind;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, ScrollHandle,
     SharedString, Subscription, WeakEntity, Window, px, relative,
@@ -27,6 +28,9 @@ use crate::el::dialog::notice;
 /// So many rows a list shows until asked for all.
 const SHOWN: usize = 50;
 
+/// So many variables set one after another fold into a row.
+const FOLDED_VARIABLES: usize = 3;
+
 pub struct XdiMigrationView {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -38,6 +42,9 @@ pub struct XdiMigrationView {
     open: HashSet<&'static str>,
     /// The steps of the page whose notes are open, by place.
     notes: HashSet<usize>,
+    /// The runs of variables of the page that are open, by their first
+    /// step's place.
+    runs: HashSet<usize>,
     scroll: ScrollHandle,
     _observe: Subscription,
 }
@@ -83,6 +90,7 @@ impl XdiMigrationView {
             page: None,
             open: HashSet::new(),
             notes: HashSet::new(),
+            runs: HashSet::new(),
             scroll: ScrollHandle::new(),
             _observe: observe,
         }
@@ -97,6 +105,7 @@ impl XdiMigrationView {
         }
         self.page = flux;
         self.notes.clear();
+        self.runs.clear();
         self.scroll.set_offset(gpui::Point::default());
         cx.notify();
     }
@@ -388,6 +397,19 @@ impl XdiMigrationView {
                     .into_any_element(),
             );
         }
+        out.extend(self.blockers(migration, cx));
+        out
+    }
+
+    /// What keeps the migration from writing, or from converting much, and
+    /// the way out of each: on the overview and on a flow's page alike.
+    fn blockers(&self, migration: &Migration, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut out = Vec::new();
+        let name = |path: &Path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        };
         if let Some(error) = &migration.error {
             out.push(
                 div()
@@ -399,19 +421,18 @@ impl XdiMigrationView {
         if migration.one_shot {
             let mut row = h_flex().gap_2().pt_1();
             if let Some(suggested) = migration.suggested.clone() {
-                let name = suggested
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 row = row.child(
-                    Button::new("xdi-migration-suggested", format!("Migrate into {name}"))
-                        .style(ButtonStyle::Filled)
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let folder = suggested.clone();
-                            this.store
-                                .update(cx, |store, cx| store.set_migration_folder(folder, cx));
-                        })),
+                    Button::new(
+                        "xdi-migration-suggested",
+                        format!("Migrate into {}", name(&suggested)),
+                    )
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let folder = suggested.clone();
+                        this.store
+                            .update(cx, |store, cx| store.set_migration_folder(folder, cx));
+                    })),
                 );
             }
             row = row.child(
@@ -427,10 +448,82 @@ impl XdiMigrationView {
                     .pt_2()
                     .child(notice(
                         Severity::Warning,
-                        "This folder holds the project converted at once (CONVERSION.md): a \
-                         migration goes into a folder of its own.",
+                        format!(
+                            "{} holds the project converted at once (CONVERSION.md): a \
+                             migration goes into a folder of its own.",
+                            name(&migration.folder)
+                        ),
                     ))
                     .child(row)
+                    .into_any_element(),
+            );
+        }
+        let read_again = |id: &'static str, cx: &mut Context<Self>| {
+            Button::new(id, "Read the project again")
+                .style(ButtonStyle::Filled)
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.store.update(cx, |store, cx| store.reload(cx));
+                }))
+        };
+        let choose_metadata = |id: &'static str, cx: &mut Context<Self>| {
+            Button::new(id, "Choose metadata folders…")
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.store
+                        .update(cx, |store, cx| store.pick_metadata_folders(cx));
+                }))
+        };
+        let (described, named) = migration.described;
+        if !migration.missing_metadata.is_empty() {
+            let missing: Vec<String> = migration
+                .missing_metadata
+                .iter()
+                .map(|path| name(path))
+                .collect();
+            out.push(
+                v_flex()
+                    .pt_2()
+                    .child(notice(
+                        Severity::Warning,
+                        format!(
+                            "The metadata folder {} is not there — a drive not mounted? The \
+                             tables it describes are not, so the mappings reading them are \
+                             not converted, and nothing is migrated until it is there: mount \
+                             it, then read the project again.",
+                            missing.join(", ")
+                        ),
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .pt_1()
+                            .child(read_again("xdi-migration-read-again", cx))
+                            .child(choose_metadata("xdi-migration-metadata", cx)),
+                    )
+                    .into_any_element(),
+            );
+        } else if named > 0 && described * 2 < named {
+            out.push(
+                v_flex()
+                    .pt_2()
+                    .child(notice(
+                        Severity::Warning,
+                        format!(
+                            "The metadata read describes {} of the {} datastores the mappings \
+                             name: the mappings reading the others are not converted. If some \
+                             metadata is elsewhere, choose its folders.",
+                            super::grouped(described),
+                            super::grouped(named)
+                        ),
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .pt_1()
+                            .child(choose_metadata("xdi-migration-metadata", cx))
+                            .child(read_again("xdi-migration-read-again", cx)),
+                    )
                     .into_any_element(),
             );
         }
@@ -824,21 +917,46 @@ impl XdiMigrationView {
             }
             None => {}
         }
-        if !migration.writable() {
-            notices.push(
+        notices.extend(self.blockers(migration, cx));
+        // Mappings it runs that are not converted: why it is no flow.
+        let unconverted = flux
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.becomes,
+                    StepBecomes::NotConverted {
+                        mapping: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        match flux.kind {
+            Kind::Manual if unconverted > 0 => notices.push(
                 notice(
                     Severity::Warning,
-                    "Nothing can be migrated into this folder now: see All flows.",
+                    if unconverted == 1 {
+                        "The mapping it runs is not converted, so nothing in it runs in a \
+                         flow: its step says why. Once it is — its metadata found, say — it \
+                         becomes a flow."
+                            .to_owned()
+                    } else {
+                        format!(
+                            "None of the {} mappings it runs is converted, so nothing in it \
+                             runs in a flow: each step says why. Once they are — their \
+                             metadata found, say — it becomes a flow.",
+                            super::grouped(unconverted)
+                        )
+                    },
                 )
                 .into_any_element(),
-            );
-        }
-        match flux.kind {
+            ),
             Kind::Manual => notices.push(
                 notice(
                     Severity::Info,
-                    "Nothing in it runs in a flow: do what its steps did by hand, as listed \
-                     under To finish.",
+                    "Nothing in it runs in a flow — SQL, scripts, files…: do what its steps \
+                     did by hand, as listed under To finish.",
                 )
                 .into_any_element(),
             ),
@@ -912,23 +1030,48 @@ impl XdiMigrationView {
             "Steps",
             super::grouped(flux.steps.len()),
         ));
-        for (ix, step) in flux.steps.iter().enumerate() {
-            out.push(self.step_row(migration, flux, ix, cx));
-            if self.notes.contains(&ix) {
-                for note in &step.notes {
-                    out.push(
-                        h_flex()
-                            .pl(px(28. + step.depth as f32 * 16.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(Self::muted(format!("· {note}"))),
-                            )
-                            .into_any_element(),
-                    );
+        // Variables set one after another fold into a row: the steps that
+        // matter stand out.
+        let variable = |step: &el_import::migrate::StepPlan| {
+            step.kind == StepKind::Variable.label()
+                && matches!(step.becomes, StepBecomes::NotRun { .. })
+        };
+        let mut ix = 0;
+        while let Some(step) = flux.steps.get(ix) {
+            let run = flux
+                .steps
+                .iter()
+                .skip(ix)
+                .take_while(|other| other.depth == step.depth && variable(other))
+                .count();
+            let shown = if run >= FOLDED_VARIABLES {
+                out.push(self.variables_row(ix, run, step.depth, cx));
+                if self.runs.contains(&ix) { run } else { 0 }
+            } else {
+                1
+            };
+            for at in ix..ix + shown {
+                out.push(self.step_row(migration, flux, at, cx));
+                if self.notes.contains(&at) {
+                    let Some(step) = flux.steps.get(at) else {
+                        continue;
+                    };
+                    for note in &step.notes {
+                        out.push(
+                            h_flex()
+                                .pl(px(28. + step.depth as f32 * 16.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Self::muted(format!("· {note}"))),
+                                )
+                                .into_any_element(),
+                        );
+                    }
                 }
             }
+            ix += run.max(1);
         }
 
         // The files it writes, then those it needs.
@@ -1071,6 +1214,50 @@ impl XdiMigrationView {
             );
         }
         out
+    }
+
+    /// The row standing for `count` variables set one after another from
+    /// step `ix`: opening on them.
+    fn variables_row(
+        &self,
+        ix: usize,
+        count: usize,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let open = self.runs.contains(&ix);
+        h_flex()
+            .id(("xdi-variables", ix))
+            .w_full()
+            .min_h(px(24.))
+            .gap_2()
+            .px_1()
+            .pl(px(4. + depth as f32 * 16.))
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.runs.remove(&ix) {
+                    this.runs.insert(ix);
+                }
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .child(div().w(px(200.)).flex_shrink_0().child(
+                Label::new(format!("{} variables", super::grouped(count))).size(LabelSize::Small),
+            ))
+            .child(div().flex_1().min_w_0().child(Self::muted(
+                "set in xDI: the models read them as dbt variables",
+            )))
+            .into_any_element()
     }
 
     fn step_row(
@@ -1537,6 +1724,64 @@ mod tests {
             .update(&mut setup.cx, |store, cx| store.refresh_migration(cx));
         setup.cx.run_until_parked();
         setup
+    }
+
+    #[gpui::test]
+    async fn a_missing_metadata_folder_stops_the_migration_and_variables_fold(
+        cx: &mut TestAppContext,
+    ) {
+        // _MTD on a drive not mounted; four variables set one after another
+        // in RUN_ORDERS.
+        let mut setup = setup(cx, |snapshot| {
+            let project = &mut snapshot.project;
+            project.metadata.push(el_import::model::MetadataRoot {
+                path: PathBuf::from("/Volumes/Unmounted/_MTD"),
+                status: el_import::model::RootStatus::Missing,
+                files: 0,
+            });
+            let run_orders = project
+                .processes
+                .iter_mut()
+                .find(|process| process.name == "RUN_ORDERS")
+                .unwrap();
+            for n in 0..4 {
+                run_orders.steps.push(Step {
+                    element_id: format!("v_{n}"),
+                    name: format!("V_{n}"),
+                    kind: StepKind::Variable,
+                    enabled: true,
+                    start: true,
+                });
+            }
+        })
+        .await;
+        let migration = setup.migration();
+        assert_eq!(
+            migration.missing_metadata,
+            [PathBuf::from("/Volumes/Unmounted/_MTD")]
+        );
+        assert!(!migration.writable());
+        setup.draw("a metadata folder not there");
+        setup.show(Some(RUN_ORDERS));
+        setup.draw("its flow, nothing writable");
+        // Migrating anyway is refused by the buttons; the store keeps to it.
+        let flux = migration.plan.flux(RUN_ORDERS).unwrap();
+        let first = flux
+            .steps
+            .iter()
+            .position(|step| step.name == "V_0")
+            .unwrap();
+        assert!(
+            flux.steps[first..first + 4]
+                .iter()
+                .all(|step| step.kind == "variable")
+        );
+        setup.draw("its variables folded");
+        setup.view.update(&mut setup.cx, |view, cx| {
+            view.runs.insert(first);
+            cx.notify();
+        });
+        setup.draw("its variables open");
     }
 
     #[gpui::test]

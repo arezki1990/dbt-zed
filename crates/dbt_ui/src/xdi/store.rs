@@ -82,6 +82,13 @@ pub struct Migration {
     /// The metadata folders the migration keeps to, when the project was
     /// read from others: read again from them first.
     pub metadata_differs: Option<Vec<PathBuf>>,
+    /// The metadata folders the project was read from that are not there —
+    /// a drive not mounted: their tables are not described, and their
+    /// mappings not converted, until they are.
+    pub missing_metadata: Vec<PathBuf>,
+    /// How many of the datastores the mappings name the metadata describes,
+    /// of how many.
+    pub described: (usize, usize),
 }
 
 impl Migration {
@@ -90,9 +97,12 @@ impl Migration {
     }
 
     /// Whether a flux can be migrated now: the folder takes it, and the
-    /// project was read as the migration keeps it.
+    /// project was read whole, as the migration keeps it.
     pub fn writable(&self) -> bool {
-        !self.one_shot && self.error.is_none() && self.metadata_differs.is_none()
+        !self.one_shot
+            && self.error.is_none()
+            && self.metadata_differs.is_none()
+            && self.missing_metadata.is_empty()
     }
 }
 
@@ -205,6 +215,18 @@ pub fn read_migration(
         .filter(|state| !state.metadata.is_empty())
         .map(|state| state.metadata_roots(&folder))
         .filter(|wanted| !same_folders(wanted, &snapshot.roots));
+    let missing_metadata = snapshot
+        .project
+        .metadata
+        .iter()
+        .filter(|root| root.status == el_import::model::RootStatus::Missing)
+        .map(|root| root.path.clone())
+        .collect();
+    let stats = &snapshot.project.stats;
+    let described = (
+        stats.resolved + stats.path_resolved,
+        stats.datastores + stats.path_datastores,
+    );
     Migration {
         snapshot,
         folder,
@@ -219,6 +241,8 @@ pub fn read_migration(
         suggested,
         error,
         metadata_differs,
+        missing_metadata,
+        described,
     }
 }
 
