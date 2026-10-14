@@ -96,6 +96,42 @@ impl Migration {
         self.statuses.iter().find(|status| status.path == path)
     }
 
+    /// Why nothing can be migrated now, in a few words; none when a flux
+    /// can be.
+    pub fn blocked(&self) -> Option<String> {
+        let name = |path: &Path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        };
+        if self.error.is_some() {
+            Some(format!(
+                "{} does not read: fix it first.",
+                migrate::STATE_FILE
+            ))
+        } else if self.one_shot {
+            Some(format!(
+                "{} holds the project converted at once: choose the folder to migrate into \
+                 first.",
+                name(&self.folder)
+            ))
+        } else if !self.missing_metadata.is_empty() {
+            let missing: Vec<String> = self
+                .missing_metadata
+                .iter()
+                .map(|path| name(path))
+                .collect();
+            Some(format!(
+                "The metadata folder {} is not there: mount it, then read the project again.",
+                missing.join(", ")
+            ))
+        } else if self.metadata_differs.is_some() {
+            Some("The project is read again from this migration's metadata folders…".to_owned())
+        } else {
+            None
+        }
+    }
+
     /// Whether a flux can be migrated now: the folder takes it, and the
     /// project was read whole, as the migration keeps it.
     pub fn writable(&self) -> bool {

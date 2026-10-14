@@ -823,6 +823,10 @@ impl XdiMigrationView {
             .as_ref()
             .and_then(|state| state.flows.iter().find(|done| done.path == flux.path));
         let writable = migration.writable() && !busy;
+        // Why the button is grey, on it.
+        let blocked = migration
+            .blocked()
+            .or_else(|| busy.then(|| "Busy reading or writing: a moment…".to_owned()));
         let button = match (flux.kind, migrated) {
             (Kind::Manual, _) => None,
             (_, None) => Some(
@@ -830,6 +834,9 @@ impl XdiMigrationView {
                     .style(ButtonStyle::Filled)
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
+                    .tooltip(Tooltip::text(blocked.clone().unwrap_or_else(|| {
+                        "Write its flow, and what its mappings became, into the folder".to_owned()
+                    })))
                     .on_click(cx.listener({
                         let path = flux.path.clone();
                         move |this, _, _, cx| {
@@ -847,6 +854,9 @@ impl XdiMigrationView {
                 Button::new("xdi-write-again", "Write again…")
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
+                    .when_some(blocked.clone(), |button, why| {
+                        button.tooltip(Tooltip::text(why))
+                    })
                     .on_click(cx.listener({
                         let path = flux.path.clone();
                         let name = flux.name.clone();
@@ -907,6 +917,22 @@ impl XdiMigrationView {
                 .color(color)
                 .into_any_element(),
         );
+        // What its button does.
+        if migrated.is_none() && flux.kind != Kind::Manual {
+            let folder = migration
+                .folder
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            out.push(
+                Self::muted(format!(
+                    "Migrate this flow writes into {folder} its flow, the dbt models and \
+                     pipelines its converted mappings became, and the sources, connections and \
+                     variables they need. Nothing in xDI changes."
+                ))
+                .into_any_element(),
+            );
+        }
         let mut notices: Vec<gpui::AnyElement> = Vec::new();
         match self.store.read(cx).last_result() {
             Some(Ok(summary)) => {
@@ -1026,10 +1052,25 @@ impl XdiMigrationView {
         }
 
         // Its steps, as xDI ran them, beside what each becomes.
-        out.push(Self::section_title(
-            "Steps",
-            super::grouped(flux.steps.len()),
-        ));
+        let mappings = flux
+            .steps
+            .iter()
+            .filter(|step| match &step.becomes {
+                StepBecomes::Copy { .. } | StepBecomes::Models { .. } => true,
+                StepBecomes::NotConverted { mapping, .. } => mapping.is_some(),
+                _ => false,
+            })
+            .count();
+        let mut count = super::grouped(flux.steps.len());
+        if unconverted > 0 && flux.kind != Kind::Manual {
+            count.push_str(&format!(
+                " · {} of its {} mappings not converted: left out of the flow, as listed under \
+                 To finish",
+                super::grouped(unconverted),
+                super::grouped(mappings)
+            ));
+        }
+        out.push(Self::section_title("Steps", count));
         // Variables set one after another fold into a row: the steps that
         // matter stand out.
         let variable = |step: &el_import::migrate::StepPlan| {
@@ -1312,6 +1353,7 @@ impl XdiMigrationView {
         let open = self.notes.contains(&ix);
         h_flex()
             .id(("xdi-step", ix))
+            .flex_shrink_0()
             .w_full()
             .min_h(px(24.))
             .gap_2()
@@ -1473,7 +1515,9 @@ impl Render for XdiMigrationView {
             Some(flux) => self.render_flux(&migration, &flux, busy, cx),
             None => self.render_overview(&migration, busy, cx),
         };
-        body = body.children(rows);
+        // In a column of their own that keeps their heights: rows of a
+        // scrolling column would shrink, and overlap, to fit it.
+        body = body.child(v_flex().w_full().flex_shrink_0().gap_0p5().children(rows));
         body
     }
 }
@@ -1682,6 +1726,13 @@ mod tests {
         let migration = setup.migration();
         assert!(migration.one_shot && !migration.writable());
         assert_eq!(
+            migration.blocked().as_deref(),
+            Some(
+                "Sales_ellode holds the project converted at once: choose the folder to \
+                 migrate into first."
+            )
+        );
+        assert_eq!(
             migration.suggested.as_deref(),
             Some(setup.root.with_file_name("Sales_ellode_2").as_path())
         );
@@ -1761,6 +1812,10 @@ mod tests {
             [PathBuf::from("/Volumes/Unmounted/_MTD")]
         );
         assert!(!migration.writable());
+        assert_eq!(
+            migration.blocked().as_deref(),
+            Some("The metadata folder _MTD is not there: mount it, then read the project again.")
+        );
         setup.draw("a metadata folder not there");
         setup.show(Some(RUN_ORDERS));
         setup.draw("its flow, nothing writable");
