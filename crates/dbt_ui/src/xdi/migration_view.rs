@@ -834,7 +834,7 @@ impl XdiMigrationView {
                     .style(ButtonStyle::Filled)
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
-                    .tooltip(Tooltip::text(blocked.clone().unwrap_or_else(|| {
+                    .tooltip(Tooltip::text(blocked.unwrap_or_else(|| {
                         "Write its flow, and what its mappings became, into the folder".to_owned()
                     })))
                     .on_click(cx.listener({
@@ -854,7 +854,7 @@ impl XdiMigrationView {
                 Button::new("xdi-write-again", "Write again…")
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
-                    .when_some(blocked.clone(), |button, why| {
+                    .when_some(blocked, |button, why| {
                         button.tooltip(Tooltip::text(why))
                     })
                     .on_click(cx.listener({
