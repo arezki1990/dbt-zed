@@ -854,9 +854,7 @@ impl XdiMigrationView {
                 Button::new("xdi-write-again", "Write again…")
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
-                    .when_some(blocked, |button, why| {
-                        button.tooltip(Tooltip::text(why))
-                    })
+                    .when_some(blocked, |button, why| button.tooltip(Tooltip::text(why)))
                     .on_click(cx.listener({
                         let path = flux.path.clone();
                         let name = flux.name.clone();
@@ -1127,11 +1125,21 @@ impl XdiMigrationView {
             "Files",
             super::grouped(flux.files.len() + flux.sources.len()),
         ));
-        let files = flux.files.iter().map(|path| (path, "")).chain(
-            flux.sources
-                .iter()
-                .map(|path| (path, "a source it reads · ")),
-        );
+        // Beside its own, the files it needs that other flows may need too:
+        // the sources its models read, and the models putting back
+        // together the tables it writes with others.
+        let files = flux
+            .files
+            .iter()
+            .map(|path| (path, ""))
+            .chain(flux.sources.iter().map(|path| {
+                let what = if path.starts_with("models/_sources/") {
+                    "a source it reads · "
+                } else {
+                    "puts back together a table it writes with others · "
+                };
+                (path, what)
+            }));
         let rows: Vec<gpui::AnyElement> = files
             .map(|(path, what)| {
                 let state = migration.files.get(path).copied();
