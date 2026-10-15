@@ -658,7 +658,13 @@ fn load_spec(project_root: &std::path::Path, spec_path: &std::path::Path) -> Res
     let mut missing_env = Vec::new();
     if let Some(connections) = &connections {
         for name in [&pipeline.source, &pipeline.target.connection] {
-            if let Some(connection) = connections.connections.get(name) {
+            // A connection with a workspace resolves its variables on that
+            // server, not from this machine's .env.
+            if let Some(connection) = connections
+                .connections
+                .get(name)
+                .filter(|connection| connection.workspace().is_none())
+            {
                 for var in connection.missing_env_refs(&env) {
                     if !missing_env.contains(&var) {
                         missing_env.push(var);

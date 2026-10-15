@@ -388,9 +388,15 @@ impl ElPanel {
                     .iter()
                     .map(|(name, connection)| {
                         let name: SharedString = name.clone().into();
-                        let missing = connection.missing_env_refs(&env);
-                        if !missing.is_empty() {
-                            self.missing_env.insert(name.clone(), missing);
+                        // A connection with a workspace resolves its
+                        // variables on that server — a platform project
+                        // keeps its own, a daemon holds what it was sent —
+                        // so this machine's .env says nothing about it.
+                        if connection.workspace().is_none() {
+                            let missing = connection.missing_env_refs(&env);
+                            if !missing.is_empty() {
+                                self.missing_env.insert(name.clone(), missing);
+                            }
                         }
                         if let el_engine::spec::Connection::Snowflake(snowflake) = connection {
                             if let Some(database) =
@@ -550,7 +556,9 @@ impl ElPanel {
                     workspace.clone(),
                 ));
                 if let Some(missing) = self.missing_env.get(name) {
-                    rows.push(Row::EnvHint(missing.clone()));
+                    if !self.has_listed(name) {
+                        rows.push(Row::EnvHint(missing.clone()));
+                    }
                 }
                 if !self.expanded.contains(name) {
                     continue;
@@ -1282,6 +1290,21 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// Whether a listing of this connection has come back: it reached the
+    /// database, so its credentials resolved whatever .env looks like.
+    fn has_listed(&self, name: &SharedString) -> bool {
+        matches!(self.tables.get(name), Some(TablesState::Loaded { .. }))
+            || self.trees.get(name).is_some_and(|tree| {
+                // A pinned database is taken as written, not listed.
+                (matches!(tree.databases, Some(Listing::Loaded(_)))
+                    && !self.pinned_databases.contains_key(name))
+                    || tree
+                        .schemas
+                        .values()
+                        .any(|listing| matches!(listing, Listing::Loaded(_)))
+            })
     }
 
     fn connection_lists_by_level(&self, name: &SharedString) -> bool {
