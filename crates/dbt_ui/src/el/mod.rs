@@ -8,6 +8,7 @@ pub mod connection_modal;
 pub mod deploy_modal;
 pub mod dialog;
 pub mod layout;
+pub mod listing_cache;
 pub mod local_runner;
 pub mod mapping_editor;
 pub mod mcp;
@@ -216,17 +217,31 @@ fn on_remote(remote: &str, error: anyhow::Error) -> anyhow::Error {
 /// Lists a connection's tables on the checkout's database worker.
 /// Blocking — call from a background thread.
 pub fn list_tables(project_root: &Path, connection: &str) -> anyhow::Result<Vec<(String, String)>> {
-    match db_worker(project_root, connection)? {
-        DbWorker::Local(worker) => {
-            let (connection, env) = local_connection(project_root, connection)?;
-            el_engine::explore::list_tables(&worker, project_root, &connection, &env)
-        }
-        DbWorker::Remote(remote) => {
-            el_engine::server::RemoteClient::connect(project_root, &remote)?
-                .explore_tables(connection)
-                .map_err(|error| on_remote(&remote, error))
-        }
-    }
+    let (definition, env) = local_connection(project_root, connection)?;
+    listing_cache::read_through(
+        project_root,
+        connection,
+        &definition,
+        listing_cache::Level::Tables,
+        || match db_worker(project_root, connection)? {
+            DbWorker::Local(worker) => {
+                el_engine::explore::list_tables(&worker, project_root, &definition, &env)
+            }
+            DbWorker::Remote(remote) => {
+                el_engine::server::RemoteClient::connect(project_root, &remote)?
+                    .explore_tables(connection)
+                    .map_err(|error| on_remote(&remote, error))
+            }
+        },
+    )
+}
+
+/// Drops cached listings so the next ones go to the database. Blocking.
+pub fn invalidate_listings(
+    project_root: &Path,
+    scope: &listing_cache::Scope,
+) -> anyhow::Result<()> {
+    listing_cache::invalidate(project_root, scope)
 }
 
 /// The local worker for one level of a catalog tree. A remote's daemon
@@ -247,40 +262,60 @@ fn level_worker(
 }
 
 /// A Snowflake account's databases. Blocking.
-pub fn list_databases(project_root: &Path, connection: &str) -> anyhow::Result<Vec<String>> {
-    let (worker, connection, env) = level_worker(project_root, connection)?;
-    el_engine::explore::list_databases(&worker, project_root, &connection, &env)
+pub fn list_databases(project_root: &Path, name: &str) -> anyhow::Result<Vec<String>> {
+    let (worker, connection, env) = level_worker(project_root, name)?;
+    listing_cache::read_through(
+        project_root,
+        name,
+        &connection,
+        listing_cache::Level::Databases,
+        || el_engine::explore::list_databases(&worker, project_root, &connection, &env),
+    )
 }
 
 /// One Snowflake database's schemas. Blocking.
 pub fn list_schemas(
     project_root: &Path,
-    connection: &str,
+    name: &str,
     database: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let (worker, connection, env) = level_worker(project_root, connection)?;
-    el_engine::explore::list_schemas(&worker, project_root, &connection, &env, database)
+    let (worker, connection, env) = level_worker(project_root, name)?;
+    listing_cache::read_through(
+        project_root,
+        name,
+        &connection,
+        listing_cache::Level::Schemas { database },
+        || el_engine::explore::list_schemas(&worker, project_root, &connection, &env, database),
+    )
 }
 
 /// One Snowflake schema's tables and views, by name. Blocking.
 pub fn list_schema_tables(
     project_root: &Path,
-    connection: &str,
+    name: &str,
     database: &str,
     schema: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let (worker, connection, env) = level_worker(project_root, connection)?;
-    Ok(el_engine::explore::list_schema_tables(
-        &worker,
+    let (worker, connection, env) = level_worker(project_root, name)?;
+    listing_cache::read_through(
         project_root,
+        name,
         &connection,
-        &env,
-        database,
-        schema,
-    )?
-    .into_iter()
-    .map(|(_, table)| table)
-    .collect())
+        listing_cache::Level::SchemaTables { database, schema },
+        || {
+            Ok(el_engine::explore::list_schema_tables(
+                &worker,
+                project_root,
+                &connection,
+                &env,
+                database,
+                schema,
+            )?
+            .into_iter()
+            .map(|(_, table)| table)
+            .collect())
+        },
+    )
 }
 
 /// Runs an ad-hoc query on the checkout's database worker. Blocking.

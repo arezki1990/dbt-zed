@@ -1469,6 +1469,101 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         );
     }
 
+    /// Drops `scope`'s cached listings, then runs `reload`: a refresh must
+    /// reach the database, not the cache it is refreshing.
+    fn invalidate_then(
+        &mut self,
+        task_key: SharedString,
+        scope: super::listing_cache::Scope,
+        cx: &mut Context<Self>,
+        reload: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let epoch = self.tables_epoch;
+        let task = cx.background_spawn(async move { super::invalidate_listings(&root, &scope) });
+        self._list_tasks.insert(
+            task_key,
+            cx.spawn(async move |this, cx| {
+                // Listing anyway is still a refresh when Redis is down;
+                // it may answer from the cache that could not be cleared.
+                if let Err(error) = task.await {
+                    log::warn!("el: could not clear cached listings: {error:#}");
+                }
+                this.update(cx, |this, cx| {
+                    if this.tables_epoch != epoch {
+                        return; // a different environment is listed now
+                    }
+                    reload(this, cx);
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
+    }
+
+    /// Lists a connection again from the database, every level of it.
+    fn refresh_connection(&mut self, name: SharedString, cx: &mut Context<Self>) {
+        let by_level = self.connection_lists_by_level(&name);
+        if by_level {
+            let tree = self.trees.entry(name.clone()).or_default();
+            tree.databases = Some(Listing::Loading);
+            tree.schemas.clear();
+            tree.tables.clear();
+        } else {
+            self.tables.insert(name.clone(), TablesState::Loading);
+        }
+        cx.notify();
+        self.invalidate_then(
+            format!("{name}\u{1}refresh").into(),
+            super::listing_cache::Scope::Connection(name.to_string()),
+            cx,
+            move |this, cx| {
+                if by_level {
+                    this.load_databases(name, cx);
+                } else {
+                    this.load_tables(name, cx);
+                }
+            },
+        );
+    }
+
+    /// Lists a database's schemas again, and the tables of those open.
+    fn refresh_database(&mut self, name: SharedString, database: String, cx: &mut Context<Self>) {
+        let tree = self.trees.entry(name.clone()).or_default();
+        tree.schemas.insert(database.clone(), Listing::Loading);
+        tree.tables.retain(|(listed, _), _| *listed != database);
+        cx.notify();
+        self.invalidate_then(
+            format!("{name}\u{1}{database}\u{1}refresh").into(),
+            super::listing_cache::Scope::Database(name.to_string(), database.clone()),
+            cx,
+            move |this, cx| this.load_schemas(name, database, cx),
+        );
+    }
+
+    fn refresh_schema(
+        &mut self,
+        name: SharedString,
+        database: String,
+        schema: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.trees
+            .entry(name.clone())
+            .or_default()
+            .tables
+            .insert((database.clone(), schema.clone()), Listing::Loading);
+        cx.notify();
+        self.invalidate_then(
+            format!("{name}\u{1}{database}\u{1}{schema}\u{1}refresh").into(),
+            super::listing_cache::Scope::Schema(name.to_string(), database.clone(), schema.clone()),
+            cx,
+            move |this, cx| this.load_schema_tables(name, database, schema, cx),
+        );
+    }
+
     fn toggle_database(
         &mut self,
         name: SharedString,
@@ -2001,13 +2096,21 @@ impl Render for ElPanel {
                                     tree.tables.clear();
                                 }
                                 this.refresh(cx);
-                                for name in this.expanded.clone() {
-                                    if this.connection_lists_by_level(&name) {
-                                        this.load_databases(name, cx);
-                                    } else {
-                                        this.load_tables(name, cx);
-                                    }
-                                }
+                                let expanded = this.expanded.clone();
+                                this.invalidate_then(
+                                    "\u{1}refresh".into(),
+                                    super::listing_cache::Scope::Project,
+                                    cx,
+                                    move |this, cx| {
+                                        for name in expanded {
+                                            if this.connection_lists_by_level(&name) {
+                                                this.load_databases(name, cx);
+                                            } else {
+                                                this.load_tables(name, cx);
+                                            }
+                                        }
+                                    },
+                                );
                                 if let Some(root) = this.root.clone() {
                                     this.check_runner(&root, cx);
                                 }
@@ -2304,6 +2407,18 @@ impl ElPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
+                .when(can_browse && expanded, |row| {
+                    let name = name.clone();
+                    row.child(
+                        IconButton::new(("el-conn-refresh", ix), IconName::RotateCw)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("List this connection again"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.refresh_connection(name.clone(), cx);
+                            })),
+                    )
+                })
                 .child({
                     let name = name.clone();
                     IconButton::new(("el-conn-edit", ix), IconName::Pencil)
@@ -2348,6 +2463,19 @@ impl ElPanel {
                             .size(LabelSize::Small)
                             .truncate(),
                     )
+                    .child(div().flex_1())
+                    .when(open && self.connection_lists_by_level(connection), |row| {
+                        let (name, database) = (connection.clone(), database.clone());
+                        row.child(
+                            IconButton::new(("el-database-refresh", ix), IconName::RotateCw)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("List this database's schemas again"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.refresh_database(name.clone(), database.clone(), cx);
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_database(
                             toggle_connection.clone(),
@@ -2395,6 +2523,26 @@ impl ElPanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                     }))
+                    // A schema of a connection listed whole is refreshed
+                    // with its connection: there is no listing of it alone.
+                    .when(open && self.connection_lists_by_level(connection), |row| {
+                        let (name, database, schema) =
+                            (connection.clone(), database.clone(), schema.clone());
+                        row.child(
+                            IconButton::new(("el-schema-refresh", ix), IconName::RotateCw)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("List this schema's tables again"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.refresh_schema(
+                                        name.clone(),
+                                        database.clone(),
+                                        schema.clone(),
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
                     // A schema a pipeline can extract from drags as a whole:
                     // every table in it becomes a stream.
                     .when_some(
