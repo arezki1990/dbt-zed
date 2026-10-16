@@ -744,6 +744,20 @@ impl Render for DbtDatabasePanel {
                             .child(self.filter_editor.clone()),
                     )
                     .child(
+                        IconButton::new("dbt-import-xdi", IconName::Download)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_window, cx| {
+                                ui::Tooltip::for_action(
+                                    "Import a process from xDI",
+                                    &crate::xdi::ImportFromXdi,
+                                    cx,
+                                )
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::xdi::ImportFromXdi), cx);
+                            }),
+                    )
+                    .child(
                         IconButton::new("dbt-db-refresh", IconName::RotateCw)
                             .icon_size(IconSize::Small)
                             .tooltip(ui::Tooltip::text("Reload from dbt artifacts"))

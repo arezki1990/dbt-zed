@@ -5348,6 +5348,7 @@ dependencies = [
  "log",
  "menu",
  "paths",
+ "picker",
  "project",
  "rand 0.9.4",
  "redis",

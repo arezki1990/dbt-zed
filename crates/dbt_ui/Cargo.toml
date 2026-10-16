@@ -26,6 +26,7 @@ gpui.workspace = true
 http_client.workspace = true
 indexmap.workspace = true
 paths.workspace = true
+picker.workspace = true
 smol.workspace = true
 language.workspace = true
 layout-rs.workspace = true

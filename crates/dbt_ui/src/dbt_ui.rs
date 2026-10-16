@@ -99,6 +99,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &xdi::MigrateToEllode, window, cx| {
             xdi::migrate_to_ellode(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &xdi::ImportFromXdi, window, cx| {
+            xdi::import::import_from_xdi(workspace, window, cx);
+        });
     })
     .detach();
 }

@@ -6,6 +6,7 @@
 //! beside it. Its own files are never written, and a server's credentials
 //! are never read.
 
+pub mod import;
 pub mod inventory_view;
 pub mod layout;
 pub mod lineage_view;
@@ -38,6 +39,9 @@ actions!(
         /// Opens the migration of the xDI project to Ellode, a flow at a
         /// time.
         MigrateToEllode,
+        /// Imports a process of an xDI project into the dbt project open,
+        /// and opens the agent on what is left to do.
+        ImportFromXdi,
     ]
 );
 

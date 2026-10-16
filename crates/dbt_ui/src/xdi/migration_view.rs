@@ -10,18 +10,21 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use el_import::migrate::{FileState, Flux, Kind, Place, Progress, StepBecomes};
 use el_import::model::StepKind;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, px, relative,
+    SharedString, Subscription, Task, WeakEntity, Window, px, relative,
 };
 use ui::{Checkbox, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     item::{Item, TabContentParams},
 };
 
+use super::import;
 use super::store::{Migration, MigrationOp, XdiStore};
 use crate::el::dialog::notice;
 
@@ -46,6 +49,10 @@ pub struct XdiMigrationView {
     /// step's place.
     runs: HashSet<usize>,
     scroll: ScrollHandle,
+    /// The flux to hand to the agent once it is migrated, by path.
+    agent_pending: Option<String>,
+    /// Writing a flux's digests, then handing it to the agent.
+    _agent: Task<()>,
     _observe: Subscription,
 }
 
@@ -70,7 +77,7 @@ impl XdiMigrationView {
         }
         let workspace_handle = cx.entity().downgrade();
         let view = cx.new(|cx| {
-            let mut view = Self::new(workspace_handle, store, cx);
+            let mut view = Self::new(workspace_handle, store, window, cx);
             view.page = flux;
             view
         });
@@ -80,9 +87,13 @@ impl XdiMigrationView {
     fn new(
         workspace: WeakEntity<Workspace>,
         store: Entity<XdiStore>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&store, |_, _, cx| cx.notify());
+        let observe = cx.observe_in(&store, window, |this, _, window, cx| {
+            this.agent_when_migrated(window, cx);
+            cx.notify();
+        });
         Self {
             focus_handle: cx.focus_handle(),
             workspace,
@@ -92,6 +103,8 @@ impl XdiMigrationView {
             notes: HashSet::new(),
             runs: HashSet::new(),
             scroll: ScrollHandle::new(),
+            agent_pending: None,
+            _agent: Task::ready(()),
             _observe: observe,
         }
     }
@@ -108,6 +121,109 @@ impl XdiMigrationView {
         self.runs.clear();
         self.scroll.set_offset(gpui::Point::default());
         cx.notify();
+    }
+
+    /// Hands the flux at `path` to the agent, migrating it first when it
+    /// is not yet.
+    pub fn prepare_with_agent(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(migration) = self.store.read(cx).migration().cloned() else {
+            return;
+        };
+        if Self::is_migrated(&migration, &path) {
+            self.ask_agent(&migration, &path, window, cx);
+        } else {
+            self.agent_pending = Some(path.clone());
+            self.queue(
+                MigrationOp::Migrate {
+                    fluxes: vec![path],
+                    rewrite: false,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn is_migrated(migration: &Migration, path: &str) -> bool {
+        migration
+            .state
+            .as_ref()
+            .is_some_and(|state| state.flows.iter().any(|done| done.path == path))
+    }
+
+    /// Once the flux waiting for the agent is migrated, hands it over; when
+    /// its migration failed, it waits no more: the tab says why.
+    fn agent_when_migrated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.agent_pending.clone() else {
+            return;
+        };
+        let store = self.store.read(cx);
+        if store.migrating() {
+            return;
+        }
+        let Some(migration) = store.migration().cloned() else {
+            return;
+        };
+        if Self::is_migrated(&migration, &path) {
+            self.agent_pending = None;
+            self.ask_agent(&migration, &path, window, cx);
+        } else if store.last_result().is_some_and(|result| result.is_err()) {
+            self.agent_pending = None;
+        }
+    }
+
+    /// Writes the flux's digests into the dbt project, then opens the agent
+    /// on its brief.
+    fn ask_agent(
+        &mut self,
+        migration: &Arc<Migration>,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let migration = migration.clone();
+        let path = path.to_owned();
+        let written = cx.background_spawn(async move {
+            let flux = migration
+                .plan
+                .flux(&path)
+                .with_context(|| format!("{path} is not in the migration's plan"))?;
+            let digests = import::write_digests(&migration, flux)?;
+            let guidance = import::guidance(&migration.folder);
+            anyhow::Ok(import::agent_prompt(&migration, flux, &guidance, &digests))
+        });
+        self._agent = cx.spawn_in(window, async move |_, cx| match written.await {
+            Ok(prompt) => {
+                cx.update(|window, cx| {
+                    window.dispatch_action(
+                        Box::new(zed_actions::agent::NewThreadWithPrompt {
+                            prompt,
+                            auto_submit: false,
+                        }),
+                        cx,
+                    );
+                })
+                .log_err();
+            }
+            Err(error) => {
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "The agent could not be given this flow",
+                        Some(&format!("{error:#}")),
+                        &["OK"],
+                        cx,
+                    )
+                });
+                if let Some(answer) = answer.log_err() {
+                    answer.await.ok();
+                }
+            }
+        });
     }
 
     fn project_name(&self, cx: &App) -> String {
@@ -194,7 +310,7 @@ impl XdiMigrationView {
     }
 
     /// What a flux's status reads as, and its color.
-    fn status_text(flux: &Flux, migration: &Migration) -> (String, Color, IconName) {
+    pub(crate) fn status_text(flux: &Flux, migration: &Migration) -> (String, Color, IconName) {
         let status = migration.status(&flux.path);
         let progress = status.map_or(Progress::ToMigrate, |status| status.progress);
         let (mut text, color, icon) = match (progress, flux.kind) {
@@ -834,7 +950,7 @@ impl XdiMigrationView {
                     .style(ButtonStyle::Filled)
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
-                    .tooltip(Tooltip::text(blocked.unwrap_or_else(|| {
+                    .tooltip(Tooltip::text(blocked.clone().unwrap_or_else(|| {
                         "Write its flow, and what its mappings became, into the folder".to_owned()
                     })))
                     .on_click(cx.listener({
@@ -854,7 +970,9 @@ impl XdiMigrationView {
                 Button::new("xdi-write-again", "Write again…")
                     .label_size(LabelSize::Small)
                     .disabled(!writable)
-                    .when_some(blocked, |button, why| button.tooltip(Tooltip::text(why)))
+                    .when_some(blocked.clone(), |button, why| {
+                        button.tooltip(Tooltip::text(why))
+                    })
                     .on_click(cx.listener({
                         let path = flux.path.clone();
                         let name = flux.name.clone();
@@ -876,6 +994,25 @@ impl XdiMigrationView {
                     })),
             ),
         };
+        let waiting = self.agent_pending.as_deref() == Some(flux.path.as_str());
+        let agent_button = Button::new("xdi-prepare-with-agent", "Prepare with agent")
+            .start_icon(Icon::new(IconName::ZedAgent).size(IconSize::Small))
+            .label_size(LabelSize::Small)
+            .disabled(waiting || (migrated.is_none() && !writable))
+            .tooltip(Tooltip::text(if migrated.is_some() {
+                "Open the agent on what is left to do, following the dbt project's own guidance"
+                    .to_owned()
+            } else {
+                blocked.unwrap_or_else(|| {
+                    "Migrate it, then open the agent on what is left to do, following the dbt \
+                     project's own guidance"
+                        .to_owned()
+                })
+            }))
+            .on_click(cx.listener({
+                let path = flux.path.clone();
+                move |this, _, window, cx| this.prepare_with_agent(path.clone(), window, cx)
+            }));
         out.push(
             h_flex()
                 .pt_2()
@@ -887,6 +1024,7 @@ impl XdiMigrationView {
                         .child(Self::title(flux.name.clone())),
                 )
                 .children(button)
+                .child(agent_button)
                 .into_any_element(),
         );
         let place = match &flux.place {
@@ -1532,7 +1670,9 @@ impl Render for XdiMigrationView {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use el_import::migrate::Progress;
     use el_import::model::{Step, StepKind};
@@ -1572,9 +1712,9 @@ mod tests {
         let store = cx.new(|cx| XdiStore::new(project.clone(), cx));
         // Its look at the workspace, which holds no project, first.
         cx.run_until_parked();
-        let view = workspace.update_in(&mut cx, |_, _, cx| {
+        let view = workspace.update_in(&mut cx, |_, window, cx| {
             let workspace = cx.entity().downgrade();
-            cx.new(|cx| XdiMigrationView::new(workspace, store.clone(), cx))
+            cx.new(|cx| XdiMigrationView::new(workspace, store.clone(), window, cx))
         });
         let dir = tempfile::tempdir().unwrap();
         let (root, mut snapshot) = fixture_snapshot(dir.path());
@@ -1685,6 +1825,77 @@ mod tests {
             state.done.len(),
             setup.migration().plan.fluxes[0].todo.len()
         );
+    }
+
+    #[gpui::test]
+    async fn a_process_imported_into_a_dbt_project_reaches_the_agent(cx: &mut TestAppContext) {
+        let mut setup = setup(cx, |_| {}).await;
+        let dbt = setup.root.with_file_name("finance");
+        std::fs::create_dir_all(dbt.join("models/bronze")).unwrap();
+        std::fs::create_dir_all(dbt.join("models/silver")).unwrap();
+        std::fs::write(dbt.join("dbt_project.yml"), "name: finance\nprofile: finance\n").unwrap();
+        std::fs::write(dbt.join("AGENTS.md"), "Models go in bronze, silver, gold.\n").unwrap();
+        let prompts = Rc::new(RefCell::new(Vec::new()));
+        setup.cx.update(|_, cx| {
+            let prompts = prompts.clone();
+            cx.on_action(move |action: &zed_actions::agent::NewThreadWithPrompt, _| {
+                prompts.borrow_mut().push(action.clone());
+            });
+        });
+
+        let root = setup.root.clone();
+        setup.store.update(&mut setup.cx, |store, cx| {
+            store.import(root, dbt.clone(), cx)
+        });
+        setup.cx.run_until_parked();
+        assert_eq!(setup.migration().folder, dbt);
+
+        setup.view.update_in(&mut setup.cx, |view, window, cx| {
+            view.prepare_with_agent(RUN_ORDERS.to_owned(), window, cx)
+        });
+        setup.cx.run_until_parked();
+        let migration = setup.migration();
+        assert!(XdiMigrationView::is_migrated(&migration, RUN_ORDERS));
+        assert!(
+            std::fs::read_to_string(dbt.join("dbt_project.yml"))
+                .unwrap()
+                .starts_with("name: finance\nprofile: finance\n"),
+            "the project's own file is added to, never written over"
+        );
+
+        let seen = prompts.borrow().clone();
+        let [action] = seen.as_slice() else {
+            panic!("one thread for the agent, not {}", seen.len());
+        };
+        assert!(!action.auto_submit);
+        let prompt = &action.prompt;
+        assert!(prompt.contains("`AGENTS.md`"), "{prompt}");
+        assert!(prompt.contains("bronze, silver"), "{prompt}");
+        assert!(prompt.contains("## To do"), "{prompt}");
+        let flux = migration.plan.flux(RUN_ORDERS).unwrap();
+        let brief = import::brief_folder(flux);
+        let digests: Vec<_> = std::fs::read_dir(dbt.join(&brief))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(digests.len(), flux.mappings.len());
+        for digest in &digests {
+            assert!(prompt.contains(&format!("`{brief}/{digest}`")), "{prompt}");
+        }
+        // Columns are in the digests, read when needed, not in the brief.
+        let digest = std::fs::read_to_string(dbt.join(&brief).join(&digests[0])).unwrap();
+        assert!(digest.contains("## Writes") && digest.contains("## Reads"), "{digest}");
+        assert!(prompt.len() < 6_000, "{} characters: {prompt}", prompt.len());
+
+        // Asked again once migrated: the agent at once, nothing written again.
+        setup.view.update_in(&mut setup.cx, |view, window, cx| {
+            view.prepare_with_agent(RUN_ORDERS.to_owned(), window, cx)
+        });
+        setup.cx.run_until_parked();
+        assert_eq!(prompts.borrow().len(), 2);
+        let flows = setup.migration().state.as_ref().unwrap().flows.len();
+        assert_eq!(flows, 1);
     }
 
     #[gpui::test]

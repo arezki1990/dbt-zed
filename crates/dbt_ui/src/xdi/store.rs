@@ -179,6 +179,9 @@ pub struct XdiStore {
     migrating: bool,
     /// What the last migration did, or why it did not.
     last_result: Option<Result<String, String>>,
+    /// The project an import asked to show, once the workspace's folders
+    /// are looked at again: it was just added to them.
+    importing: Option<PathBuf>,
     _detect: Task<()>,
     _load: Task<()>,
     _debounce: Task<()>,
@@ -462,6 +465,7 @@ impl XdiStore {
             queue: VecDeque::new(),
             migrating: false,
             last_result: None,
+            importing: None,
             _detect: Task::ready(()),
             _load: Task::ready(()),
             _debounce: Task::ready(()),
@@ -584,13 +588,28 @@ impl XdiStore {
             this.update(cx, |this, cx| {
                 this.detected = true;
                 this.picked = picked;
-                this.folders = folders;
-                let keep = this
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| projects.contains(active));
+                // A folder chosen while they were looked at, not stored yet.
+                let chosen = std::mem::replace(&mut this.folders, folders);
+                for (project, folder) in chosen {
+                    this.folders.entry(project).or_insert(folder);
+                }
+                let importing = this
+                    .importing
+                    .take_if(|importing| projects.contains(importing));
+                let keep = importing.is_none()
+                    && this
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| projects.contains(active));
                 this.projects = projects;
-                if !keep {
+                if let Some(importing) = importing {
+                    this.active = Some(importing);
+                    this.snapshot = None;
+                    this.reader = None;
+                    this.migration = None;
+                    this.last_result = None;
+                    this.reload(cx);
+                } else if !keep {
                     this.active = this.projects.first().cloned();
                     this.snapshot = None;
                     this.reader = None;
@@ -818,6 +837,36 @@ impl XdiStore {
             self.reload(cx);
         } else {
             self.refresh_migration(cx);
+        }
+        cx.notify();
+    }
+
+    /// Shows `project`, migrating into `folder`: a process imported into a
+    /// dbt project. The project may not be among the workspace's yet,
+    /// when it was just added to it.
+    pub fn import(&mut self, project: PathBuf, folder: PathBuf, cx: &mut Context<Self>) {
+        let kvp = KeyValueStore::global(cx);
+        let key = folder_key(&project);
+        let value = folder.to_string_lossy().into_owned();
+        cx.background_spawn(async move { kvp.write_kvp(key, value).await.log_err() })
+            .detach();
+        let moved = self.folders.get(&project) != Some(&folder);
+        self.folders.insert(project.clone(), folder);
+        if moved {
+            self.pinned.remove(&project);
+        }
+        if self.projects.contains(&project) {
+            if self.active.as_ref() == Some(&project) {
+                if moved {
+                    self.last_result = None;
+                    self.reload(cx);
+                }
+            } else {
+                self.set_active(project, cx);
+            }
+        } else {
+            self.importing = Some(project);
+            self.detect(cx);
         }
         cx.notify();
     }

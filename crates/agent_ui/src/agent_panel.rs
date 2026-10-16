@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, ConflictContent, LogoutAgent, NewThreadWithPrompt, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -577,6 +577,33 @@ pub fn init(cx: &mut App) {
                             }),
                             true,
                             AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .register_action(|workspace, action: &NewThreadWithPrompt, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+                    let content_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        action.prompt.clone(),
+                    ))];
+
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: content_blocks,
+                                auto_submit: action.auto_submit,
+                            }),
+                            true,
+                            AgentThreadSource::AgentPanel,
                             window,
                             cx,
                         );
