@@ -226,6 +226,24 @@ impl XdiMigrationView {
         });
     }
 
+    /// The way to the import of a process into the dbt project open.
+    pub(crate) fn import_button(id: &'static str) -> Button {
+        Button::new(id, "Import from xDI…")
+            .start_icon(Icon::new(IconName::Download).size(IconSize::Small))
+            .label_size(LabelSize::Small)
+            .tooltip(|_window, cx| {
+                Tooltip::for_action(
+                    "Pick an xDI project and one of its processes, and migrate it into the dbt \
+                     project open",
+                    &super::ImportFromXdi,
+                    cx,
+                )
+            })
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(super::ImportFromXdi), cx);
+            })
+    }
+
     fn project_name(&self, cx: &App) -> String {
         self.store
             .read(cx)
@@ -1635,6 +1653,7 @@ impl Render for XdiMigrationView {
                             "Writing…"
                         }))
                     })
+                    .child(Self::import_button("xdi-migration-import"))
                     .child(
                         IconButton::new("xdi-migration-refresh", IconName::RotateCw)
                             .icon_size(IconSize::Small)
@@ -1649,7 +1668,7 @@ impl Render for XdiMigrationView {
             return body.child(Self::muted(if loading {
                 "Reading the project…"
             } else {
-                "No xDI project read yet."
+                "No xDI project read yet: import a process from one into the dbt project open."
             }));
         };
         let flux = self

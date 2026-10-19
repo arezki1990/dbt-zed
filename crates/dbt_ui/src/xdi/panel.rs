@@ -1104,11 +1104,15 @@ impl Render for XdiPanel {
                         .p_2()
                         .items_center()
                         .justify_center()
+                        .gap_2()
                         .child(
                             Label::new(message)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        ),
+                        )
+                        .when(detected && !has_project, |column| {
+                            column.child(super::XdiMigrationView::import_button("xdi-panel-import"))
+                        }),
                 );
             }
         }
