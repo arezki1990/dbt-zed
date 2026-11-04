@@ -99,16 +99,14 @@ enum Failure {
     Other,
 }
 
+/// Only the runner's own transport errors are shared by a group. A database
+/// that times out or refuses ("connecting to oracle timed out") is that
+/// connection's problem and is shown, in red, under it.
 fn classify_failure(message: &str) -> Failure {
     let lower = message.to_lowercase();
     if lower.contains("connector worker not found") {
         Failure::WorkerMissing
-    } else if lower.contains("remote unreachable")
-        || lower.contains("connection refused")
-        || lower.contains("error sending request")
-        || lower.contains("timed out")
-        || lower.contains("dns error")
-    {
+    } else if lower.contains("remote unreachable") || lower.contains("error sending request") {
         Failure::Unreachable
     } else {
         Failure::Other
@@ -3625,6 +3623,15 @@ mod tests {
                 == Failure::Unreachable
         );
         assert!(classify_failure("ORA-01017: invalid username/password") == Failure::Other);
+        assert!(
+            classify_failure(
+                "connecting to oracle timed out after 30s — is the listener reachable?"
+            ) == Failure::Other
+        );
+        assert!(
+            classify_failure("on remote x: postgres: connection refused (os error 61)")
+                == Failure::Other
+        );
     }
 
     #[test]
