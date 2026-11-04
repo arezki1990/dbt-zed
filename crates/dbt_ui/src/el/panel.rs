@@ -12,7 +12,7 @@ use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy,
     Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
 };
-use ui::{HighlightedLabel, SpinnerLabel, Tooltip, WithScrollbar as _, prelude::*};
+use ui::{HighlightedLabel, Indicator, SpinnerLabel, Tooltip, WithScrollbar as _, prelude::*};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -67,19 +67,100 @@ pub struct ElPanel {
     tables_epoch: u64,
     _list_tasks: std::collections::HashMap<SharedString, Task<()>>,
     scroll: UniformListScrollHandle,
-    scroll_lower: UniformListScrollHandle,
-    scroll_remotes: UniformListScrollHandle,
-    /// Heights of the Pipelines and Connections sections (Remotes takes
-    /// the rest); the two splitters drag them.
-    split: f32,
-    split_connections: f32,
-    /// (which splitter, pointer y at drag start, split at drag start).
-    split_drag: Option<(usize, f32, f32)>,
+    /// The health card was folded away; the header keeps a count.
+    health_hidden: bool,
+    /// Runner groups the user folded in the Connections section.
+    collapsed_groups: std::collections::HashSet<SharedString>,
+    /// Each connection's last listing that came back, kept so a runner
+    /// that stops answering still leaves its tables browsable.
+    last_good: std::collections::HashMap<SharedString, LastListing>,
+    /// Connections shown from `last_good` because the latest listing
+    /// failed: the failure and when the shown listing was taken.
+    stale: std::collections::HashMap<SharedString, (SharedString, std::time::SystemTime)>,
+    /// No ellode-worker binary where the IDE looks for one.
+    worker_missing: bool,
     _refresh: Task<()>,
 }
 
+struct LastListing {
+    tables: Vec<(String, String)>,
+    haystack: Vec<String>,
+    at: std::time::SystemTime,
+}
+
+/// Why a listing failed, as far as the panel can act on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// No connector worker on this machine.
+    WorkerMissing,
+    /// The runner the connection lists through did not answer.
+    Unreachable,
+    /// Anything the database or the runner said.
+    Other,
+}
+
+fn classify_failure(message: &str) -> Failure {
+    let lower = message.to_lowercase();
+    if lower.contains("connector worker not found") {
+        Failure::WorkerMissing
+    } else if lower.contains("remote unreachable")
+        || lower.contains("connection refused")
+        || lower.contains("error sending request")
+        || lower.contains("timed out")
+        || lower.contains("dns error")
+    {
+        Failure::Unreachable
+    } else {
+        Failure::Other
+    }
+}
+
+/// How old a cached listing is, in words: "just now", "12 min ago".
+fn age_text(at: std::time::SystemTime) -> String {
+    let Ok(age) = std::time::SystemTime::now().duration_since(at) else {
+        return "just now".into();
+    };
+    let minutes = age.as_secs() / 60;
+    match minutes {
+        0 => "just now".into(),
+        1..=59 => format!("{minutes} min ago"),
+        60..=1439 => format!("{} h ago", minutes / 60),
+        _ => format!("{} days ago", minutes / 1440),
+    }
+}
+
+/// One problem the health card lists, with the buttons that fix it.
+struct Issue {
+    color: Color,
+    text: SharedString,
+    detail: Option<SharedString>,
+    actions: Vec<IssueAction>,
+}
+
+#[derive(Clone)]
+enum IssueAction {
+    OpenEnv,
+    OpenConnectionsYaml,
+    /// List again every unfolded connection behind this runner.
+    Retry(SharedString),
+    EditRemote(SharedString),
+    Copy(SharedString),
+}
+
+impl IssueAction {
+    fn label(&self) -> &'static str {
+        match self {
+            IssueAction::OpenEnv => "Open .env",
+            IssueAction::OpenConnectionsYaml => "Edit connections.yml",
+            IssueAction::Retry(_) => "Retry",
+            IssueAction::EditRemote(_) => "Edit runner",
+            IssueAction::Copy(_) => "Copy error",
+        }
+    }
+}
+
 const PROFILE_HINT: &str = "Which environment's connections this checkout uses; pipelines stay \
-the same. Your choice is saved in el/.zdbt/profile for you only — connections.yml does not \
+the same. Your choice is saved for you only, in el/.zdbt/profile; connections.yml does not \
 change.";
 
 /// Tables per page under an unfolded connection.
@@ -137,7 +218,7 @@ fn lists_by_level(kind: &str, workspace: &str) -> bool {
 
 /// Tree indentation: the connection row sits at depth 0.
 fn indent(depth: usize) -> Pixels {
-    px(8. + 16. * depth as f32)
+    px(16. + 16. * depth as f32)
 }
 
 struct TableBrowser {
@@ -172,8 +253,13 @@ enum Row {
     /// Section headers: collapse chevron, label, and the "+" action.
     PipelinesHeader,
     ConnectionsHeader,
-    RemotesHeader,
-    Remote(SharedString, SharedString),
+    /// Where a set of connections runs: this Mac or a runner in
+    /// el/remotes.yml, with that runner's state.
+    Group {
+        workspace: SharedString,
+        host: Option<SharedString>,
+        status: GroupStatus,
+    },
     Pipeline(PathBuf),
     Connection(SharedString, SharedString, SharedString),
     /// A Snowflake database in a connection's tree.
@@ -199,7 +285,6 @@ enum Row {
         table: String,
         depth: usize,
     },
-    ConnNote(SharedString, Color),
     /// A level of a tree that is loading, empty or failed; loading spins,
     /// since a 10g dictionary or a Snowflake account can take seconds.
     TreeNote {
@@ -220,17 +305,28 @@ enum Row {
         searching: bool,
         depth: usize,
     },
-    /// The built-in local runner (`localhost`), with its start/stop control.
-    LocalRunner,
-    /// A note about the local runner; the tooltip carries Docker's own words.
-    RunnerNote(SharedString, Color, Option<SharedString>),
-    /// "Set X in .env to connect" under a connection or server whose
-    /// `${VAR}` references are unset — click opens .env.
-    EnvHint(Vec<String>),
-    /// The Remotes empty state: its tooltip says what a server is.
-    RemotesEmpty,
-    Initialize,
+    /// An empty section: what goes here, and the button that adds it.
+    Empty(SharedString, EmptyAction),
     Note(SharedString),
+}
+
+#[derive(Clone, PartialEq)]
+enum GroupStatus {
+    /// Nothing known against it.
+    Fine,
+    /// This Mac has no connector worker.
+    WorkerMissing,
+    /// The runner did not answer; `cached` when tables are still shown.
+    Offline { cached: bool },
+    /// Its token variable is not set here.
+    NeedsToken(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EmptyAction {
+    Initialize,
+    NewPipeline,
+    AddConnection,
 }
 
 /// The pill that follows the cursor while a table is dragged.
@@ -305,11 +401,11 @@ impl ElPanel {
             tables_epoch: 0,
             _list_tasks: Default::default(),
             scroll: UniformListScrollHandle::new(),
-            scroll_lower: UniformListScrollHandle::new(),
-            scroll_remotes: UniformListScrollHandle::new(),
-            split: 200.,
-            split_connections: 220.,
-            split_drag: None,
+            health_hidden: false,
+            collapsed_groups: Default::default(),
+            last_good: Default::default(),
+            stale: Default::default(),
+            worker_missing: false,
             _refresh: Task::ready(()),
         })
     }
@@ -424,6 +520,11 @@ impl ElPanel {
                     })
                     .collect();
                 self.connections_error = None;
+                self.worker_missing = self
+                    .connections
+                    .iter()
+                    .any(|(_, _, workspace)| workspace.as_ref() == "local")
+                    && super::find_worker().is_none();
             }
             Err(el_engine::spec::SpecError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
@@ -463,21 +564,24 @@ impl ElPanel {
         self.expanded.clear();
         self.browsers.clear();
         self.trees.clear();
+        // Another environment's listings are not a cache of this one's.
+        self.last_good.clear();
+        self.stale.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
         // The selection file is one voice among three — say what actually
         // happened instead of assuming the write took effect.
         let effective = self.profile.clone();
         let message = if effective.as_ref() == Some(&name) {
-            format!("Profile: {name}")
+            format!("Environment: {name}")
         } else if std::env::var("ELLODE_PROFILE").is_ok() {
             format!(
-                "Saved, but ELLODE_PROFILE overrides the selection — this window                  still runs as {}.",
+                "Saved, but ELLODE_PROFILE overrides the selection, so this window still runs as {}.",
                 effective.as_deref().unwrap_or("the base connections")
             )
         } else {
             format!(
-                "Saved, but the active profile is {} — check connections.yml.",
+                "Saved, but the active environment is {} — check connections.yml.",
                 effective.as_deref().unwrap_or("none")
             )
         };
@@ -510,14 +614,18 @@ impl ElPanel {
         self.pipelines.is_empty() && self.connections.is_empty() && self.remotes.is_empty()
     }
 
-    /// The upper list: pipelines.
-    fn upper_rows(&self) -> Vec<Row> {
+    /// The whole list: Pipelines, then Connections grouped by where they
+    /// run. Problems are not rows: the health card above says them once.
+    fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         if self.is_empty_project() {
             rows.push(Row::Note(
-                "Extract-load pipelines, defined as YAML in el/.".into(),
+                "Pipelines and connections live as YAML in el/.".into(),
             ));
-            rows.push(Row::Initialize);
+            rows.push(Row::Empty(
+                "Start an EL workspace in this folder.".into(),
+                EmptyAction::Initialize,
+            ));
             return rows;
         }
         rows.push(Row::PipelinesHeader);
@@ -526,57 +634,163 @@ impl ElPanel {
                 rows.push(Row::Pipeline(path.clone()));
             }
             if self.pipelines.is_empty() {
-                rows.push(Row::ConnNote(
-                    "No pipelines yet — press + to start one.".into(),
-                    Color::Muted,
-                ));
-                if self
+                let can_drag = self
                     .connections
                     .iter()
-                    .any(|(_, kind, _)| super::extractable(kind))
-                {
-                    rows.push(Row::ConnNote(
-                        "Then drag a table from Connections onto it.".into(),
-                        Color::Muted,
-                    ));
+                    .any(|(_, kind, _)| super::extractable(kind));
+                rows.push(Row::Empty(
+                    if can_drag {
+                        "No pipelines. Create one, then drag tables onto it."
+                    } else {
+                        "No pipelines yet."
+                    }
+                    .into(),
+                    EmptyAction::NewPipeline,
+                ));
+            }
+        }
+        rows.push(Row::ConnectionsHeader);
+        if self.collapsed.contains("connections") {
+            return rows;
+        }
+        if self.connections_error.is_some() {
+            rows.push(Row::Note("Fix connections.yml to see them here.".into()));
+            return rows;
+        }
+        if self.connections.is_empty() && self.remotes.is_empty() {
+            rows.push(Row::Empty(
+                "No connections yet.".into(),
+                EmptyAction::AddConnection,
+            ));
+            return rows;
+        }
+        for workspace in self.workspaces() {
+            rows.push(Row::Group {
+                workspace: workspace.clone(),
+                host: self.remote_host(&workspace),
+                status: self.group_status(&workspace),
+            });
+            if self.collapsed_groups.contains(&workspace) {
+                continue;
+            }
+            let mut any = false;
+            for (name, kind, owner) in &self.connections {
+                if *owner != workspace {
+                    continue;
                 }
+                any = true;
+                rows.push(Row::Connection(name.clone(), kind.clone(), owner.clone()));
+                if self.expanded.contains(name) {
+                    self.push_catalog_rows(&mut rows, name, kind, owner);
+                }
+            }
+            if !any {
+                rows.push(Row::Note(
+                    if self.console_remotes.contains(&workspace) {
+                        "No connections here yet. Pull them from the console."
+                    } else {
+                        "No connections run here."
+                    }
+                    .into(),
+                ));
             }
         }
         rows
     }
 
-    /// The middle list: connections with their explorer trees.
-    fn connection_rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        if let Some(error) = &self.connections_error {
-            rows.push(Row::ConnectionsHeader);
-            if !self.collapsed.contains("connections") {
-                rows.push(Row::ConnNote(error.clone(), Color::Error));
-            }
-            return rows;
+    /// The groups in order: this Mac when a connection runs on it, then
+    /// each runner in el/remotes.yml, then any workspace a connection names
+    /// that remotes.yml does not declare.
+    fn workspaces(&self) -> Vec<SharedString> {
+        let mut workspaces: Vec<SharedString> = Vec::new();
+        if self
+            .connections
+            .iter()
+            .any(|(_, _, workspace)| workspace.as_ref() == "local")
+        {
+            workspaces.push("local".into());
         }
-        if !self.collapsed.contains("connections") {
-            rows.push(Row::ConnectionsHeader);
-            for (name, kind, workspace) in &self.connections {
-                rows.push(Row::Connection(
-                    name.clone(),
-                    kind.clone(),
-                    workspace.clone(),
-                ));
-                if let Some(missing) = self.missing_env.get(name) {
-                    if !self.has_listed(name) {
-                        rows.push(Row::EnvHint(missing.clone()));
-                    }
-                }
-                if !self.expanded.contains(name) {
-                    continue;
-                }
-                self.push_catalog_rows(&mut rows, name, kind, workspace);
+        for (name, _) in &self.remotes {
+            // The local runner has its own line at the bottom; it is a
+            // group only when connections run on it.
+            let runner = *name == self.runner.remote_name;
+            if !workspaces.contains(name)
+                && (!runner || self.connections.iter().any(|(_, _, w)| w == name))
+            {
+                workspaces.push(name.clone());
             }
-        } else {
-            rows.push(Row::ConnectionsHeader);
         }
-        rows
+        for (_, _, workspace) in &self.connections {
+            if !workspaces.contains(workspace) {
+                workspaces.push(workspace.clone());
+            }
+        }
+        workspaces
+    }
+
+    fn remote_host(&self, workspace: &SharedString) -> Option<SharedString> {
+        self.remotes
+            .iter()
+            .find(|(name, _)| name == workspace)
+            .map(|(_, host)| host.clone())
+    }
+
+    /// A group's state, from what its connections' listings said.
+    fn group_status(&self, workspace: &SharedString) -> GroupStatus {
+        if workspace.as_ref() == "local" {
+            if self.worker_missing
+                || self.group_failure(workspace).map(|(failure, _)| failure)
+                    == Some(Failure::WorkerMissing)
+            {
+                return GroupStatus::WorkerMissing;
+            }
+            return GroupStatus::Fine;
+        }
+        if let Some(var) = self.remotes_missing_token.get(workspace) {
+            return GroupStatus::NeedsToken(var.clone());
+        }
+        let cached = self
+            .connections
+            .iter()
+            .any(|(name, _, owner)| owner == workspace && self.stale.contains_key(name));
+        match self.group_failure(workspace) {
+            Some((Failure::Unreachable, _)) => GroupStatus::Offline { cached },
+            _ if cached => GroupStatus::Offline { cached },
+            _ => GroupStatus::Fine,
+        }
+    }
+
+    /// The failure a group's connections share — the runner's or the
+    /// machine's, never one database's own — with its message.
+    fn group_failure(&self, workspace: &SharedString) -> Option<(Failure, SharedString)> {
+        self.connections
+            .iter()
+            .filter(|(_, _, owner)| owner == workspace)
+            .filter_map(|(name, _, _)| self.failure_of(name))
+            .map(|message| (classify_failure(&message), message))
+            .find(|(failure, _)| *failure != Failure::Other)
+    }
+
+    /// The message of a connection's latest failed listing, at any level.
+    fn failure_of(&self, name: &SharedString) -> Option<SharedString> {
+        if let Some(TablesState::Failed(message)) = self.tables.get(name) {
+            return Some(message.clone());
+        }
+        if let Some((message, _)) = self.stale.get(name) {
+            return Some(message.clone());
+        }
+        let tree = self.trees.get(name)?;
+        if let Some(Listing::Failed(message)) = &tree.databases {
+            return Some(message.clone());
+        }
+        let failed = |listing: &Listing<Vec<String>>| match listing {
+            Listing::Failed(message) => Some(message.clone()),
+            _ => None,
+        };
+        tree.schemas
+            .values()
+            .find_map(failed)
+            .or_else(|| tree.tables.values().find_map(failed))
     }
 
     /// An unfolded connection: its search field, then the tables the search
@@ -913,46 +1127,153 @@ impl ElPanel {
         }
     }
 
-    /// The built-in runner, or what stands in its way. Only a licensed
-    /// machine gets the row itself; everyone else is told what to do next.
-    fn runner_rows(&self) -> Vec<Row> {
-        let note = |text: &str, color: Color, detail: &String| {
-            Row::RunnerNote(text.to_owned().into(), color, Some(detail.clone().into()))
-        };
-        match &self.runner.access {
-            None => vec![Row::RunnerNote(
-                "Checking the local runner licence…".into(),
-                Color::Muted,
-                None,
-            )],
-            Some(Access::Licensed) => {
-                let mut rows = vec![Row::LocalRunner];
-                if let Some(error) = &self.runner.error {
-                    rows.push(Row::ConnNote(error.clone(), Color::Error));
-                }
-                rows
-            }
-            Some(Access::Unlicensed(detail)) => vec![note(
-                "The local runner needs a licence — ask your provider for access.",
-                Color::Warning,
-                detail,
-            )],
-            Some(Access::SignIn(detail)) => vec![note(
-                "Sign in to the runner's registry and refresh, or ask your provider for a licence.",
-                Color::Warning,
-                detail,
-            )],
-            Some(Access::NoDocker(detail)) => vec![note(
-                "Start Docker and refresh to run pipelines on this machine.",
-                Color::Muted,
-                detail,
-            )],
-            Some(Access::Unavailable(detail)) => vec![note(
-                "The local runner can't be checked right now.",
-                Color::Muted,
-                detail,
-            )],
+    /// What blocks work right now, each said once with its fix. The tree
+    /// only carries a dot or a badge for these.
+    fn issues(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if let Some(error) = &self.connections_error {
+            issues.push(Issue {
+                color: Color::Error,
+                text: "connections.yml can't be read.".into(),
+                detail: Some(error.clone()),
+                actions: vec![IssueAction::OpenConnectionsYaml],
+            });
         }
+        for workspace in self.workspaces() {
+            let declared = self.remotes.iter().any(|(name, _)| *name == workspace);
+            match self.group_status(&workspace) {
+                GroupStatus::Fine => {}
+                GroupStatus::WorkerMissing => issues.push(Issue {
+                    color: Color::Error,
+                    text: "Connections on this Mac can't be listed: the connector worker \
+                           isn't installed."
+                        .into(),
+                    detail: Some(super::WORKER_MISSING.into()),
+                    actions: vec![
+                        IssueAction::OpenConnectionsYaml,
+                        IssueAction::Copy(super::WORKER_MISSING.into()),
+                    ],
+                }),
+                GroupStatus::Offline { cached } => {
+                    let error = self.group_failure(&workspace).map(|(_, message)| message);
+                    let mut actions = vec![IssueAction::Retry(workspace.clone())];
+                    if declared {
+                        actions.push(IssueAction::EditRemote(workspace.clone()));
+                    }
+                    if let Some(error) = &error {
+                        actions.push(IssueAction::Copy(error.clone()));
+                    }
+                    let place = self
+                        .remote_host(&workspace)
+                        .map(|host| format!("{workspace} ({host})"))
+                        .unwrap_or_else(|| workspace.to_string());
+                    issues.push(Issue {
+                        color: Color::Warning,
+                        text: if cached {
+                            format!("{place} isn't answering. Showing its last listing.")
+                        } else {
+                            format!("{place} isn't answering.")
+                        }
+                        .into(),
+                        detail: error,
+                        actions,
+                    });
+                }
+                GroupStatus::NeedsToken(var) => {
+                    let mut actions = vec![IssueAction::OpenEnv];
+                    if declared {
+                        actions.push(IssueAction::EditRemote(workspace.clone()));
+                    }
+                    issues.push(Issue {
+                        color: Color::Warning,
+                        text: format!("{workspace} needs {var} in .env.").into(),
+                        detail: Some(
+                            "remotes.yml names the token; its value lives in .env on this \
+                             machine."
+                                .into(),
+                        ),
+                        actions,
+                    });
+                }
+            }
+        }
+        let mut vars: Vec<String> = Vec::new();
+        let mut count = 0;
+        for (name, missing) in &self.missing_env {
+            if self.has_listed(name) {
+                continue;
+            }
+            count += 1;
+            for var in missing {
+                if !vars.contains(var) {
+                    vars.push(var.clone());
+                }
+            }
+        }
+        if count > 0 {
+            vars.sort();
+            issues.push(Issue {
+                color: Color::Warning,
+                text: format!(
+                    "{} need {} in .env.",
+                    if count == 1 {
+                        "1 connection".to_owned()
+                    } else {
+                        format!("{count} connections")
+                    },
+                    vars.join(", ")
+                )
+                .into(),
+                detail: Some(
+                    "connections.yml names these variables; their values stay in .env on \
+                     this machine."
+                        .into(),
+                ),
+                actions: vec![IssueAction::OpenEnv],
+            });
+        }
+        issues
+    }
+
+    fn run_issue_action(
+        &mut self,
+        action: &IssueAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            IssueAction::OpenEnv => self.open_env_file(window, cx),
+            IssueAction::OpenConnectionsYaml => self.open_connections_yaml(window, cx),
+            IssueAction::Retry(workspace) => self.retry_workspace(workspace.clone(), cx),
+            IssueAction::EditRemote(name) => self.edit_remote(Some(name.clone()), window, cx),
+            IssueAction::Copy(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
+            }
+        }
+    }
+
+    /// Lists again every connection of a group that was listed or tried.
+    fn retry_workspace(&mut self, workspace: SharedString, cx: &mut Context<Self>) {
+        let names: Vec<SharedString> = self
+            .connections
+            .iter()
+            .filter(|(name, _, owner)| {
+                *owner == workspace
+                    && (self.expanded.contains(name)
+                        || self.tables.contains_key(name)
+                        || self.trees.contains_key(name))
+            })
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        for name in names {
+            self.refresh_connection(name, cx);
+        }
+        if workspace == self.runner.remote_name {
+            if let Some(root) = self.root.clone() {
+                self.check_runner(&root, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Asks the registry whether this machine may run the EL image, and
@@ -1038,34 +1359,6 @@ impl ElPanel {
     }
 
     /// The bottom list: declared servers.
-    fn remote_rows(&self) -> Vec<Row> {
-        let mut rows = Vec::new();
-        rows.push(Row::RemotesHeader);
-        if self.collapsed.contains("remotes") {
-            return rows;
-        }
-        let runner_offered = matches!(self.runner.access, Some(Access::Licensed));
-        rows.extend(self.runner_rows());
-        if self.remotes.is_empty() && !runner_offered {
-            rows.push(Row::RemotesEmpty);
-            rows.push(Row::ConnNote(
-                "A server runs deployed pipelines on a schedule.".into(),
-                Color::Muted,
-            ));
-        }
-        for (name, host) in &self.remotes {
-            // The runner row already stands for `localhost`.
-            if runner_offered && *name == self.runner.remote_name {
-                continue;
-            }
-            rows.push(Row::Remote(name.clone(), host.clone()));
-            if let Some(var) = self.remotes_missing_token.get(name) {
-                rows.push(Row::EnvHint(vec![var.clone()]));
-            }
-        }
-        rows
-    }
-
     fn toggle_section(&mut self, key: &'static str, cx: &mut Context<Self>) {
         if !self.collapsed.remove(key) {
             self.collapsed.insert(key);
@@ -1281,9 +1574,35 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                     if this.tables_epoch != epoch {
                         return; // a different environment answered
                     }
+                    // A listing that fails after one came back keeps the
+                    // old tables on screen, marked cached, so an offline
+                    // runner does not empty the tree.
                     let state = match result {
-                        Ok((tables, haystack)) => TablesState::Loaded { tables, haystack },
-                        Err(error) => TablesState::Failed(format!("{error:#}").into()),
+                        Ok((tables, haystack)) => {
+                            this.stale.remove(&name);
+                            this.last_good.insert(
+                                name.clone(),
+                                LastListing {
+                                    tables: tables.clone(),
+                                    haystack: haystack.clone(),
+                                    at: std::time::SystemTime::now(),
+                                },
+                            );
+                            TablesState::Loaded { tables, haystack }
+                        }
+                        Err(error) => {
+                            let message: SharedString = format!("{error:#}").into();
+                            match this.last_good.get(&name) {
+                                Some(last) => {
+                                    this.stale.insert(name.clone(), (message, last.at));
+                                    TablesState::Loaded {
+                                        tables: last.tables.clone(),
+                                        haystack: last.haystack.clone(),
+                                    }
+                                }
+                                None => TablesState::Failed(message),
+                            }
+                        }
                     };
                     this.tables.insert(name.clone(), state);
                     // A search typed before a Refresh applies to the new list.
@@ -1734,7 +2053,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
                     .insert((database.clone(), schema.clone()), page);
             }
         }
-        let rows = self.connection_rows();
+        let rows = self.rows();
         let anchor = rows.iter().position(|row| match (scope, row) {
             (
                 PagerScope::Schema(database, schema),
@@ -1749,7 +2068,7 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
             _ => false,
         });
         if let Some(ix) = anchor {
-            self.scroll_lower.scroll_to_item(ix, ScrollStrategy::Top);
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
         }
         cx.notify();
     }
@@ -1761,6 +2080,9 @@ el/remotes.yml, one NAME=value per line.\n# Never commit this file.\n";
         self.expanded.clear();
         self.browsers.clear();
         self.trees.clear();
+        // An edited connection lists afresh; its old tables are no cache.
+        self.last_good.clear();
+        self.stale.clear();
         self.tables_epoch += 1;
         self.refresh(cx);
     }
@@ -1949,233 +2271,85 @@ impl Panel for ElPanel {
 impl Render for ElPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let make_list = |id: &'static str,
-                         rows: Vec<Row>,
-                         scroll: &UniformListScrollHandle,
-                         cx: &mut Context<Self>| {
-            let rows = std::sync::Arc::new(rows);
-            let count = rows.len();
-            let entity = cx.entity();
-            gpui::uniform_list(id, count, {
-                move |range, _window, cx| {
-                    entity.update(cx, |this, cx| {
-                        range
-                            .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, ix, cx)))
-                            .collect::<Vec<_>>()
-                    })
-                }
-            })
-            .track_scroll(scroll)
-        };
-        let empty = self.is_empty_project();
-        let upper = make_list("el-panel-upper", self.upper_rows(), &self.scroll, cx);
-        let middle = make_list(
-            "el-panel-connections",
-            self.connection_rows(),
-            &self.scroll_lower,
-            cx,
-        );
-        let bottom = make_list(
-            "el-panel-remotes",
-            self.remote_rows(),
-            &self.scroll_remotes,
-            cx,
-        );
-        let dragging = self.split_drag.is_some();
-        const HEADER_ONLY: f32 = 26.;
-        // A 1px line with a 5px grab area — drag to trade space.
-        let splitter = |which: usize, dragging: bool, cx: &mut Context<Self>| {
-            div()
-                .id(("el-panel-split", which))
-                .w_full()
-                .h(px(5.))
-                .flex_shrink_0()
-                .cursor(gpui::CursorStyle::ResizeRow)
-                .border_t_1()
-                .border_color(if dragging {
-                    colors.border_focused
-                } else {
-                    colors.border
+        let rows = std::sync::Arc::new(self.rows());
+        let count = rows.len();
+        let entity = cx.entity();
+        let list = gpui::uniform_list("el-panel-list", count, {
+            move |range, _window, cx| {
+                entity.update(cx, |this, cx| {
+                    range
+                        .filter_map(|ix| rows.get(ix).map(|row| this.render_row(row, ix, cx)))
+                        .collect::<Vec<_>>()
                 })
-                .hover(|style| style.border_color(colors.border_focused))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        let start = if which == 0 {
-                            this.split
-                        } else {
-                            this.split_connections
-                        };
-                        this.split_drag = Some((which, f32::from(event.position.y), start));
-                        cx.notify();
-                    }),
-                )
-        };
-        let pipelines_h = if self.collapsed.contains("pipelines") {
-            HEADER_ONLY
-        } else {
-            self.split
-        };
-        let connections_h = if self.collapsed.contains("connections") {
-            HEADER_ONLY
-        } else {
-            self.split_connections
-        };
-        let list: gpui::AnyElement = if empty {
-            upper.flex_1().into_any_element()
-        } else {
-            v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    div()
-                        .h(px(pipelines_h))
-                        .flex_shrink_0()
-                        .child(upper.size_full())
-                        .custom_scrollbars(super::scrollbar(&self.scroll), window, cx),
-                )
-                .child(splitter(0, dragging, cx))
-                .child(
-                    div()
-                        .h(px(connections_h))
-                        .flex_shrink_0()
-                        .child(middle.size_full())
-                        .custom_scrollbars(super::scrollbar(&self.scroll_lower), window, cx),
-                )
-                .child(splitter(1, dragging, cx))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(bottom.size_full())
-                        .custom_scrollbars(super::scrollbar(&self.scroll_remotes), window, cx),
-                )
-                .into_any_element()
-        };
+            }
+        })
+        .track_scroll(&self.scroll);
+        let issues = self.issues();
+        let show_footer = self.root.is_some() && !self.is_empty_project();
 
         v_flex()
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("ElPanel")
             .bg(colors.panel_background)
-            .when(dragging, |flex| {
-                flex.on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    if let Some((which, start_y, start_split)) = this.split_drag {
-                        let next =
-                            (start_split + f32::from(event.position.y) - start_y).clamp(60., 900.);
-                        if which == 0 {
-                            this.split = next;
-                        } else {
-                            this.split_connections = next;
-                        }
-                        cx.notify();
-                    }
-                }))
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.split_drag = None;
-                        cx.notify();
-                    }),
-                )
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.split_drag = None;
-                        cx.notify();
-                    }),
-                )
-            })
-            .child(
-                h_flex()
-                    .w_full()
-                    .p_1()
-                    .gap_1()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .child(Label::new("EL").size(LabelSize::Default))
-                    .child(div().flex_1())
-                    .children(self.profile.clone().map(|profile| {
-                        div()
-                            .id("el-profile-badge")
-                            .tooltip(|_, cx| {
-                                Tooltip::with_meta("Active profile", None, PROFILE_HINT, cx)
-                            })
-                            .child(
-                                Label::new(profile)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Accent),
-                            )
-                    }))
-                    .child(
-                        IconButton::new("el-panel-refresh", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Refresh"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                // Explicit refresh also invalidates cached
-                                // table listings.
-                                this.tables.clear();
-                                for tree in this.trees.values_mut() {
-                                    tree.databases = None;
-                                    tree.schemas.clear();
-                                    tree.tables.clear();
-                                }
-                                this.refresh(cx);
-                                let expanded = this.expanded.clone();
-                                this.invalidate_then(
-                                    "\u{1}refresh".into(),
-                                    super::listing_cache::Scope::Project,
-                                    cx,
-                                    move |this, cx| {
-                                        for name in expanded {
-                                            if this.connection_lists_by_level(&name) {
-                                                this.load_databases(name, cx);
-                                            } else {
-                                                this.load_tables(name, cx);
-                                            }
-                                        }
-                                    },
-                                );
-                                if let Some(root) = this.root.clone() {
-                                    this.check_runner(&root, cx);
-                                }
-                            })),
-                    ),
+            .child(self.render_header(&issues, cx))
+            .children(
+                (!issues.is_empty() && !self.health_hidden)
+                    .then(|| self.render_health(&issues, cx)),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list.size_full())
+                    .custom_scrollbars(super::scrollbar(&self.scroll), window, cx),
+            )
+            .children(show_footer.then(|| self.render_runner_footer(cx)))
+    }
+}
+
+impl ElPanel {
+    /// "EL", the environment with its health dot, and the panel's own
+    /// actions. One line: the environment is named once.
+    fn render_header(&self, issues: &[Issue], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let health = if issues.iter().any(|issue| issue.color == Color::Error) {
+            Color::Error
+        } else if issues.is_empty() {
+            Color::Success
+        } else {
+            Color::Warning
+        };
+        let panel = cx.entity().downgrade();
+        h_flex()
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(Label::new("EL").size(LabelSize::Default))
             .children((!self.profiles.is_empty()).then(|| {
-                // The environment switcher: same pipelines, different
-                // connections. One dropdown, the active profile as its
-                // face — the panel's single accent.
                 let profiles = self.profiles.clone();
                 let active = self.profile.clone();
-                let panel = cx.entity().downgrade();
+                let panel = panel.clone();
                 h_flex()
-                    .w_full()
-                    .px_2()
-                    .py_1()
                     .gap_1()
                     .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
+                    .child(Indicator::dot().color(health))
                     .child(
-                        Label::new("profile")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        ui::PopoverMenu::new("el-profile-select")
+                        ui::PopoverMenu::new("el-environment-select")
                             .trigger(
                                 Button::new(
-                                    "el-profile-trigger",
+                                    "el-environment-trigger",
                                     active.clone().unwrap_or_else(|| "choose…".into()),
                                 )
-                                .label_size(LabelSize::XSmall)
-                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Subtle)
                                 .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                                 .tooltip(|_, cx| {
-                                    Tooltip::with_meta("Profile", None, PROFILE_HINT, cx)
+                                    Tooltip::with_meta("Environment", None, PROFILE_HINT, cx)
                                 }),
                             )
                             .menu(move |window, cx| {
@@ -2183,13 +2357,12 @@ impl Render for ElPanel {
                                 let profiles = profiles.clone();
                                 let active = active.clone();
                                 Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    menu = menu.header("Profiles in connections.yml");
+                                    menu = menu.header("Environments in connections.yml");
                                     for name in profiles {
                                         let panel = panel.clone();
                                         let selected = active.as_ref() == Some(&name);
-                                        let label = name.clone();
                                         menu = menu.toggleable_entry(
-                                            label,
+                                            name.clone(),
                                             selected,
                                             ui::IconPosition::Start,
                                             None,
@@ -2217,7 +2390,400 @@ impl Render for ElPanel {
                             }),
                     )
             }))
-            .child(list)
+            .child(div().flex_1())
+            .when(self.health_hidden && !issues.is_empty(), |row| {
+                let count = issues.len();
+                row.child(
+                    Button::new(
+                        "el-health-show",
+                        if count == 1 {
+                            "1 issue".to_owned()
+                        } else {
+                            format!("{count} issues")
+                        },
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .color(health)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text("Show what needs fixing"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.health_hidden = false;
+                        cx.notify();
+                    })),
+                )
+            })
+            .child(
+                IconButton::new("el-panel-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Refresh everything"))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_all(cx))),
+            )
+            .child(
+                ui::PopoverMenu::new("el-panel-more")
+                    .trigger(
+                        IconButton::new("el-panel-more-trigger", IconName::Ellipsis)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("More")),
+                    )
+                    .menu({
+                        let consoles: Vec<SharedString> = self
+                            .remotes
+                            .iter()
+                            .filter(|(name, _)| self.console_remotes.contains(name))
+                            .map(|(name, _)| name.clone())
+                            .collect();
+                        let has_root = self.root.is_some();
+                        move |window, cx| {
+                            let panel = panel.clone();
+                            let consoles = consoles.clone();
+                            Some(ui::ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                if !has_root {
+                                    return menu.header("Open a project folder first");
+                                }
+                                let on = |panel: WeakEntity<ElPanel>,
+                                          act: fn(&mut ElPanel, &mut Window, &mut Context<ElPanel>)| {
+                                    move |window: &mut Window, cx: &mut App| {
+                                        panel.update(cx, |this, cx| act(this, window, cx)).ok();
+                                    }
+                                };
+                                menu = menu
+                                    .entry(
+                                        "New pipeline",
+                                        None,
+                                        on(panel.clone(), |this, window, cx| {
+                                            this.new_pipeline(window, cx)
+                                        }),
+                                    )
+                                    .entry(
+                                        "Add connection",
+                                        None,
+                                        on(panel.clone(), |this, window, cx| {
+                                            this.edit_connection(None, window, cx)
+                                        }),
+                                    )
+                                    .entry(
+                                        "Add runner",
+                                        None,
+                                        on(panel.clone(), |this, window, cx| {
+                                            this.edit_remote(None, window, cx)
+                                        }),
+                                    );
+                                for name in consoles {
+                                    let panel = panel.clone();
+                                    menu = menu.entry(
+                                        format!("Pull connections from {name}"),
+                                        None,
+                                        move |window, cx| {
+                                            panel
+                                                .update(cx, |this, cx| {
+                                                    this.pull_connections(name.clone(), window, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    );
+                                }
+                                menu.separator()
+                                    .entry(
+                                        "Edit connections.yml",
+                                        None,
+                                        on(panel.clone(), |this, window, cx| {
+                                            this.open_connections_yaml(window, cx)
+                                        }),
+                                    )
+                                    .entry(
+                                        "Open .env",
+                                        None,
+                                        on(panel.clone(), |this, window, cx| {
+                                            this.open_env_file(window, cx)
+                                        }),
+                                    )
+                            }))
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Refresh: re-reads the YAML, drops cached listings, lists again what
+    /// is unfolded, and asks the local runner again.
+    fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.tables.clear();
+        for tree in self.trees.values_mut() {
+            tree.databases = None;
+            tree.schemas.clear();
+            tree.tables.clear();
+        }
+        self.refresh(cx);
+        let expanded = self.expanded.clone();
+        self.invalidate_then(
+            "\u{1}refresh".into(),
+            super::listing_cache::Scope::Project,
+            cx,
+            move |this, cx| {
+                for name in expanded {
+                    if this.connection_lists_by_level(&name) {
+                        this.load_databases(name, cx);
+                    } else {
+                        this.load_tables(name, cx);
+                    }
+                }
+            },
+        );
+        if let Some(root) = self.root.clone() {
+            self.check_runner(&root, cx);
+        }
+    }
+
+    /// The health card: each blocker once, with the buttons that fix it.
+    fn render_health(&self, issues: &[Issue], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let worst = if issues.iter().any(|issue| issue.color == Color::Error) {
+            Color::Error
+        } else {
+            Color::Warning
+        };
+        let title = if issues.len() == 1 {
+            "1 thing needs you".to_owned()
+        } else {
+            format!("{} things need you", issues.len())
+        };
+        v_flex()
+            .m_2()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1p5()
+                    .items_center()
+                    .child(Indicator::dot().color(worst))
+                    .child(Label::new(title).size(LabelSize::Small))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("el-health-hide", "Hide")
+                            .label_size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.health_hidden = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .children(issues.iter().enumerate().map(|(index, issue)| {
+                let text = issue.text.clone();
+                let detail = issue.detail.clone();
+                v_flex()
+                    .id(("el-issue", index))
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .when_some(detail, |row, detail| {
+                        let text = text.clone();
+                        row.tooltip(move |_, cx| {
+                            Tooltip::with_meta(text.clone(), None, detail.clone(), cx)
+                        })
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_start()
+                            .child(div().pt_1().child(Indicator::dot().color(issue.color)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Label::new(text).size(LabelSize::Small)),
+                            ),
+                    )
+                    .child(
+                        h_flex().pl_3().gap_1().flex_wrap().children(
+                            issue.actions.iter().enumerate().map(|(position, action)| {
+                                let action = action.clone();
+                                Button::new(
+                                    ("el-issue-action", index * 8 + position),
+                                    action.label(),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .style(if position == 0 {
+                                    ButtonStyle::Filled
+                                } else {
+                                    ButtonStyle::Subtle
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run_issue_action(&action, window, cx);
+                                }))
+                            }),
+                        ),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// The local runner on one line at the bottom: where runs happen on
+    /// this machine, and the one thing to do about it.
+    fn render_runner_footer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let image = self
+            .root
+            .as_deref()
+            .map(local_runner::image)
+            .unwrap_or_default();
+        let running = self.runner.container == Some(Container::Running);
+        let (dot, status, detail): (Color, SharedString, Option<SharedString>) =
+            match &self.runner.access {
+                None => (Color::Muted, "checking…".into(), None),
+                Some(Access::Licensed) => {
+                    let status: SharedString = match (self.runner.busy, &self.runner.container) {
+                        (Some(busy), _) => busy.into(),
+                        (None, Some(Container::Running)) => "running".into(),
+                        (None, Some(Container::Stopped(status))) if !status.is_empty() => {
+                            status.clone().into()
+                        }
+                        _ => "stopped".into(),
+                    };
+                    let dot = if self.runner.error.is_some() {
+                        Color::Error
+                    } else if running {
+                        Color::Success
+                    } else {
+                        Color::Muted
+                    };
+                    (dot, status, self.runner.error.clone())
+                }
+                Some(Access::Unlicensed(detail)) => (
+                    Color::Warning,
+                    "can't pull its image".into(),
+                    Some(format!("The registry refused {image}.\n\n{detail}").into()),
+                ),
+                Some(Access::SignIn(detail)) => (
+                    Color::Warning,
+                    "sign in to the registry".into(),
+                    Some(format!("Docker has no credentials for {image}.\n\n{detail}").into()),
+                ),
+                Some(Access::NoDocker(detail)) => (
+                    Color::Muted,
+                    "Docker isn't running".into(),
+                    Some(detail.clone().into()),
+                ),
+                Some(Access::Unavailable(detail)) => (
+                    Color::Muted,
+                    "can't be checked".into(),
+                    Some(format!("{image}\n\n{detail}").into()),
+                ),
+            };
+        let licensed = matches!(self.runner.access, Some(Access::Licensed));
+        let busy = self.runner.busy.is_some();
+        let name = self.runner.remote_name.clone();
+        h_flex()
+            .id("el-runner-footer")
+            .w_full()
+            .h(px(28.))
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.title_bar_background)
+            .child(Indicator::dot().color(dot))
+            .child(Label::new("Local runner").size(LabelSize::Small))
+            .child(
+                Label::new(status)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(div().flex_1())
+            .tooltip({
+                let detail = detail.clone();
+                move |_, cx| {
+                    Tooltip::with_meta(
+                        "Local runner",
+                        None,
+                        detail.clone().unwrap_or_else(|| {
+                            format!(
+                                "The EL daemon in this machine's Docker, serving this project at \
+                                 http://127.0.0.1:{} as the `{name}` runner. Point a connection \
+                                 at it with `workspace: {name}`.",
+                                local_runner::PORT
+                            )
+                            .into()
+                        }),
+                        cx,
+                    )
+                }
+            })
+            .when(licensed && running, |row| {
+                row.child(
+                    IconButton::new("el-runner-open", IconName::ArrowUpRight)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Open in the EL console"))
+                        .on_click(cx.listener({
+                            let name = self.runner.remote_name.clone();
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.show_remote(name.clone(), window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    IconButton::new("el-runner-stop", IconName::Stop)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(busy)
+                        .tooltip(Tooltip::text("Stop the local runner"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.stop_runner(cx);
+                        })),
+                )
+            })
+            .when(licensed && !running, |row| {
+                row.child(
+                    IconButton::new("el-runner-start", IconName::PlayFilled)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .disabled(busy)
+                        .tooltip(Tooltip::text("Start the local runner"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.start_runner(cx);
+                        })),
+                )
+            })
+            .when(!licensed && self.runner.access.is_some(), |row| {
+                row.when_some(detail, |row, detail| {
+                    row.child(
+                        IconButton::new("el-runner-copy", IconName::Copy)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Copy the error"))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    detail.to_string(),
+                                ));
+                            }),
+                    )
+                })
+                .child(
+                    IconButton::new("el-runner-recheck", IconName::RotateCw)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Check again"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(root) = this.root.clone() {
+                                this.check_runner(&root, cx);
+                            }
+                        })),
+                )
+            })
+            .into_any_element()
     }
 }
 
@@ -2229,14 +2795,11 @@ impl ElPanel {
         base: gpui::Stateful<gpui::Div>,
         key: &'static str,
         label: &'static str,
+        count: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let folded = self.collapsed.contains(key);
-        let colors = cx.theme().colors();
         base.cursor_pointer()
-            .bg(colors.element_background)
-            .border_b_1()
-            .border_color(colors.border)
             .child(
                 Icon::new(if folded {
                     IconName::ChevronRight
@@ -2248,8 +2811,14 @@ impl ElPanel {
             )
             .child(
                 Label::new(label)
-                    .size(LabelSize::Default)
-                    .color(Color::Default),
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(count.to_string())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Disabled),
             )
             .child(div().flex_1())
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(key, cx)))
@@ -2266,7 +2835,7 @@ impl ElPanel {
             .hover(|style| style.bg(cx.theme().colors().element_hover));
         match row {
             Row::PipelinesHeader => self
-                .render_section_header(base, "pipelines", "Pipelines", cx)
+                .render_section_header(base, "pipelines", "Pipelines", self.pipelines.len(), cx)
                 .child(
                     IconButton::new("el-new-pipeline", IconName::Plus)
                         .icon_size(IconSize::XSmall)
@@ -2279,7 +2848,23 @@ impl ElPanel {
                 )
                 .into_any_element(),
             Row::ConnectionsHeader => self
-                .render_section_header(base, "connections", "Connections", cx)
+                .render_section_header(
+                    base,
+                    "connections",
+                    "Connections",
+                    self.connections.len(),
+                    cx,
+                )
+                .child(
+                    IconButton::new("el-add-remote", IconName::Server)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Add runner"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.edit_remote(None, window, cx)
+                        })),
+                )
                 .child(
                     IconButton::new("el-add-connection", IconName::Plus)
                         .icon_size(IconSize::XSmall)
@@ -2291,39 +2876,66 @@ impl ElPanel {
                         })),
                 )
                 .into_any_element(),
-            Row::RemotesHeader => self
-                .render_section_header(base, "remotes", "Remotes", cx)
-                .child(
-                    IconButton::new("el-add-remote", IconName::Plus)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Add server"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.edit_remote(None, window, cx)
-                        })),
-                )
-                .into_any_element(),
-            Row::Remote(name, host) => {
-                let open_name = name.clone();
+            Row::Group {
+                workspace,
+                host,
+                status,
+            } => {
+                let local = workspace.as_ref() == "local";
+                let folded = self.collapsed_groups.contains(workspace);
+                let declared = self.remotes.iter().any(|(name, _)| name == workspace);
+                let console = self.console_remotes.contains(workspace);
+                let badge: Option<(&str, Color)> = match status {
+                    GroupStatus::Fine => None,
+                    GroupStatus::WorkerMissing => Some(("worker missing", Color::Error)),
+                    GroupStatus::Offline { cached: true } => Some(("offline · cached", Color::Muted)),
+                    GroupStatus::Offline { cached: false } => Some(("offline", Color::Warning)),
+                    GroupStatus::NeedsToken(_) => Some(("needs token", Color::Warning)),
+                };
+                let toggle = workspace.clone();
                 base.cursor_pointer()
                     .child(
-                        Icon::new(IconName::Server)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        Icon::new(if folded {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
                     )
-                    .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
-                    .child(div().flex_1())
                     .child(
-                        Label::new(host.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate(),
+                        Icon::new(if local {
+                            IconName::Screen
+                        } else {
+                            IconName::Server
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
                     )
-                    .when(self.console_remotes.contains(name), |row| {
-                        let name = name.clone();
+                    .child(
+                        Label::new(if local {
+                            SharedString::from("This Mac")
+                        } else {
+                            workspace.clone()
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                    )
+                    .children(host.clone().map(|host| {
+                        Label::new(host)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Disabled)
+                            .truncate()
+                    }))
+                    .child(div().flex_1())
+                    .children(badge.map(|(text, color)| {
+                        Label::new(text).size(LabelSize::XSmall).color(color)
+                    }))
+                    .when(console, |row| {
+                        let name = workspace.clone();
                         row.child(
-                            IconButton::new(("el-remote-pull-connections", ix), IconName::Download)
+                            IconButton::new(("el-group-pull", ix), IconName::Download)
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("Pull connections from the console"))
@@ -2333,23 +2945,39 @@ impl ElPanel {
                                 })),
                         )
                     })
-                    .child({
-                        let name = name.clone();
-                        IconButton::new(("el-remote-edit", ix), IconName::Pencil)
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Edit server"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.edit_remote(Some(name.clone()), window, cx);
-                            }))
+                    .when(declared, |row| {
+                        let open = workspace.clone();
+                        let edit = workspace.clone();
+                        row.child(
+                            IconButton::new(("el-group-open", ix), IconName::ArrowUpRight)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Open in the EL console"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.show_remote(open.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            IconButton::new(("el-group-edit", ix), IconName::Pencil)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Edit runner"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.edit_remote(Some(edit.clone()), window, cx);
+                                })),
+                        )
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_remote(open_name.clone(), window, cx);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed_groups.remove(&toggle) {
+                            this.collapsed_groups.insert(toggle.clone());
+                        }
+                        cx.notify();
                     }))
                     .into_any_element()
             }
-            Row::Note(text) => base
+            Row::Note(text) => base.pl(indent(0))
                 .child(
                     Label::new(text.clone())
                         .size(LabelSize::XSmall)
@@ -2375,7 +3003,7 @@ impl ElPanel {
                     }))
                     .into_any_element()
             }
-            Row::Connection(name, kind, workspace) => {
+            Row::Connection(name, kind, _workspace) => {
                 let can_browse = super::browsable(kind);
                 let expanded = self.expanded.contains(name);
                 let chevron = if expanded {
@@ -2388,88 +3016,140 @@ impl ElPanel {
                     "{kind} connections can't be browsed yet — describe what to load with + Source on the canvas."
                 )
                 .into();
-                base.when(can_browse, |row| {
-                    row.cursor_pointer()
-                        .child(
-                            Icon::new(chevron)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                // The dot says the connection's state at a glance; the
+                // health card says what to do about the shared ones.
+                let missing = self
+                    .missing_env
+                    .get(name)
+                    .filter(|_| !self.has_listed(name))
+                    .cloned();
+                let failure = self.failure_of(name);
+                let (dot, note, note_color, tip): (
+                    Color,
+                    Option<SharedString>,
+                    Color,
+                    Option<SharedString>,
+                ) = if let Some(vars) = &missing {
+                    (
+                        Color::Warning,
+                        Some(format!("needs {}", vars.join(", ")).into()),
+                        Color::Warning,
+                        Some("Click to open .env".into()),
+                    )
+                } else if let Some((error, at)) = self.stale.get(name) {
+                    (
+                        Color::Info,
+                        Some(format!("cached {}", age_text(*at)).into()),
+                        Color::Muted,
+                        Some(error.clone()),
+                    )
+                } else if let Some(message) = &failure {
+                    match classify_failure(message) {
+                        Failure::Other => (
+                            Color::Error,
+                            Some("failed".into()),
+                            Color::Error,
+                            Some(message.clone()),
+                        ),
+                        _ => (Color::Muted, None, Color::Muted, Some(message.clone())),
+                    }
+                } else if self.has_listed(name) {
+                    (Color::Success, None, Color::Muted, None)
+                } else {
+                    (Color::Disabled, None, Color::Muted, None)
+                };
+                base.pl(indent(0))
+                    .when(can_browse, |row| {
+                        row.cursor_pointer()
+                            .child(
+                                Icon::new(chevron)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.toggle_connection(toggle_name.clone(), window, cx);
+                            }))
+                    })
+                    .when(!can_browse, |row| row.tooltip(Tooltip::text(kind_hint)))
+                    .when_some(
+                        match self.tables.get(name) {
+                            Some(TablesState::Loaded { tables, .. })
+                                if super::extractable(kind) && !tables.is_empty() =>
+                            {
+                                Some(tables.len())
+                            }
+                            _ => None,
+                        },
+                        |row, count| {
+                            let label: SharedString =
+                                format!("{name} · {} tables", super::thousands(count)).into();
+                            row.on_drag(
+                                super::DraggedTables {
+                                    connection: name.clone(),
+                                    schema: None,
+                                    count,
+                                },
+                                move |_, _, _, cx| {
+                                    let label = label.clone();
+                                    cx.new(|_| DraggedTablePreview(label))
+                                },
+                            )
+                        },
+                    )
+                    .child(Indicator::dot().color(dot))
+                    .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
+                    .child(div().flex_1())
+                    .children(note.map(|note| {
+                        let opens_env = missing.is_some();
+                        div()
+                            .id(("el-conn-note", ix))
+                            .min_w_0()
+                            .child(
+                                Label::new(note)
+                                    .size(LabelSize::XSmall)
+                                    .color(note_color)
+                                    .truncate(),
+                            )
+                            .when_some(tip.clone(), |note, tip| {
+                                note.tooltip(Tooltip::text(tip))
+                            })
+                            .when(opens_env, |note| {
+                                note.cursor_pointer().on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_env_file(window, cx);
+                                    },
+                                ))
+                            })
+                    }))
+                    .child(
+                        Label::new(kind.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when(can_browse && expanded, |row| {
+                        let name = name.clone();
+                        row.child(
+                            IconButton::new(("el-conn-refresh", ix), IconName::RotateCw)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("List this connection again"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.refresh_connection(name.clone(), cx);
+                                })),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_connection(toggle_name.clone(), window, cx);
-                        }))
-                })
-                .when(!can_browse, |row| row.tooltip(Tooltip::text(kind_hint)))
-                .when_some(
-                    match self.tables.get(name) {
-                        Some(TablesState::Loaded { tables, .. })
-                            if super::extractable(kind) && !tables.is_empty() =>
-                        {
-                            Some(tables.len())
-                        }
-                        _ => None,
-                    },
-                    |row, count| {
-                        let label: SharedString =
-                            format!("{name} · {} tables", super::thousands(count)).into();
-                        row.on_drag(
-                            super::DraggedTables {
-                                connection: name.clone(),
-                                schema: None,
-                                count,
-                            },
-                            move |_, _, _, cx| {
-                                let label = label.clone();
-                                cx.new(|_| DraggedTablePreview(label))
-                            },
-                        )
-                    },
-                )
-                .child(
-                    Icon::new(IconName::DatabaseZap)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
-                .child(div().flex_1())
-                // Where this one runs. Shown even when it is "local", so
-                // the answer is never something you have to open a modal
-                // to learn.
-                .child(Label::new(workspace.clone()).size(LabelSize::XSmall).color(
-                    if workspace.as_ref() == "local" {
-                        Color::Muted
-                    } else {
-                        Color::Accent
-                    },
-                ))
-                .child(
-                    Label::new(kind.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .when(can_browse && expanded, |row| {
-                    let name = name.clone();
-                    row.child(
-                        IconButton::new(("el-conn-refresh", ix), IconName::RotateCw)
+                    })
+                    .child({
+                        let name = name.clone();
+                        IconButton::new(("el-conn-edit", ix), IconName::Pencil)
                             .icon_size(IconSize::XSmall)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("List this connection again"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.refresh_connection(name.clone(), cx);
-                            })),
-                    )
-                })
-                .child({
-                    let name = name.clone();
-                    IconButton::new(("el-conn-edit", ix), IconName::Pencil)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Edit connection"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.edit_connection(Some(name.clone()), window, cx);
-                        }))
-                })
-                .into_any_element()
+                            .tooltip(Tooltip::text("Edit connection"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_connection(Some(name.clone()), window, cx);
+                            }))
+                    })
+                    .into_any_element()
             }
             Row::Database {
                 connection,
@@ -2705,123 +3385,53 @@ impl ElPanel {
                     }))
                     .into_any_element()
             }
-            Row::LocalRunner => {
-                let running = self.runner.container == Some(Container::Running);
-                let busy = self.runner.busy;
-                let status: SharedString = match (busy, &self.runner.container) {
-                    (Some(busy), _) => busy.into(),
-                    (None, Some(Container::Running)) => "running".into(),
-                    (None, Some(Container::Stopped(status))) if !status.is_empty() => {
-                        status.clone().into()
-                    }
-                    _ => "stopped".into(),
-                };
-                let control = if running {
-                    IconButton::new("el-runner-stop", IconName::Stop)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .disabled(busy.is_some())
-                        .tooltip(Tooltip::text("Stop the local runner"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.stop_runner(cx);
-                        }))
-                } else {
-                    IconButton::new("el-runner-start", IconName::PlayFilled)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .disabled(busy.is_some())
-                        .tooltip(Tooltip::text("Start the local runner"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.start_runner(cx);
-                        }))
-                };
-                base.child(
-                    Icon::new(IconName::Server)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(Label::new(self.runner.remote_name.clone()).size(LabelSize::Small))
-                .child(div().flex_1())
-                .child(
-                    Label::new(status)
-                        .size(LabelSize::XSmall)
-                        .color(if running {
-                            Color::Success
-                        } else {
-                            Color::Muted
-                        })
-                        .truncate(),
-                )
-                .child(control)
-                .tooltip({
-                    let name = self.runner.remote_name.clone();
-                    move |_, cx| {
-                        Tooltip::with_meta(
-                            "Local runner",
-                            None,
-                            format!(
-                                "The EL daemon in this machine's Docker, serving this project at \
-                                 http://127.0.0.1:7431 as the `{name}` server in el/remotes.yml. \
-                                 Point a connection at it with `workspace: {name}`."
-                            ),
-                            cx,
-                        )
-                    }
-                })
-                .when(running, |row| {
-                    let name = self.runner.remote_name.clone();
-                    row.cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.show_remote(name.clone(), window, cx);
-                        }))
-                })
-                .into_any_element()
-            }
-            Row::RunnerNote(text, color, detail) => base
-                .pl_6()
-                .child(
-                    Label::new(text.clone())
-                        .size(LabelSize::XSmall)
-                        .color(*color),
-                )
-                .when_some(detail.clone(), |row, detail| {
-                    let text = text.clone();
-                    row.tooltip(move |_, cx| {
-                        Tooltip::with_meta(text.clone(), None, detail.clone(), cx)
-                    })
-                })
-                .into_any_element(),
-            Row::ConnNote(text, color) => base
-                .pl_6()
-                .child(
-                    Label::new(text.clone())
-                        .size(LabelSize::XSmall)
-                        .color(*color),
-                )
-                .into_any_element(),
             Row::TreeNote {
                 text,
                 color,
                 depth,
                 loading,
-            } => base
-                .pl(indent(*depth))
-                .when(*loading, |row| {
-                    row.child(
-                        SpinnerLabel::new()
+            } => {
+                // A failure the runner or the machine caused is said once in
+                // the health card; under the connection it is one short line.
+                let shared = *color == Color::Error && classify_failure(text) != Failure::Other;
+                let (shown, shown_color): (SharedString, Color) = if shared {
+                    ("Not listed. See the note at the top.".into(), Color::Muted)
+                } else {
+                    (text.clone(), *color)
+                };
+                let full = text.clone();
+                base.pl(indent(*depth))
+                    .when(*loading, |row| {
+                        row.child(
+                            SpinnerLabel::new()
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        Label::new(shown)
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(shown_color)
+                            .truncate(),
                     )
-                })
-                .child(
-                    Label::new(text.clone())
-                        .size(LabelSize::XSmall)
-                        .color(*color)
-                        .truncate(),
-                )
-                .into_any_element(),
+                    .when(*color == Color::Error, |row| {
+                        let tip = full.clone();
+                        row.tooltip(Tooltip::text(tip))
+                            .child(div().flex_1())
+                            .child(
+                                IconButton::new(("el-note-copy", ix), IconName::Copy)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Copy the error"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            full.to_string(),
+                                        ));
+                                    }),
+                            )
+                    })
+                    .into_any_element()
+            }
             Row::TableSearch(connection) => {
                 let Some(browser) = self.browsers.get(connection) else {
                     return base.into_any_element();
@@ -2951,65 +3561,33 @@ impl ElPanel {
                     })
                     .into_any_element()
             }
-            Row::EnvHint(vars) => {
-                // The row is narrow and the names are the whole point, so
-                // the tooltip repeats them rather than the explanation alone.
-                let title =
-                    super::runs_panel::tooltip_text(&format!("Set {} in .env", vars.join(", ")));
-                base.pl_6()
-                    .cursor_pointer()
+            Row::Empty(text, action) => {
+                let action = *action;
+                let label = match action {
+                    EmptyAction::Initialize => "Initialize",
+                    EmptyAction::NewPipeline => "New pipeline",
+                    EmptyAction::AddConnection => "Add connection",
+                };
+                base.pl(indent(0))
                     .child(
-                        Label::new(format!("Set {} in .env to connect", vars.join(", ")))
+                        Label::new(text.clone())
                             .size(LabelSize::XSmall)
-                            .color(Color::Warning)
+                            .color(Color::Muted)
                             .truncate(),
                     )
-                    .tooltip(move |_, cx| {
-                        Tooltip::with_meta(
-                            title.clone(),
-                            None,
-                            "The YAML references ${VAR}; the value lives in .env next to \
-                             the project (or in your shell). Click to open .env.",
-                            cx,
-                        )
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.open_env_file(window, cx)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new(("el-empty-action", ix), label)
+                            .label_size(LabelSize::XSmall)
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(move |this, _, window, cx| match action {
+                                EmptyAction::Initialize => this.initialize(window, cx),
+                                EmptyAction::NewPipeline => this.new_pipeline(window, cx),
+                                EmptyAction::AddConnection => this.edit_connection(None, window, cx),
+                            })),
+                    )
                     .into_any_element()
             }
-            Row::RemotesEmpty => base
-                .pl_6()
-                .child(
-                    Label::new("No servers yet — press + to add one.")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .tooltip(|_, cx| {
-                    Tooltip::with_meta(
-                        "Servers",
-                        None,
-                        "el/remotes.yml lists the servers the IDE deploys to and watches. Add \
-                         server points at a running daemon, installs one over SSH (ellode-ide el \
-                         install-remote), or reaches a project of the Ellode platform through \
-                         its console with your access token. Tokens are ${VAR} references \
-                         resolved from .env.",
-                        cx,
-                    )
-                })
-                .into_any_element(),
-            Row::Initialize => base
-                .cursor_pointer()
-                .child(
-                    Icon::new(IconName::Plus)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new("Initialize EL workspace…")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.initialize(window, cx)))
-                .into_any_element(),
         }
     }
 }
@@ -3032,5 +3610,29 @@ mod tests {
         assert_eq!(page_range(9_331, 500), 9_300..9_331);
         assert_eq!(page_range(100, 1), 0..100);
         assert_eq!(page_range(0, 3), 0..0);
+    }
+
+    #[test]
+    fn failures_split_into_the_runner_and_the_database() {
+        assert!(classify_failure(super::super::WORKER_MISSING) == Failure::WorkerMissing);
+        assert!(
+            classify_failure(
+                "on remote ellode_finance: remote unreachable: http://localhost:3100/api/platform/projects/finance"
+            ) == Failure::Unreachable
+        );
+        assert!(
+            classify_failure("on remote x: error sending request for url: Connection refused")
+                == Failure::Unreachable
+        );
+        assert!(classify_failure("ORA-01017: invalid username/password") == Failure::Other);
+    }
+
+    #[test]
+    fn cached_listings_say_their_age() {
+        let now = std::time::SystemTime::now();
+        assert_eq!(age_text(now), "just now");
+        assert_eq!(age_text(now - Duration::from_secs(12 * 60)), "12 min ago");
+        assert_eq!(age_text(now - Duration::from_secs(3 * 3600)), "3 h ago");
+        assert_eq!(age_text(now - Duration::from_secs(2 * 86400)), "2 days ago");
     }
 }
