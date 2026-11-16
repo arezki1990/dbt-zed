@@ -215,6 +215,8 @@ pub fn layout(around: &Neighbourhood, project: &Project, show_columns: bool) -> 
             edges,
             width: placement.width,
             height: placement.height,
+            routes: placement.routes,
+            groups: Vec::new(),
         },
         ids: nodes.iter().map(|node| node.id.clone()).collect(),
     }

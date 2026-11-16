@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -23,8 +25,9 @@ use crate::{
     ShowModelData, ToggleFocus,
     dbt_settings::DbtSettings,
     lineage::{
-        GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_MAX_COLUMNS, GRAPH_NODE_HEIGHT,
-        GRAPH_PADDING, GRAPH_ROW_GAP, LayoutGraph, LineageStore, LineageTree, LineageTreeNode,
+        FOLDER_NODE_KIND, GRAPH_COL_GAP, GRAPH_COLUMN_ROW_HEIGHT, GRAPH_GROUP_HEADER,
+        GRAPH_GROUP_PADDING, GRAPH_MAX_COLUMNS, GRAPH_NODE_HEIGHT, GRAPH_PADDING, GRAPH_ROW_GAP,
+        GraphGroup, GraphLayoutNode, LayoutGraph, LineageStore, LineageTree, LineageTreeNode,
     },
 };
 
@@ -76,6 +79,82 @@ fn sources_toward(
 
 /// The second line of a node's tooltip: what kind of thing it is, what it
 /// does to its inputs, and what a click does.
+/// The folder a node is grouped in: where its file is in the project, with
+/// a source in a box of its own beside its folder's models.
+fn node_folder(root: Option<&std::path::Path>, node: &GraphLayoutNode) -> String {
+    let folder = node
+        .path
+        .as_deref()
+        .map(|path| {
+            root.and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path)
+                .parent()
+                .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if node.kind == "source" {
+        format!("{folder}#sources")
+    } else {
+        folder
+    }
+}
+
+/// Folders that would hold a single node of the graph join their parent's
+/// box, again until none does (but never past the top folder, such as
+/// `models/gold`): ten one-model folders side by side were ten boxes. A
+/// source alone joins its folder's models.
+fn merge_lonely_folders(folders: &mut [String]) {
+    loop {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for folder in folders.iter() {
+            *counts.entry(folder.as_str()).or_default() += 1;
+        }
+        let lonely: HashSet<String> = counts
+            .into_iter()
+            .filter(|(_, count)| *count == 1)
+            .map(|(folder, _)| folder.to_owned())
+            .collect();
+        let mut changed = false;
+        for folder in folders.iter_mut() {
+            if !lonely.contains(folder.as_str()) {
+                continue;
+            }
+            let parent = match folder.strip_suffix("#sources") {
+                Some(models) => Some(models.to_owned()),
+                None => folder
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_owned())
+                    .filter(|parent| parent.contains('/')),
+            };
+            if let Some(parent) = parent {
+                *folder = parent;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// What a folder is called on the canvas: its path under `models/`.
+fn folder_label(key: &str) -> String {
+    let (folder, sources) = match key.strip_suffix("#sources") {
+        Some(folder) => (folder, true),
+        None => (key, false),
+    };
+    let short = folder
+        .strip_prefix("models/")
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(if folder.is_empty() { "(project)" } else { folder });
+    if sources {
+        format!("{short} · sources")
+    } else {
+        short.to_owned()
+    }
+}
+
 fn node_tooltip_meta(node: &crate::lineage::GraphLayoutNode) -> String {
     let mut lines = Vec::new();
     lines.push(if node.kind == node.materialization || node.materialization.is_empty() {
@@ -159,6 +238,14 @@ pub struct DbtResultsPanel {
     cell_detail: Option<(SharedString, usize, SharedString)>,
     collapsed_up: HashSet<String>,
     collapsed_down: HashSet<String>,
+    /// Draw each folder's models in a box of their own.
+    group_by_folder: bool,
+    /// Folders folded into one node each, by their path in the project.
+    collapsed_folders: HashSet<String>,
+    /// The graph as last laid out for the canvas: (what it was laid out
+    /// from, the lineage it came from, the layout). Laying it out is too
+    /// costly to redo on every frame of a drag.
+    shown_layout: RefCell<Option<(u64, usize, Arc<LayoutGraph>)>>,
     selected_column: Option<String>,
     pan: (f32, f32),
     zoom: f32,
@@ -504,6 +591,9 @@ impl DbtResultsPanel {
                 cell_detail: None,
                 collapsed_up: Default::default(),
                 collapsed_down: Default::default(),
+                group_by_folder: false,
+                collapsed_folders: Default::default(),
+                shown_layout: RefCell::new(None),
                 selected_column: None,
                 pan: (0., 0.),
                 zoom: 1.0,
@@ -1464,6 +1554,55 @@ impl DbtResultsPanel {
                     cx.notify();
                 })),
             )
+            .child(
+                toggle(
+                    "dbt-toggle-folders",
+                    "Folders",
+                    self.group_by_folder,
+                    "Box each folder's models together — click a folder's name to fold it",
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.group_by_folder = !this.group_by_folder;
+                    this.node_offsets.clear();
+                    this.pending_center = true;
+                    cx.notify();
+                })),
+            )
+            .when(self.group_by_folder, |this| {
+                let any_folded = !self.collapsed_folders.is_empty();
+                let foldable: Vec<String> = layout
+                    .groups
+                    .iter()
+                    .filter(|group| !group.holds_center)
+                    .map(|group| group.key.clone())
+                    .collect();
+                this.child(
+                    IconButton::new(
+                        "dbt-folders-fold-all",
+                        if any_folded {
+                            IconName::ExpandVertical
+                        } else {
+                            IconName::FoldVertical
+                        },
+                    )
+                    .icon_size(IconSize::Small)
+                    .disabled(!any_folded && foldable.is_empty())
+                    .tooltip(ui::Tooltip::text(if any_folded {
+                        "Open every folder"
+                    } else {
+                        "Fold every folder but this model's"
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.collapsed_folders.is_empty() {
+                            this.collapsed_folders.extend(foldable.iter().cloned());
+                        } else {
+                            this.collapsed_folders.clear();
+                        }
+                        this.pending_center = true;
+                        cx.notify();
+                    })),
+                )
+            })
             .child(divider())
             .child(
                 IconButton::new("dbt-lineage-center", IconName::Crosshair)
@@ -2040,12 +2179,13 @@ impl DbtResultsPanel {
             edges,
             width: x - GRAPH_COL_GAP + GRAPH_PADDING,
             height: max_height + GRAPH_PADDING,
+            ..LayoutGraph::default()
         }))
     }
 
     /// Whether the centered model is currently visible in the viewport.
     fn center_in_view(&self) -> bool {
-        let Some(layout) = self.lineage_layout.as_ref() else {
+        let Some(layout) = self.drawn_layout() else {
             return true;
         };
         let Some(node) = layout.nodes.iter().find(|node| node.is_center) else {
@@ -2069,7 +2209,7 @@ impl DbtResultsPanel {
     /// Pans the canvas so the centered (browsed) model sits in the middle of
     /// the viewport — browsing a file always brings its node into view.
     fn center_on_model(&mut self) -> bool {
-        let Some(layout) = self.lineage_layout.as_ref() else {
+        let Some(layout) = self.drawn_layout() else {
             log::info!("dbt lineage: center skipped — no layout");
             return true;
         };
@@ -2113,7 +2253,7 @@ impl DbtResultsPanel {
         if (new_zoom - self.zoom).abs() < f32::EPSILON {
             return;
         }
-        if let Some(layout) = self.lineage_layout.as_ref() {
+        if let Some(layout) = self.drawn_layout() {
             let anchor = layout
                 .nodes
                 .iter()
@@ -2224,6 +2364,7 @@ impl DbtResultsPanel {
     fn render_graph_viewport(
         &self,
         id: &'static str,
+        shown: Arc<LayoutGraph>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let full_layout = self.lineage_layout.clone()?;
@@ -2243,7 +2384,7 @@ impl DbtResultsPanel {
             .and_then(|column| self.build_column_focus_layout(&full_layout, column))
         {
             Some(focus_layout) => focus_layout,
-            None => self.filtered_layout(&full_layout),
+            None => shown,
         };
         Some(
             div()
@@ -2301,10 +2442,71 @@ impl DbtResultsPanel {
         cx.theme().accents().color_for_index(index)
     }
 
+    /// The lineage as the canvas draws it, laid out again only when
+    /// something that changes it has.
+    fn shown_layout(&self, full: &Arc<LayoutGraph>, window: &Window, cx: &App) -> Arc<LayoutGraph> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.show_upstream.hash(&mut hasher);
+        self.show_downstream.hash(&mut hasher);
+        self.columns_visible_at(self.zoom).hash(&mut hasher);
+        self.selected_column.hash(&mut hasher);
+        self.group_by_folder.hash(&mut hasher);
+        self.lineage_root.hash(&mut hasher);
+        for set in [
+            &self.collapsed_up,
+            &self.collapsed_down,
+            &self.collapsed_folders,
+        ] {
+            let mut items: Vec<&String> = set.iter().collect();
+            items.sort();
+            items.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let source = Arc::as_ptr(full) as usize;
+        if let Some((cached_key, cached_source, layout)) = self.shown_layout.borrow().as_ref() {
+            if *cached_key == key && *cached_source == source {
+                return layout.clone();
+            }
+        }
+        // Boxes are as wide as their names, measured in the font they are
+        // drawn in: a guess per character cut long or capitalised names.
+        let text_system = cx.text_system();
+        let font_id = text_system.resolve_font(&window.text_style().font());
+        let measure = |text: &str| -> f32 {
+            text.chars()
+                .map(|ch| {
+                    text_system
+                        .advance(font_id, px(13.), ch)
+                        .map(|size| f32::from(size.width))
+                        .unwrap_or(8.)
+                })
+                .sum()
+        };
+        let layout = self.filtered_layout(full, &measure);
+        *self.shown_layout.borrow_mut() = Some((key, source, layout.clone()));
+        layout
+    }
+
+    /// The layout the canvas last drew, if it was drawn from the lineage
+    /// loaded now; else the lineage as loaded.
+    fn drawn_layout(&self) -> Option<Arc<LayoutGraph>> {
+        let full = self.lineage_layout.as_ref()?;
+        if self.column_focus.is_none() {
+            if let Some((_, source, layout)) = self.shown_layout.borrow().as_ref() {
+                if *source == Arc::as_ptr(full) as usize {
+                    return Some(layout.clone());
+                }
+            }
+        }
+        Some(full.clone())
+    }
+
     /// Applies the global stream toggles and the per-node collapse state:
     /// a node is visible when reachable from the model without crossing a
-    /// collapsed handle. Remaining columns are re-anchored to the left edge.
-    fn filtered_layout(&self, layout: &LayoutGraph) -> Arc<LayoutGraph> {
+    /// collapsed handle. What remains is sized to its names (`measure`
+    /// gives a text's width at the node font's size) and laid out again,
+    /// by folder when grouping.
+    fn filtered_layout(&self, layout: &LayoutGraph, measure: &dyn Fn(&str) -> f32) -> Arc<LayoutGraph> {
         let node_count = layout.nodes.len();
         let Some(center_ix) = layout.nodes.iter().position(|node| node.is_center) else {
             return Arc::new(layout.clone());
@@ -2385,79 +2587,180 @@ impl DbtResultsPanel {
                 }
                 // Semantic zoom: columns collapse away when zoomed out.
                 let columns_visible = self.columns_visible_at(self.zoom);
+                // Room for the name, its badges, and the − / + handles that
+                // sit over both ends.
+                let badges = node.ops.as_ref().map(|ops| ops.badges()).unwrap_or_default();
+                let mut width = 40. + measure(&node.name);
+                if !badges.is_empty() {
+                    width += 6. + 0.9 * measure(&badges);
+                }
                 if columns_visible && !node.columns.is_empty() {
                     let shown = node.columns.len().min(GRAPH_MAX_COLUMNS);
                     let more = usize::from(node.columns.len() > GRAPH_MAX_COLUMNS);
                     node.height =
                         GRAPH_NODE_HEIGHT + 4. + (shown + more) as f32 * GRAPH_COLUMN_ROW_HEIGHT;
-                    // Widen the box to fit its longest visible column name.
+                    // Wide enough for its longest visible column name.
                     let longest = node
                         .columns
                         .iter()
                         .take(GRAPH_MAX_COLUMNS)
-                        .map(|column| column.len())
-                        .max()
-                        .unwrap_or(0);
-                    node.width = node.width.max((28. + 7.2 * longest as f32).min(340.));
+                        .map(|column| measure(column))
+                        .fold(0_f32, f32::max);
+                    width = width.max(28. + longest * 12. / 13.);
                 } else {
                     node.height = GRAPH_NODE_HEIGHT;
                 }
+                node.width = width.max(80.);
                 nodes.push(node);
             }
         }
 
-        // Re-stack each level vertically (heights vary when columns show).
-        let mut groups: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
-        for (ix, node) in nodes.iter().enumerate() {
-            groups.entry(node.level).or_default().push(ix);
-        }
-        let mut content_height = 0.0_f32;
-        for group in groups.values() {
-            let group_height: f32 = group
-                .iter()
-                .map(|&ix| nodes[ix].height + GRAPH_ROW_GAP)
-                .sum::<f32>()
-                - GRAPH_ROW_GAP;
-            content_height = content_height.max(group_height);
-        }
-        for group in groups.values() {
-            let group_height: f32 = group
-                .iter()
-                .map(|&ix| nodes[ix].height + GRAPH_ROW_GAP)
-                .sum::<f32>()
-                - GRAPH_ROW_GAP;
-            let mut y = GRAPH_PADDING + (content_height - group_height) / 2.;
-            for &ix in group {
-                nodes[ix].y = y;
-                y += nodes[ix].height + GRAPH_ROW_GAP;
-            }
-        }
-
-        // Re-space levels horizontally too — widths vary when columns show,
-        // and hidden levels compact away.
-        let mut x = GRAPH_PADDING;
-        for group in groups.values() {
-            let level_width = group
-                .iter()
-                .map(|&ix| nodes[ix].width)
-                .fold(80.0_f32, f32::max);
-            for &ix in group {
-                nodes[ix].x = x;
-            }
-            x += level_width + GRAPH_COL_GAP;
-        }
-        let width = x - GRAPH_COL_GAP + GRAPH_PADDING;
-
-        let edges = layout
+        let edges: Vec<(usize, usize)> = layout
             .edges
             .iter()
             .filter_map(|&(from, to)| Some((index_map[from]?, index_map[to]?)))
             .collect();
+        let spacing = crate::graph_layout::Spacing {
+            padding: GRAPH_PADDING,
+            column_gap: GRAPH_COL_GAP,
+            row_gap: GRAPH_ROW_GAP,
+        };
+        if self.group_by_folder {
+            return self.grouped_layout(nodes, edges, spacing, measure);
+        }
+        let sizes: Vec<(f32, f32)> = nodes.iter().map(|node| (node.width, node.height)).collect();
+        let center = nodes.iter().position(|node| node.is_center);
+        let placement = crate::graph_layout::layered(&sizes, &edges, center, spacing);
+        for (node, placed) in nodes.iter_mut().zip(&placement.nodes) {
+            node.x = placed.x;
+            node.y = placed.y;
+        }
         Arc::new(LayoutGraph {
             nodes,
             edges,
-            width,
-            height: content_height + 2. * GRAPH_PADDING,
+            routes: placement.routes,
+            groups: Vec::new(),
+            width: placement.width,
+            height: placement.height,
+        })
+    }
+
+    /// Each folder's models in a box, the boxes laid out around each other;
+    /// a folded folder is one node standing for its models.
+    fn grouped_layout(
+        &self,
+        nodes: Vec<GraphLayoutNode>,
+        edges: Vec<(usize, usize)>,
+        spacing: crate::graph_layout::Spacing,
+        measure: &dyn Fn(&str) -> f32,
+    ) -> Arc<LayoutGraph> {
+        let root = self.lineage_root.as_deref();
+        let mut folders: Vec<String> = nodes.iter().map(|node| node_folder(root, node)).collect();
+        merge_lonely_folders(&mut folders);
+        let center_folder = nodes
+            .iter()
+            .position(|node| node.is_center)
+            .map(|ix| folders[ix].clone());
+        let folded = |folder: &String| {
+            self.collapsed_folders.contains(folder) && center_folder.as_ref() != Some(folder)
+        };
+
+        let mut shown: Vec<GraphLayoutNode> = Vec::new();
+        let mut shown_ix = vec![0_usize; nodes.len()];
+        let mut group_of: Vec<Option<usize>> = Vec::new();
+        let mut group_keys: Vec<String> = Vec::new();
+        let mut group_ix: HashMap<String, usize> = HashMap::new();
+        let mut folder_node: HashMap<String, usize> = HashMap::new();
+        let mut members: HashMap<String, usize> = HashMap::new();
+        for (ix, node) in nodes.into_iter().enumerate() {
+            let folder = &folders[ix];
+            *members.entry(folder.clone()).or_default() += 1;
+            if folded(folder) {
+                shown_ix[ix] = *folder_node.entry(folder.clone()).or_insert_with(|| {
+                    let label = format!("{}/", folder_label(folder));
+                    shown.push(GraphLayoutNode {
+                        width: 40. + measure(&label) + 10. + measure("000 models"),
+                        height: GRAPH_NODE_HEIGHT,
+                        name: label,
+                        kind: FOLDER_NODE_KIND.to_owned(),
+                        materialization: FOLDER_NODE_KIND.to_owned(),
+                        details: Some(serde_json::json!({ "folder": folder })),
+                        level: 1,
+                        ..GraphLayoutNode::default()
+                    });
+                    group_of.push(None);
+                    shown.len() - 1
+                });
+            } else {
+                let group = *group_ix.entry(folder.clone()).or_insert_with(|| {
+                    group_keys.push(folder.clone());
+                    group_keys.len() - 1
+                });
+                shown_ix[ix] = shown.len();
+                shown.push(node);
+                group_of.push(Some(group));
+            }
+        }
+        // How many models each folded folder stands for.
+        for node in &mut shown {
+            if node.kind == FOLDER_NODE_KIND {
+                let folder = node
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("folder"))
+                    .and_then(|folder| folder.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let count = members.get(&folder).copied().unwrap_or(0);
+                node.details = Some(serde_json::json!({ "folder": folder, "models": count }));
+            }
+        }
+        let mut seen = HashSet::new();
+        let edges: Vec<(usize, usize)> = edges
+            .into_iter()
+            .map(|(from, to)| (shown_ix[from], shown_ix[to]))
+            .filter(|(from, to)| from != to && seen.insert((*from, *to)))
+            .collect();
+
+        let sizes: Vec<(f32, f32)> = shown.iter().map(|node| (node.width, node.height)).collect();
+        let center = shown.iter().position(|node| node.is_center);
+        let grouped = crate::graph_layout::grouped(
+            &sizes,
+            &edges,
+            center,
+            &group_of,
+            group_keys.len(),
+            spacing,
+            crate::graph_layout::Frame {
+                padding: GRAPH_GROUP_PADDING,
+                header: GRAPH_GROUP_HEADER,
+            },
+        );
+        for (node, placed) in shown.iter_mut().zip(&grouped.placement.nodes) {
+            node.x = placed.x;
+            node.y = placed.y;
+        }
+        let groups = group_keys
+            .iter()
+            .zip(&grouped.boxes)
+            .map(|(key, &(x, y, width, height))| GraphGroup {
+                key: key.clone(),
+                label: folder_label(key),
+                models: members.get(key).copied().unwrap_or(0),
+                holds_center: center_folder.as_ref() == Some(key),
+                x,
+                y,
+                width,
+                height,
+            })
+            .collect();
+        Arc::new(LayoutGraph {
+            nodes: shown,
+            edges,
+            routes: grouped.placement.routes,
+            groups,
+            width: grouped.placement.width,
+            height: grouped.placement.height,
         })
     }
 
@@ -2473,8 +2776,10 @@ impl DbtResultsPanel {
         let center_border = theme.text_accent;
         let text_color = theme.text;
         let muted_color = theme.text_muted;
-        let name_text_size = px((13. * self.zoom).clamp(8., 22.));
-        let column_text_size = px((12. * self.zoom).clamp(7., 18.));
+        // Text scales with the boxes it was measured for: clamped, it
+        // outgrew them when zoomed out and was cut.
+        let name_text_size = px((13. * self.zoom).max(4.));
+        let column_text_size = px((12. * self.zoom).max(4.));
 
         // Single source of truth: drag offsets are baked into node positions
         // once, and both the edge canvas and the node elements read from the
@@ -2494,6 +2799,18 @@ impl DbtResultsPanel {
                 node.y += dy;
             }
         }
+        for route in &mut positioned.routes {
+            for point in route.iter_mut() {
+                point.0 = point.0 * zoom + self.pan.0;
+                point.1 = point.1 * zoom + self.pan.1;
+            }
+        }
+        for group in &mut positioned.groups {
+            group.x = group.x * zoom + self.pan.0;
+            group.y = group.y * zoom + self.pan.1;
+            group.width *= zoom;
+            group.height *= zoom;
+        }
         let positioned = Arc::new(positioned);
 
         let edge_nodes = positioned.clone();
@@ -2510,17 +2827,30 @@ impl DbtResultsPanel {
         let edges = canvas(
             move |_, _, _| {},
             move |bounds, _, window, _| {
+                // An edge curves from one end to the next point of its
+                // route, runs straight through each column it crosses (the
+                // route's points come in pairs), and curves into the other
+                // end.
                 let draw_curve = |window: &mut Window,
                                   start: Point<Pixels>,
+                                  route: &[Point<Pixels>],
                                   end: Point<Pixels>,
                                   width: f32,
                                   color| {
-                    let mid_x = (start.x + end.x) / 2.;
-                    let mid = point(mid_x, (start.y + end.y) / 2.);
                     let mut builder = PathBuilder::stroke(px(width));
                     builder.move_to(start);
-                    builder.curve_to(mid, point(mid_x, start.y));
-                    builder.curve_to(end, point(mid_x, end.y));
+                    let mut from = start;
+                    for (ix, &to) in route.iter().chain(std::iter::once(&end)).enumerate() {
+                        if ix % 2 == 1 {
+                            builder.line_to(to);
+                        } else {
+                            let mid_x = (from.x + to.x) / 2.;
+                            let mid = point(mid_x, (from.y + to.y) / 2.);
+                            builder.curve_to(mid, point(mid_x, from.y));
+                            builder.curve_to(to, point(mid_x, to.y));
+                        }
+                        from = to;
+                    }
                     if let Ok(path) = builder.build() {
                         window.paint_path(path, color);
                     }
@@ -2535,12 +2865,24 @@ impl DbtResultsPanel {
                     }
                 };
 
-                for &(from_ix, to_ix) in &edge_nodes.edges {
+                for (edge_ix, &(from_ix, to_ix)) in edge_nodes.edges.iter().enumerate() {
                     let (Some(from), Some(to)) =
                         (edge_nodes.nodes.get(from_ix), edge_nodes.nodes.get(to_ix))
                     else {
                         continue;
                     };
+                    let route: Vec<Point<Pixels>> = edge_nodes
+                        .routes
+                        .get(edge_ix)
+                        .map(|route| {
+                            route
+                                .iter()
+                                .map(|&(x, y)| {
+                                    point(bounds.origin.x + px(x), bounds.origin.y + px(y))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     // Edges start flush at the source border (emerging from
                     // behind its handle when present); the arrow end is inset
                     // only where the target actually shows a collapse handle.
@@ -2553,7 +2895,7 @@ impl DbtResultsPanel {
                         bounds.origin.x + px(to.x - end_inset),
                         bounds.origin.y + px(to.y + header_height / 2.),
                     );
-                    draw_curve(window, start, end, 1.5, edge_color);
+                    draw_curve(window, start, &route, end, 1.5, edge_color);
                     draw_arrow(window, end, edge_color);
 
                     // Column-level lineage: same-named columns on connected
@@ -2599,10 +2941,10 @@ impl DbtResultsPanel {
                                         && marks[from_ix].contains(source.as_str())
                                 });
                                 if is_selected {
-                                    draw_curve(window, start, end, 2.0, accent);
+                                    draw_curve(window, start, &route, end, 2.0, accent);
                                     draw_arrow(window, end, accent);
                                 } else {
-                                    draw_curve(window, start, end, 1.0, column_edge_color);
+                                    draw_curve(window, start, &route, end, 1.0, column_edge_color);
                                 }
                             }
                         }
@@ -2621,8 +2963,18 @@ impl DbtResultsPanel {
             .relative()
             .w(px(layout.width * zoom))
             .h(px(layout.height * zoom))
+            .children(
+                positioned
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, group)| self.render_folder_box(ix, group, cx)),
+            )
             .child(edges)
             .children(positioned.nodes.clone().into_iter().enumerate().map(|(ix, node)| {
+                if node.kind == FOLDER_NODE_KIND {
+                    return self.render_folder_node(ix, &node, name_text_size, cx);
+                }
                 let path = node.path.clone();
                 let workspace = workspace.clone();
                 let materialization_color =
@@ -2850,6 +3202,7 @@ impl DbtResultsPanel {
                             })
                             .ok();
                     }))
+                    .into_any_element()
             }))
             // Floating collapse/expand handles: siblings of the nodes, so they
             // never interfere with node dragging or get clipped by node bounds.
@@ -2981,6 +3334,158 @@ impl DbtResultsPanel {
                     push_expand("down", node.x + node.width);
                 }
                 handles
+            }))
+            .into_any_element()
+    }
+
+    /// A folder's box behind its models; its name band folds it.
+    fn render_folder_box(
+        &self,
+        ix: usize,
+        group: &GraphGroup,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let zoom = self.zoom;
+        let mut background = colors.text;
+        background.a = 0.035;
+        let folder = group.key.clone();
+        let foldable = !group.holds_center;
+        let hover_bg = colors.ghost_element_hover;
+        div()
+            .absolute()
+            .left(px(group.x))
+            .top(px(group.y))
+            .w(px(group.width))
+            .h(px(group.height))
+            .rounded_lg()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(background)
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("dbt-folder-{ix}")))
+                    .w_full()
+                    .h(px(GRAPH_GROUP_HEADER * zoom))
+                    .px(px(10. * zoom))
+                    .gap(px(6. * zoom))
+                    .items_center()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px((12. * zoom).max(4.)))
+                            .text_color(colors.text_muted)
+                            .child(if foldable { "▾" } else { "•" }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((12. * zoom).max(4.)))
+                            .text_color(colors.text)
+                            .whitespace_nowrap()
+                            .child(SharedString::from(group.label.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px((11. * zoom).max(4.)))
+                            .text_color(colors.text_muted)
+                            .whitespace_nowrap()
+                            .child(SharedString::from(group.models.to_string())),
+                    )
+                    .when(foldable, |this| {
+                        this.cursor_pointer()
+                            .hover(move |style| style.bg(hover_bg))
+                            .rounded_t_lg()
+                            .tooltip(ui::Tooltip::text("Fold this folder into one node"))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.collapsed_folders.insert(folder.clone());
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                    })
+                    .when(!foldable, |this| {
+                        this.tooltip(ui::Tooltip::text(
+                            "The folder of the model you are browsing stays open",
+                        ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A folded folder: one node for its models; a click opens it again.
+    fn render_folder_node(
+        &self,
+        ix: usize,
+        node: &GraphLayoutNode,
+        text_size: Pixels,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let accent = colors.text_accent;
+        let folder = node
+            .details
+            .as_ref()
+            .and_then(|details| details.get("folder"))
+            .and_then(|folder| folder.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let models = node
+            .details
+            .as_ref()
+            .and_then(|details| details.get("models"))
+            .and_then(|models| models.as_u64())
+            .unwrap_or(0);
+        let name = node.name.clone();
+        div()
+            .id(SharedString::from(format!("dbt-graph-node-{ix}")))
+            .absolute()
+            .left(px(node.x))
+            .top(px(node.y))
+            .w(px(node.width))
+            .h(px(node.height))
+            .rounded_md()
+            .border_1()
+            .border_dashed()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .hover(move |style| style.border_color(accent))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(8. * self.zoom))
+            .child(
+                div()
+                    .text_size(text_size)
+                    .text_color(colors.text)
+                    .whitespace_nowrap()
+                    .child(SharedString::from(node.name.clone())),
+            )
+            .child(
+                div()
+                    .text_size(text_size * 0.85)
+                    .text_color(colors.text_muted)
+                    .whitespace_nowrap()
+                    .child(SharedString::from(format!(
+                        "{models} {}",
+                        if models == 1 { "model" } else { "models" }
+                    ))),
+            )
+            .tooltip(ui::Tooltip::text("A folded folder · click to open it"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.drag_moved = false;
+                    this.graph_drag = Some(GraphDrag::Node(name.clone(), event.position));
+                    cx.stop_propagation();
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if std::mem::take(&mut this.drag_moved) {
+                    return;
+                }
+                this.collapsed_folders.remove(&folder);
+                cx.notify();
             }))
             .into_any_element()
     }
@@ -3893,9 +4398,9 @@ impl DbtResultsPanel {
                     .size_full()
                     .items_start()
                     .when_some(self.lineage_layout.clone(), |this, full_layout| {
-                        let layout = self.filtered_layout(&full_layout);
+                        let layout = self.shown_layout(&full_layout, window, cx);
                         let mut legend: Vec<SharedString> = Vec::new();
-                        for node in &layout.nodes {
+                        for node in layout.nodes.iter().filter(|node| node.kind != FOLDER_NODE_KIND) {
                             let materialization: SharedString =
                                 node.materialization.clone().into();
                             if !legend.contains(&materialization) {
@@ -3949,6 +4454,7 @@ impl DbtResultsPanel {
                                         .children(
                                             self.render_graph_viewport(
                                                 "dbt-lineage-canvas",
+                                                layout.clone(),
                                                 cx,
                                             ),
                                         )
@@ -4372,6 +4878,13 @@ impl Render for DbtResultsPanel {
         if self.view == ResultsView::Connection {
             self.ensure_connection(cx);
         }
+        if self.pending_center && self.view == ResultsView::Lineage && self.column_focus.is_none() {
+            // Center on where the model will be drawn, not where it was
+            // loaded.
+            if let Some(full) = self.lineage_layout.clone() {
+                self.shown_layout(&full, window, cx);
+            }
+        }
         if self.pending_center {
             if self.center_on_model() {
                 self.pending_center = false;
@@ -4603,6 +5116,7 @@ mod render_tests {
             edges: vec![(0, 1), (1, 2)],
             width: 900.,
             height: 120.,
+            ..LayoutGraph::default()
         };
         let leaf = |name: &str| LineageTreeNode {
             node: ModelNode {
@@ -4685,6 +5199,18 @@ mod render_tests {
         panel.update(cx, |panel, _| panel.zoom = 0.4);
         draw("graph — columns on, hidden by the zoom", cx);
 
+        // By folder: open, then one folder folded.
+        panel.update(cx, |panel, _| {
+            panel.zoom = 1.0;
+            panel.group_by_folder = true;
+        });
+        draw("graph — by folder", cx);
+        panel.update(cx, |panel, _| {
+            panel.collapsed_folders.insert("models/marts".to_owned());
+        });
+        draw("graph — a folder folded", cx);
+        panel.update(cx, |panel, _| panel.group_by_folder = false);
+
         // Every banner at once, both Refresh buttons busy, then stale.
         panel.update(cx, |panel, _| {
             panel.zoom = 1.0;
@@ -4706,6 +5232,51 @@ mod render_tests {
             panel.update(cx, |panel, _| panel.view = view);
             draw("another tab", cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::{folder_label, merge_lonely_folders};
+
+    #[test]
+    fn one_model_folders_join_their_parent() {
+        let mut folders: Vec<String> = [
+            "models/integration/usecase_001",
+            "models/integration/usecase_002",
+            "models/integration",
+            "models/gold/report_monitoring",
+            "models/gold",
+            "models/gold",
+            "models/silver#sources",
+            "models/silver",
+            "models/bronze#sources",
+            "models/bronze#sources",
+            "models/lonely",
+        ]
+        .iter()
+        .map(|folder| folder.to_string())
+        .collect();
+        merge_lonely_folders(&mut folders);
+        assert_eq!(
+            folders,
+            [
+                "models/integration",
+                "models/integration",
+                "models/integration",
+                "models/gold",
+                "models/gold",
+                "models/gold",
+                "models/silver",
+                "models/silver",
+                "models/bronze#sources",
+                "models/bronze#sources",
+                "models/lonely",
+            ]
+        );
+        assert_eq!(folder_label("models/bronze#sources"), "bronze · sources");
+        assert_eq!(folder_label("models"), "models");
+        assert_eq!(folder_label(""), "(project)");
     }
 }
 

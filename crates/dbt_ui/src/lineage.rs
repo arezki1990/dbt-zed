@@ -373,7 +373,7 @@ pub(crate) fn extract_ops(sql: &str) -> NodeOps {
     ops
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GraphLayoutNode {
     pub name: String,
     pub kind: String,
@@ -414,9 +414,37 @@ pub struct LayoutGraph {
     pub nodes: Vec<GraphLayoutNode>,
     /// Edges as (from, to) indices into `nodes`, pointing downstream.
     pub edges: Vec<(usize, usize)>,
+    /// For each edge, the points it passes through between its ends, in
+    /// pairs: where it enters and leaves each column it crosses, so it runs
+    /// between nodes rather than over them. Missing or empty: straight
+    /// from one node to the other.
+    pub routes: Vec<Vec<(f32, f32)>>,
+    /// The folder boxes drawn behind the nodes, when grouping by folder.
+    pub groups: Vec<GraphGroup>,
     pub width: f32,
     pub height: f32,
 }
+
+/// A folder's box on the lineage canvas, around its models.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GraphGroup {
+    /// The folder in the project: what folding it remembers.
+    pub key: String,
+    pub label: String,
+    pub models: usize,
+    /// It holds the browsed model, so it cannot be folded away.
+    pub holds_center: bool,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// A folder's box: the band on top with its name, and the margin inside.
+pub const GRAPH_GROUP_HEADER: f32 = 28.;
+pub const GRAPH_GROUP_PADDING: f32 = 12.;
+/// The kind of the node a folded folder is drawn as.
+pub const FOLDER_NODE_KIND: &str = "folder";
 
 #[derive(Default)]
 pub struct LineageStore {
@@ -931,6 +959,7 @@ impl LineageStore {
                 edges,
                 width: x - GRAPH_COL_GAP + GRAPH_PADDING,
                 height: content_height + 2. * GRAPH_PADDING,
+                ..LayoutGraph::default()
             })
         })
     }
