@@ -2209,6 +2209,10 @@ impl DbtResultsPanel {
     /// Pans the canvas so the centered (browsed) model sits in the middle of
     /// the viewport — browsing a file always brings its node into view.
     fn center_on_model(&mut self) -> bool {
+        if self.lineage_layout.is_some() && self.drawn_layout().is_none() {
+            // Not laid out for the canvas yet: the next render does it.
+            return false;
+        }
         let Some(layout) = self.drawn_layout() else {
             log::info!("dbt lineage: center skipped — no layout");
             return true;
@@ -2487,18 +2491,17 @@ impl DbtResultsPanel {
         layout
     }
 
-    /// The layout the canvas last drew, if it was drawn from the lineage
-    /// loaded now; else the lineage as loaded.
+    /// Where the nodes are on the canvas: the layout it last drew, if that
+    /// was drawn from the lineage loaded now (the lineage as loaded, in
+    /// column focus). None until the canvas has laid out a new lineage.
     fn drawn_layout(&self) -> Option<Arc<LayoutGraph>> {
         let full = self.lineage_layout.as_ref()?;
-        if self.column_focus.is_none() {
-            if let Some((_, source, layout)) = self.shown_layout.borrow().as_ref() {
-                if *source == Arc::as_ptr(full) as usize {
-                    return Some(layout.clone());
-                }
-            }
+        if self.column_focus.is_some() {
+            return Some(full.clone());
         }
-        Some(full.clone())
+        let shown = self.shown_layout.borrow();
+        let (_, source, layout) = shown.as_ref()?;
+        (*source == Arc::as_ptr(full) as usize).then(|| layout.clone())
     }
 
     /// Applies the global stream toggles and the per-node collapse state:
@@ -2590,9 +2593,12 @@ impl DbtResultsPanel {
                 // Room for the name, its badges, and the − / + handles that
                 // sit over both ends.
                 let badges = node.ops.as_ref().map(|ops| ops.badges()).unwrap_or_default();
-                let mut width = 40. + measure(&node.name);
+                let mut width = 48. + measure(&node.name);
                 if !badges.is_empty() {
-                    width += 6. + 0.9 * measure(&badges);
+                    // The badge glyphs come from fallback fonts the
+                    // measure can miss: never less than a glyph's width.
+                    let glyphs = badges.chars().filter(|ch| !ch.is_whitespace()).count() as f32;
+                    width += 6. + (0.9 * measure(&badges)).max(7.5 * glyphs);
                 }
                 if columns_visible && !node.columns.is_empty() {
                     let shown = node.columns.len().min(GRAPH_MAX_COLUMNS);
@@ -3042,10 +3048,11 @@ impl DbtResultsPanel {
                                         this.border_b_1()
                                             .border_color(cx.theme().colors().border)
                                     })
-                                    .gap_1()
+                                    .gap(px(6. * zoom))
                                     .child(
                                         div()
                                             .text_size(name_text_size)
+                                            .whitespace_nowrap()
                                             .text_color(if node.is_center {
                                                 center_border
                                             } else {
@@ -3212,6 +3219,8 @@ impl DbtResultsPanel {
                 let materialization_color =
                     Self::materialization_color(&node.materialization, cx);
                 let mut handles = Vec::new();
+                // Handles shrink with the boxes, whose margins they sit in.
+                let handle_size = (18. * zoom).clamp(11., 18.);
                 let mut push_handle = |suffix: &'static str,
                                        anchor_x: f32,
                                        collapsed: bool,
@@ -3221,10 +3230,10 @@ impl DbtResultsPanel {
                         div()
                             .id(SharedString::from(format!("dbt-handle-{suffix}-{ix}")))
                             .absolute()
-                            .left(px(anchor_x - 9.))
-                            .top(px(node.y + header_height / 2. - 9.))
-                            .w(px(18.))
-                            .h(px(18.))
+                            .left(px(anchor_x - handle_size / 2.))
+                            .top(px(node.y + header_height / 2. - handle_size / 2.))
+                            .w(px(handle_size))
+                            .h(px(handle_size))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -3292,10 +3301,10 @@ impl DbtResultsPanel {
                         div()
                             .id(SharedString::from(format!("dbt-expand-{suffix}-{ix}")))
                             .absolute()
-                            .left(px(anchor_x - 9.))
-                            .top(px(node.y + header_height / 2. - 9.))
-                            .w(px(18.))
-                            .h(px(18.))
+                            .left(px(anchor_x - handle_size / 2.))
+                            .top(px(node.y + header_height / 2. - handle_size / 2.))
+                            .w(px(handle_size))
+                            .h(px(handle_size))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -4878,7 +4887,7 @@ impl Render for DbtResultsPanel {
         if self.view == ResultsView::Connection {
             self.ensure_connection(cx);
         }
-        if self.pending_center && self.view == ResultsView::Lineage && self.column_focus.is_none() {
+        if self.pending_center && self.column_focus.is_none() {
             // Center on where the model will be drawn, not where it was
             // loaded.
             if let Some(full) = self.lineage_layout.clone() {
