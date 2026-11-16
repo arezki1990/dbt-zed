@@ -405,6 +405,16 @@ pub struct GraphLayoutNode {
     /// downstream.
     pub level: i32,
     pub is_center: bool,
+    /// Set when this node stands for a folded folder of models.
+    pub folded: Option<FoldedFolder>,
+}
+
+/// The folder a folded node stands for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FoldedFolder {
+    /// The folder in the project, as [`GraphGroup::key`].
+    pub key: String,
+    pub models: usize,
 }
 
 /// A layered, positioned lineage graph (left-to-right): upstream columns,
@@ -443,8 +453,8 @@ pub struct GraphGroup {
 /// A folder's box: the band on top with its name, and the margin inside.
 pub const GRAPH_GROUP_HEADER: f32 = 28.;
 pub const GRAPH_GROUP_PADDING: f32 = 12.;
-/// The kind of the node a folded folder is drawn as.
-pub const FOLDER_NODE_KIND: &str = "folder";
+/// The size, at 100%, of a node's name: what its box is measured for.
+pub const GRAPH_NAME_TEXT_SIZE: f32 = 13.;
 
 #[derive(Default)]
 pub struct LineageStore {
@@ -940,6 +950,7 @@ impl LineageStore {
                         height: GRAPH_NODE_HEIGHT,
                         level,
                         is_center: *id == center,
+                        folded: None,
                     });
                 }
                 x += column_width + GRAPH_COL_GAP;

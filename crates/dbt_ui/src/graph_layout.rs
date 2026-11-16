@@ -71,8 +71,18 @@ pub fn layered(
     center: Option<usize>,
     spacing: Spacing,
 ) -> Placement {
-    let count = sizes.len();
-    if count == 0 {
+    layered_with_hints(sizes, edges, center, spacing, &[])
+}
+
+/// [`layered`], each column first ordered by `hints` (see [`arrange`]).
+fn layered_with_hints(
+    sizes: &[(f32, f32)],
+    edges: &[(usize, usize)],
+    center: Option<usize>,
+    spacing: Spacing,
+    hints: &[Option<f32>],
+) -> Placement {
+    if sizes.is_empty() {
         return Placement {
             nodes: Vec::new(),
             routes: vec![Vec::new(); edges.len()],
@@ -80,8 +90,29 @@ pub fn layered(
             height: 2. * spacing.padding,
         };
     }
-    let level = levels(count, edges, center);
-    arrange(sizes, &level, edges, spacing, &[])
+    let level = levels(sizes.len(), edges, center);
+    arrange(sizes, &level, edges, spacing, hints)
+}
+
+/// What [`grouped`] lays out as one: a group's box, or a node in no group.
+struct Unit {
+    group: Option<usize>,
+    members: Vec<usize>,
+    /// The members' edges, as indices into the members, and the index of
+    /// each in the edges given.
+    edges: Vec<(usize, usize)>,
+    edge_ixs: Vec<usize>,
+    /// Where the members sit inside the box.
+    inside: Option<Placement>,
+}
+
+impl Unit {
+    fn size(&self, sizes: &[(f32, f32)], frame: Frame) -> (f32, f32) {
+        match &self.inside {
+            Some(inside) => (inside.width, inside.height + frame.header),
+            None => sizes[self.members[0]],
+        }
+    }
 }
 
 /// Like [`layered`], with each node in at most one group (`group_of`, as
@@ -100,10 +131,10 @@ pub fn grouped(
     frame: Frame,
 ) -> Grouped {
     let count = sizes.len();
-    // A unit is a group's box or a node in no group.
+    let valid = |&(from, to): &(usize, usize)| from < count && to < count && from != to;
+
+    let mut units: Vec<Unit> = Vec::new();
     let mut unit_of = vec![0_usize; count];
-    let mut unit_group: Vec<Option<usize>> = Vec::new();
-    let mut unit_members: Vec<Vec<usize>> = Vec::new();
     let mut group_unit: Vec<Option<usize>> = vec![None; group_count];
     for node in 0..count {
         let group = group_of
@@ -111,78 +142,85 @@ pub fn grouped(
             .copied()
             .flatten()
             .filter(|group| *group < group_count);
-        let unit = match group {
-            Some(group) => *group_unit[group].get_or_insert_with(|| {
-                unit_group.push(Some(group));
-                unit_members.push(Vec::new());
-                unit_group.len() - 1
-            }),
-            None => {
-                unit_group.push(None);
-                unit_members.push(Vec::new());
-                unit_group.len() - 1
+        let existing = group.and_then(|group| group_unit[group]);
+        let unit = existing.unwrap_or_else(|| {
+            units.push(Unit {
+                group,
+                members: Vec::new(),
+                edges: Vec::new(),
+                edge_ixs: Vec::new(),
+                inside: None,
+            });
+            if let Some(group) = group {
+                group_unit[group] = Some(units.len() - 1);
             }
-        };
+            units.len() - 1
+        });
         unit_of[node] = unit;
-        unit_members[unit].push(node);
+        units[unit].members.push(node);
     }
+    let local: Vec<usize> = {
+        let mut local = vec![0; count];
+        for unit in &units {
+            for (ix, &node) in unit.members.iter().enumerate() {
+                local[node] = ix;
+            }
+        }
+        local
+    };
 
-    let valid = |&(from, to): &(usize, usize)| from < count && to < count && from != to;
+    // Edges within a box are its own; between units, one for each linked
+    // pair, which the edges between them share.
+    let mut unit_edges: Vec<(usize, usize)> = Vec::new();
+    let mut unit_edge_ix: HashMap<(usize, usize), usize> = HashMap::new();
+    for (edge_ix, edge) in edges.iter().enumerate().filter(|(_, edge)| valid(edge)) {
+        let pair = (unit_of[edge.0], unit_of[edge.1]);
+        if pair.0 == pair.1 {
+            let unit = &mut units[pair.0];
+            unit.edges.push((local[edge.0], local[edge.1]));
+            unit.edge_ixs.push(edge_ix);
+        } else {
+            unit_edge_ix.entry(pair).or_insert_with(|| {
+                unit_edges.push(pair);
+                unit_edges.len() - 1
+            });
+        }
+    }
+    let outer_center = center
+        .filter(|center| *center < count)
+        .map(|center| unit_of[center]);
+
     let inner_spacing = Spacing {
         padding: frame.padding,
         ..spacing
     };
-    // The units, as one graph; one edge for each pair of linked units.
-    let mut unit_edges: Vec<(usize, usize)> = Vec::new();
-    let mut unit_edge_ix: HashMap<(usize, usize), usize> = HashMap::new();
-    for edge in edges.iter().filter(|edge| valid(edge)) {
-        let pair = (unit_of[edge.0], unit_of[edge.1]);
-        if pair.0 != pair.1 && !unit_edge_ix.contains_key(&pair) {
-            unit_edge_ix.insert(pair, unit_edges.len());
-            unit_edges.push(pair);
-        }
+    let lay_out_box = |unit: &Unit, hints: &[Option<f32>]| {
+        let member_sizes: Vec<(f32, f32)> = unit.members.iter().map(|&node| sizes[node]).collect();
+        let member_center =
+            center.filter(|center| unit_of.get(*center) == Some(&unit_of[unit.members[0]]));
+        layered_with_hints(
+            &member_sizes,
+            &unit.edges,
+            member_center.map(|center| local[center]),
+            inner_spacing,
+            hints,
+        )
+    };
+    let lay_out_units = |units: &[Unit]| {
+        let unit_sizes: Vec<(f32, f32)> =
+            units.iter().map(|unit| unit.size(sizes, frame)).collect();
+        layered(&unit_sizes, &unit_edges, outer_center, spacing)
+    };
+
+    // Each box laid out on its own, then the units around each other.
+    for unit in units.iter_mut().filter(|unit| unit.group.is_some()) {
+        unit.inside = Some(lay_out_box(unit, &[]));
     }
-    let outer_center = center.filter(|center| *center < count).map(|center| unit_of[center]);
+    let mut outer = lay_out_units(&units);
 
-    // Each group laid out on its own (where its nodes sit inside the box),
-    // then the units around each other. Then, left to right, each group
-    // orders its nodes again by where what feeds them (else what they
-    // feed) now sits, and the units are laid out again with those boxes.
-    let lay_group = |members: &[usize], hints: &[Option<f32>]| {
-        let local: HashMap<usize, usize> = members
-            .iter()
-            .enumerate()
-            .map(|(local, &node)| (node, local))
-            .collect();
-        let local_sizes: Vec<(f32, f32)> = members.iter().map(|&node| sizes[node]).collect();
-        let local_edges: Vec<(usize, usize)> = edges
-            .iter()
-            .filter(|edge| valid(edge))
-            .filter_map(|(from, to)| Some((*local.get(from)?, *local.get(to)?)))
-            .collect();
-        let local_center = center.and_then(|center| local.get(&center).copied());
-        let level = levels(local_sizes.len(), &local_edges, local_center);
-        let placement = arrange(&local_sizes, &level, &local_edges, inner_spacing, hints);
-        (placement, local)
-    };
-    let mut inner: Vec<Option<(Placement, HashMap<usize, usize>)>> = unit_members
-        .iter()
-        .enumerate()
-        .map(|(unit, members)| unit_group[unit].map(|_| lay_group(members, &[])))
-        .collect();
-    let unit_sizes_of = |inner: &[Option<(Placement, HashMap<usize, usize>)>]| -> Vec<(f32, f32)> {
-        inner
-            .iter()
-            .enumerate()
-            .map(|(unit, entry)| match entry {
-                Some((placement, _)) => (placement.width, placement.height + frame.header),
-                None => sizes[unit_members[unit][0]],
-            })
-            .collect()
-    };
-    let mut unit_sizes = unit_sizes_of(&inner);
-    let mut outer = layered(&unit_sizes, &unit_edges, outer_center, spacing);
-
+    // Then, left to right, each box orders its nodes again by where what
+    // feeds them (else what they feed) now sits, and the units are laid
+    // out again around those boxes.
     let mut feeds: Vec<Vec<usize>> = vec![Vec::new(); count];
     let mut fed: Vec<Vec<usize>> = vec![Vec::new(); count];
     for &(from, to) in edges.iter().filter(|edge| valid(edge)) {
@@ -191,23 +229,23 @@ pub fn grouped(
             fed[from].push(to);
         }
     }
-    let mut by_column: Vec<usize> = (0..unit_members.len()).collect();
-    by_column.sort_by(|a, b| outer.nodes[*a].x.total_cmp(&outer.nodes[*b].x));
-    for unit in by_column {
-        if inner[unit].is_none() {
+    let middle = |units: &[Unit], outer: &Placement, node: usize| -> f32 {
+        let unit = &units[unit_of[node]];
+        let top = &outer.nodes[unit_of[node]];
+        let inside = unit
+            .inside
+            .as_ref()
+            .map_or(0., |inside| frame.header + inside.nodes[local[node]].y);
+        top.y + inside + sizes[node].1 / 2.
+    };
+    let mut left_to_right: Vec<usize> = (0..units.len()).collect();
+    left_to_right.sort_by(|a, b| outer.nodes[*a].x.total_cmp(&outer.nodes[*b].x));
+    for ix in left_to_right {
+        if units[ix].group.is_none() {
             continue;
         }
-        let middle = |inner: &[Option<(Placement, HashMap<usize, usize>)>], node: usize| -> f32 {
-            let unit = unit_of[node];
-            let at = &outer.nodes[unit];
-            match &inner[unit] {
-                Some((placement, local)) => {
-                    at.y + frame.header + placement.nodes[local[&node]].y + sizes[node].1 / 2.
-                }
-                None => at.y + sizes[node].1 / 2.,
-            }
-        };
-        let hints: Vec<Option<f32>> = unit_members[unit]
+        let hints: Vec<Option<f32>> = units[ix]
+            .members
             .iter()
             .map(|&node| {
                 let linked = if feeds[node].is_empty() {
@@ -216,91 +254,68 @@ pub fn grouped(
                     &feeds[node]
                 };
                 (!linked.is_empty()).then(|| {
-                    linked.iter().map(|&other| middle(&inner, other)).sum::<f32>()
+                    linked
+                        .iter()
+                        .map(|&other| middle(&units, &outer, other))
+                        .sum::<f32>()
                         / linked.len() as f32
                 })
             })
             .collect();
-        inner[unit] = Some(lay_group(&unit_members[unit], &hints));
+        units[ix].inside = Some(lay_out_box(&units[ix], &hints));
     }
-    unit_sizes = unit_sizes_of(&inner);
-    outer = layered(&unit_sizes, &unit_edges, outer_center, spacing);
+    outer = lay_out_units(&units);
 
-    let mut nodes = vec![
-        Placed {
-            x: 0.,
-            y: 0.,
-            level: 0,
-        };
-        count
-    ];
-    for node in 0..count {
-        let unit = unit_of[node];
+    // Everything moved to where its unit landed.
+    let origin = |unit: usize| {
         let at = &outer.nodes[unit];
-        nodes[node] = match &inner[unit] {
-            Some((placement, local)) => {
-                let inside = &placement.nodes[local[&node]];
-                Placed {
-                    x: at.x + inside.x,
-                    y: at.y + frame.header + inside.y,
-                    level: at.level,
+        (at.x, at.y + frame.header)
+    };
+    let nodes = (0..count)
+        .map(|node| {
+            let unit = unit_of[node];
+            let at = &outer.nodes[unit];
+            match &units[unit].inside {
+                Some(inside) => {
+                    let (x, y) = origin(unit);
+                    let placed = &inside.nodes[local[node]];
+                    Placed {
+                        x: x + placed.x,
+                        y: y + placed.y,
+                        level: at.level,
+                    }
                 }
+                None => at.clone(),
             }
-            None => at.clone(),
-        };
-    }
-
-    // Routes: inside a box, the box's own, moved with it; between units,
-    // the route between them.
-    let mut local_edge_ix: Vec<HashMap<(usize, usize), usize>> = vec![HashMap::new(); inner.len()];
-    for (unit, entry) in inner.iter().enumerate() {
-        if let Some((_, local)) = entry {
-            let mut next = 0;
-            for &(from, to) in edges.iter().filter(|edge| valid(edge)) {
-                if let (Some(&from), Some(&to)) = (local.get(&from), local.get(&to)) {
-                    local_edge_ix[unit].entry((from, to)).or_insert(next);
-                    next += 1;
-                }
-            }
-        }
-    }
-    let routes = edges
-        .iter()
-        .map(|edge| {
-            if !valid(edge) {
-                return Vec::new();
-            }
-            let (from_unit, to_unit) = (unit_of[edge.0], unit_of[edge.1]);
-            if from_unit != to_unit {
-                return unit_edge_ix
-                    .get(&(from_unit, to_unit))
-                    .and_then(|ix| outer.routes.get(*ix))
-                    .cloned()
-                    .unwrap_or_default();
-            }
-            let Some((placement, local)) = &inner[from_unit] else {
-                return Vec::new();
-            };
-            let at = &outer.nodes[from_unit];
-            local_edge_ix[from_unit]
-                .get(&(local[&edge.0], local[&edge.1]))
-                .and_then(|ix| placement.routes.get(*ix))
-                .map(|points| {
-                    points
-                        .iter()
-                        .map(|(x, y)| (at.x + x, at.y + frame.header + y))
-                        .collect()
-                })
-                .unwrap_or_default()
         })
         .collect();
-
+    let mut routes: Vec<Vec<(f32, f32)>> = edges
+        .iter()
+        .map(|edge| {
+            let pair = (unit_of.get(edge.0), unit_of.get(edge.1));
+            match pair {
+                (Some(from), Some(to)) if from != to => unit_edge_ix
+                    .get(&(*from, *to))
+                    .map(|ix| outer.routes[*ix].clone())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
     let mut boxes = vec![(0., 0., 0., 0.); group_count];
-    for (unit, group) in unit_group.iter().enumerate() {
-        if let Some(group) = group {
-            let at = &outer.nodes[unit];
-            boxes[*group] = (at.x, at.y, unit_sizes[unit].0, unit_sizes[unit].1);
+    for (ix, unit) in units.iter().enumerate() {
+        let (Some(group), Some(inside)) = (unit.group, &unit.inside) else {
+            continue;
+        };
+        let (x, y) = origin(ix);
+        for (local_ix, &edge_ix) in unit.edge_ixs.iter().enumerate() {
+            routes[edge_ix] = inside.routes[local_ix]
+                .iter()
+                .map(|(dx, dy)| (x + dx, y + dy))
+                .collect();
         }
+        let (width, height) = unit.size(sizes, frame);
+        boxes[group] = (outer.nodes[ix].x, outer.nodes[ix].y, width, height);
     }
     Grouped {
         placement: Placement {
@@ -370,296 +385,54 @@ fn arrange(
     spacing: Spacing,
     hints: &[Option<f32>],
 ) -> Placement {
-    let count = sizes.len();
     let min_level = level.iter().copied().min().unwrap_or(0);
-    let max_level = level.iter().copied().max().unwrap_or(0);
-    let column_count = (max_level - min_level + 1) as usize;
-
-    // Nodes and, for each column a long edge crosses, a slot for it.
-    let mut column_of: Vec<usize> = level
+    let column_of: Vec<usize> = level
         .iter()
         .map(|level| (level - min_level) as usize)
         .collect();
-    let mut height: Vec<f32> = sizes.iter().map(|size| size.1).collect();
-    let mut is_slot = vec![false; count];
-    let mut links: Vec<(usize, usize)> = Vec::new();
-    let mut slots_of_edge: Vec<Vec<usize>> = vec![Vec::new(); edges.len()];
-    let mut seen_links = HashSet::new();
-    for (edge_ix, &(from, to)) in edges.iter().enumerate() {
-        if from == to || from >= count || to >= count {
-            continue;
-        }
-        let (first, last) = (column_of[from], column_of[to]);
-        // An edge back or within a column plays no part in the order.
-        if last <= first {
-            continue;
-        }
-        let mut previous = from;
-        for column in first + 1..last {
-            let slot = column_of.len();
-            column_of.push(column);
-            height.push(SLOT_HEIGHT);
-            is_slot.push(true);
-            links.push((previous, slot));
-            slots_of_edge[edge_ix].push(slot);
-            previous = slot;
-        }
-        if seen_links.insert((previous, to)) {
-            links.push((previous, to));
-        }
-    }
-    let total = column_of.len();
-    let mut before = vec![Vec::new(); total];
-    let mut after = vec![Vec::new(); total];
-    for &(from, to) in &links {
-        after[from].push(to);
-        before[to].push(from);
-    }
+    let graph = Columns::new(sizes, column_of, edges);
 
-    // First order: depth-first from the leftmost column, so what is linked
-    // starts out close.
-    let mut discovered = vec![usize::MAX; total];
-    let mut next_discovery = 0;
-    let mut starts: Vec<usize> = (0..total).collect();
-    starts.sort_by_key(|&node| (column_of[node], node));
-    for start in starts {
-        if discovered[start] != usize::MAX {
-            continue;
-        }
-        let mut stack = vec![start];
-        while let Some(node) = stack.pop() {
-            if discovered[node] != usize::MAX {
-                continue;
-            }
-            discovered[node] = next_discovery;
-            next_discovery += 1;
-            for &next in after[node].iter().rev() {
-                if discovered[next] == usize::MAX {
-                    stack.push(next);
-                }
-            }
-        }
-    }
-    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); column_count];
-    for node in 0..total {
-        columns[column_of[node]].push(node);
-    }
-    for column in &mut columns {
-        column.sort_by_key(|&node| discovered[node]);
-    }
+    let mut columns = graph.first_order();
     if hints.iter().any(Option::is_some) {
-        // A node with no hint of its own takes the mean of its linked
-        // nodes' (left to right, then right to left), else stays put.
-        let mut key: Vec<Option<f32>> = (0..total)
-            .map(|node| hints.get(node).copied().flatten())
-            .collect();
-        for rightward in [true, false] {
-            let order: Vec<usize> = if rightward {
-                (0..column_count).collect()
-            } else {
-                (0..column_count).rev().collect()
-            };
-            for column_ix in order {
-                for &node in &columns[column_ix] {
-                    if key[node].is_some() {
-                        continue;
-                    }
-                    let around = if rightward { &before[node] } else { &after[node] };
-                    let known: Vec<f32> = around.iter().filter_map(|other| key[*other]).collect();
-                    if !known.is_empty() {
-                        key[node] = Some(known.iter().sum::<f32>() / known.len() as f32);
-                    }
-                }
-            }
-        }
-        for column in &mut columns {
-            let mut keyed: Vec<(f32, usize, usize)> = Vec::with_capacity(column.len());
-            let mut last = f32::NEG_INFINITY;
-            for (row, &node) in column.iter().enumerate() {
-                // Unhinted nodes keep their place after the one before.
-                let value = key[node].unwrap_or(last);
-                last = value;
-                keyed.push((value, row, node));
-            }
-            keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            *column = keyed.into_iter().map(|(_, _, node)| node).collect();
-        }
+        graph.order_by_hints(&mut columns, hints);
     }
-    let mut position = vec![0_usize; total];
-    let index = |columns: &Vec<Vec<usize>>, position: &mut Vec<usize>| {
-        for column in columns {
-            for (row, &node) in column.iter().enumerate() {
-                position[node] = row;
-            }
-        }
-    };
-    index(&columns, &mut position);
-
-    // Order: barycenter sweeps right then left, each followed by swaps of
-    // neighbours that cross less; the ordering with the fewest crossings
-    // seen is kept.
-    let mut best = columns.clone();
-    let mut best_crossings = all_crossings(&columns, &position, &after);
-    for sweep in 0..ORDER_SWEEPS {
-        if best_crossings == 0 {
-            break;
-        }
-        let rightward = sweep % 2 == 0;
-        let order: Vec<usize> = if rightward {
-            (1..column_count).collect()
-        } else {
-            (0..column_count.saturating_sub(1)).rev().collect()
-        };
-        for column_ix in order {
-            let around = if rightward { &before } else { &after };
-            let mut keyed: Vec<(f32, usize)> = columns[column_ix]
-                .iter()
-                .map(|&node| {
-                    let linked = &around[node];
-                    let key = if linked.is_empty() {
-                        position[node] as f32
-                    } else {
-                        linked.iter().map(|other| position[*other] as f32).sum::<f32>()
-                            / linked.len() as f32
-                    };
-                    (key, node)
-                })
-                .collect();
-            keyed.sort_by(|a, b| {
-                a.0.total_cmp(&b.0)
-                    .then(position[a.1].cmp(&position[b.1]))
-            });
-            columns[column_ix] = keyed.into_iter().map(|(_, node)| node).collect();
-            for (row, &node) in columns[column_ix].iter().enumerate() {
-                position[node] = row;
-            }
-        }
-        transpose(&mut columns, &mut position, &before, &after);
-        let crossings = all_crossings(&columns, &position, &after);
-        if crossings < best_crossings {
-            best_crossings = crossings;
-            best = columns.clone();
-        }
-    }
-    columns = best;
-    index(&columns, &mut position);
+    let columns = graph.fewest_crossings(columns);
 
     // Columns as wide as their widest node.
-    let mut column_x = vec![0_f32; column_count];
-    let mut column_width = vec![0_f32; column_count];
+    let mut column_x = Vec::with_capacity(columns.len());
+    let mut column_width = Vec::with_capacity(columns.len());
     let mut x = spacing.padding;
-    for (column_ix, column) in columns.iter().enumerate() {
+    for column in &columns {
         let width = column
             .iter()
-            .filter(|&&node| !is_slot[node])
+            .filter(|&&node| !graph.is_slot[node])
             .map(|&node| sizes[node].0)
             .fold(0_f32, f32::max);
-        column_x[column_ix] = x;
-        column_width[column_ix] = width;
+        column_x.push(x);
+        column_width.push(width);
         x += width + spacing.column_gap;
     }
-
-    // Rows: each node level with the middle of what it is linked to, as
-    // near as the order and the gaps allow, from the left, from the right,
-    // then both. Slots hold to their line hardest, so long edges run
-    // straight.
-    let gap_between = |upper: usize, lower: usize| {
-        if is_slot[upper] && is_slot[lower] {
-            spacing.row_gap / 2.
-        } else {
-            spacing.row_gap
-        }
-    };
-    let mut top = vec![0_f32; total];
-    for column in &columns {
-        let mut y = 0.;
-        for (row, &node) in column.iter().enumerate() {
-            if row > 0 {
-                y += gap_between(column[row - 1], node);
-            }
-            top[node] = y;
-            y += height[node];
-        }
-    }
-    for pass in 0..PLACE_PASSES {
-        let (use_before, use_after, rightward) = match pass {
-            pass if pass + 2 >= PLACE_PASSES => (true, true, pass % 2 == 0),
-            pass if pass % 2 == 0 => (true, false, true),
-            _ => (false, true, false),
-        };
-        let order: Vec<usize> = if rightward {
-            (0..column_count).collect()
-        } else {
-            (0..column_count).rev().collect()
-        };
-        for column_ix in order {
-            let column = &columns[column_ix];
-            if column.is_empty() {
-                continue;
-            }
-            let mut targets = Vec::with_capacity(column.len());
-            let mut weights = Vec::with_capacity(column.len());
-            let mut offset = 0_f32;
-            for (row, &node) in column.iter().enumerate() {
-                if row > 0 {
-                    offset += height[column[row - 1]] + gap_between(column[row - 1], node);
-                }
-                let mut sum = 0.;
-                let mut linked = 0;
-                for list in [use_before.then_some(&before[node]), use_after.then_some(&after[node])]
-                    .into_iter()
-                    .flatten()
-                {
-                    for &other in list {
-                        sum += top[other] + height[other] / 2.;
-                        linked += 1;
-                    }
-                }
-                let (middle, weight) = if linked == 0 {
-                    (top[node] + height[node] / 2., 0.05)
-                } else if is_slot[node] {
-                    (sum / linked as f32, 8.)
-                } else {
-                    (sum / linked as f32, 1.)
-                };
-                targets.push(middle - height[node] / 2. - offset);
-                weights.push(weight);
-            }
-            let fitted = increasing_fit(&targets, &weights);
-            let mut offset = 0_f32;
-            for (row, &node) in column.iter().enumerate() {
-                if row > 0 {
-                    offset += height[column[row - 1]] + gap_between(column[row - 1], node);
-                }
-                top[node] = fitted[row] + offset;
-            }
-        }
-    }
-
-    let lowest = top.iter().copied().fold(f32::INFINITY, f32::min);
-    let lowest = if lowest.is_finite() { lowest } else { 0. };
-    for value in &mut top {
-        *value += spacing.padding - lowest;
-    }
-    let bottom = (0..total)
-        .map(|node| top[node] + height[node])
+    let top = graph.rows(&columns, spacing);
+    let bottom = (0..graph.len())
+        .map(|node| top[node] + graph.height[node])
         .fold(0_f32, f32::max);
 
-    let nodes = (0..count)
+    let nodes = (0..sizes.len())
         .map(|node| Placed {
-            x: column_x[column_of[node]],
+            x: column_x[graph.column_of[node]],
             y: top[node],
             level: level[node],
         })
         .collect();
-    let routes = slots_of_edge
+    let routes = graph
+        .slots_of_edge
         .iter()
         .map(|slots| {
             slots
                 .iter()
                 .flat_map(|&slot| {
-                    let column = column_of[slot];
-                    let middle = top[slot] + height[slot] / 2.;
+                    let column = graph.column_of[slot];
+                    let middle = top[slot] + graph.height[slot] / 2.;
                     [
                         (column_x[column], middle),
                         (column_x[column] + column_width[column], middle),
@@ -674,6 +447,282 @@ fn arrange(
         width: x - spacing.column_gap + spacing.padding,
         height: bottom + spacing.padding,
     }
+}
+
+/// The graph [`arrange`] orders and places: the nodes, then a slot for
+/// each column a long edge crosses, every link between neighbouring
+/// columns.
+struct Columns {
+    column_of: Vec<usize>,
+    column_count: usize,
+    height: Vec<f32>,
+    is_slot: Vec<bool>,
+    before: Vec<Vec<usize>>,
+    after: Vec<Vec<usize>>,
+    /// For each edge given, the slots it passes through, left to right.
+    slots_of_edge: Vec<Vec<usize>>,
+}
+
+impl Columns {
+    fn new(sizes: &[(f32, f32)], mut column_of: Vec<usize>, edges: &[(usize, usize)]) -> Self {
+        let count = sizes.len();
+        let column_count = column_of.iter().max().map_or(1, |max| max + 1);
+        let mut height: Vec<f32> = sizes.iter().map(|size| size.1).collect();
+        let mut is_slot = vec![false; count];
+        let mut links: Vec<(usize, usize)> = Vec::new();
+        let mut seen_links = HashSet::new();
+        let mut slots_of_edge: Vec<Vec<usize>> = vec![Vec::new(); edges.len()];
+        for (edge_ix, &(from, to)) in edges.iter().enumerate() {
+            if from == to || from >= count || to >= count {
+                continue;
+            }
+            let (first, last) = (column_of[from], column_of[to]);
+            // An edge back or within a column plays no part in the order.
+            if last <= first {
+                continue;
+            }
+            let mut previous = from;
+            for column in first + 1..last {
+                let slot = column_of.len();
+                column_of.push(column);
+                height.push(SLOT_HEIGHT);
+                is_slot.push(true);
+                links.push((previous, slot));
+                slots_of_edge[edge_ix].push(slot);
+                previous = slot;
+            }
+            if seen_links.insert((previous, to)) {
+                links.push((previous, to));
+            }
+        }
+        let mut before = vec![Vec::new(); column_of.len()];
+        let mut after = vec![Vec::new(); column_of.len()];
+        for &(from, to) in &links {
+            after[from].push(to);
+            before[to].push(from);
+        }
+        Self {
+            column_of,
+            column_count,
+            height,
+            is_slot,
+            before,
+            after,
+            slots_of_edge,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.column_of.len()
+    }
+
+    /// The columns in the order a depth-first walk from the left reaches
+    /// their nodes, so what is linked starts out close.
+    fn first_order(&self) -> Vec<Vec<usize>> {
+        let unseen = usize::MAX;
+        let mut reached = vec![unseen; self.len()];
+        let mut next = 0;
+        let mut starts: Vec<usize> = (0..self.len()).collect();
+        starts.sort_by_key(|&node| (self.column_of[node], node));
+        for start in starts {
+            let mut stack = vec![start];
+            while let Some(node) = stack.pop() {
+                if reached[node] != unseen {
+                    continue;
+                }
+                reached[node] = next;
+                next += 1;
+                stack.extend(
+                    self.after[node]
+                        .iter()
+                        .rev()
+                        .filter(|next| reached[**next] == unseen),
+                );
+            }
+        }
+        let mut columns: Vec<Vec<usize>> = vec![Vec::new(); self.column_count];
+        for node in 0..self.len() {
+            columns[self.column_of[node]].push(node);
+        }
+        for column in &mut columns {
+            column.sort_by_key(|&node| reached[node]);
+        }
+        columns
+    }
+
+    /// Orders each column by `hints`. A node with no hint of its own takes
+    /// the mean of its linked nodes' (left to right, then right to left),
+    /// else keeps its place after the node before it.
+    fn order_by_hints(&self, columns: &mut [Vec<usize>], hints: &[Option<f32>]) {
+        let mut key: Vec<Option<f32>> = (0..self.len())
+            .map(|node| hints.get(node).copied().flatten())
+            .collect();
+        for rightward in [true, false] {
+            let around = if rightward { &self.before } else { &self.after };
+            for column_ix in sweep(columns.len(), rightward) {
+                for &node in &columns[column_ix] {
+                    if key[node].is_none() {
+                        key[node] = mean(around[node].iter().filter_map(|other| key[*other]));
+                    }
+                }
+            }
+        }
+        for column in columns.iter_mut() {
+            let mut last = f32::NEG_INFINITY;
+            let mut keyed: Vec<(f32, usize, usize)> = column
+                .iter()
+                .enumerate()
+                .map(|(row, &node)| {
+                    last = key[node].unwrap_or(last);
+                    (last, row, node)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            *column = keyed.into_iter().map(|(_, _, node)| node).collect();
+        }
+    }
+
+    /// Barycenter sweeps right then left, each followed by swaps of
+    /// neighbours that cross less; the ordering with the fewest crossings
+    /// seen wins.
+    fn fewest_crossings(&self, mut columns: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+        let mut position = positions(&columns, self.len());
+        let mut best = columns.clone();
+        let mut best_crossings = all_crossings(&columns, &position, &self.after);
+        for pass in 0..ORDER_SWEEPS {
+            if best_crossings == 0 {
+                break;
+            }
+            let rightward = pass % 2 == 0;
+            let around = if rightward { &self.before } else { &self.after };
+            // The first column swept has nothing on its far side to follow.
+            for column_ix in sweep(columns.len(), rightward).skip(1) {
+                let mut keyed: Vec<(f32, usize)> = columns[column_ix]
+                    .iter()
+                    .map(|&node| {
+                        let key = mean(around[node].iter().map(|other| position[*other] as f32))
+                            .unwrap_or(position[node] as f32);
+                        (key, node)
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(position[a.1].cmp(&position[b.1])));
+                columns[column_ix] = keyed.into_iter().map(|(_, node)| node).collect();
+                for (row, &node) in columns[column_ix].iter().enumerate() {
+                    position[node] = row;
+                }
+            }
+            transpose(&mut columns, &mut position, &self.before, &self.after);
+            let crossings = all_crossings(&columns, &position, &self.after);
+            if crossings < best_crossings {
+                best_crossings = crossings;
+                best = columns.clone();
+            }
+        }
+        best
+    }
+
+    /// Each node's top: level with the middle of what it is linked to, as
+    /// near as the order and the gaps allow; from the left, from the
+    /// right, then both. Slots hold to their line hardest, so long edges
+    /// run straight. The highest node is at the padding.
+    fn rows(&self, columns: &[Vec<usize>], spacing: Spacing) -> Vec<f32> {
+        // How far each node in a column sits below the column's first, when
+        // packed with the gaps.
+        let offsets = |column: &[usize]| -> Vec<f32> {
+            let mut offset = 0_f32;
+            column
+                .iter()
+                .enumerate()
+                .map(|(row, &node)| {
+                    if row > 0 {
+                        let upper = column[row - 1];
+                        let gap = if self.is_slot[upper] && self.is_slot[node] {
+                            spacing.row_gap / 2.
+                        } else {
+                            spacing.row_gap
+                        };
+                        offset += self.height[upper] + gap;
+                    }
+                    offset
+                })
+                .collect()
+        };
+        let mut top = vec![0_f32; self.len()];
+        for column in columns {
+            for (&node, offset) in column.iter().zip(offsets(column)) {
+                top[node] = offset;
+            }
+        }
+        for pass in 0..PLACE_PASSES {
+            let (use_before, use_after, rightward) = match pass {
+                pass if pass + 2 >= PLACE_PASSES => (true, true, pass % 2 == 0),
+                pass if pass % 2 == 0 => (true, false, true),
+                _ => (false, true, false),
+            };
+            for column_ix in sweep(columns.len(), rightward) {
+                let column = &columns[column_ix];
+                let offsets = offsets(column);
+                let (targets, weights): (Vec<f32>, Vec<f32>) = column
+                    .iter()
+                    .zip(&offsets)
+                    .map(|(&node, offset)| {
+                        let linked = use_before
+                            .then_some(&self.before[node])
+                            .into_iter()
+                            .chain(use_after.then_some(&self.after[node]))
+                            .flatten()
+                            .map(|&other| top[other] + self.height[other] / 2.);
+                        let (middle, weight) = match mean(linked) {
+                            None => (top[node] + self.height[node] / 2., 0.05),
+                            Some(middle) if self.is_slot[node] => (middle, 8.),
+                            Some(middle) => (middle, 1.),
+                        };
+                        (middle - self.height[node] / 2. - offset, weight)
+                    })
+                    .unzip();
+                for ((&node, offset), fitted) in column
+                    .iter()
+                    .zip(&offsets)
+                    .zip(increasing_fit(&targets, &weights))
+                {
+                    top[node] = fitted + offset;
+                }
+            }
+        }
+        let highest = top.iter().copied().fold(f32::INFINITY, f32::min);
+        let shift = spacing.padding - if highest.is_finite() { highest } else { 0. };
+        for value in &mut top {
+            *value += shift;
+        }
+        top
+    }
+}
+
+/// Column indices left to right, or right to left.
+fn sweep(count: usize, rightward: bool) -> Box<dyn Iterator<Item = usize>> {
+    if rightward {
+        Box::new(0..count)
+    } else {
+        Box::new((0..count).rev())
+    }
+}
+
+/// Each node's row in its column.
+fn positions(columns: &[Vec<usize>], count: usize) -> Vec<usize> {
+    let mut position = vec![0; count];
+    for column in columns {
+        for (row, &node) in column.iter().enumerate() {
+            position[node] = row;
+        }
+    }
+    position
+}
+
+fn mean(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let (sum, count) = values.fold((0_f32, 0_usize), |(sum, count), value| {
+        (sum + value, count + 1)
+    });
+    (count > 0).then(|| sum / count as f32)
 }
 
 /// The non-decreasing sequence nearest `targets`, each weighed by its
@@ -696,11 +745,10 @@ fn increasing_fit(targets: &[f32], weights: &[f32]) -> Vec<f32> {
             merged.2 += last.2;
         }
     }
-    let mut fitted = Vec::with_capacity(targets.len());
-    for (sum, weight, size) in blocks {
-        fitted.extend(std::iter::repeat_n(sum / weight, size));
-    }
-    fitted
+    blocks
+        .into_iter()
+        .flat_map(|(sum, weight, size)| std::iter::repeat_n(sum / weight, size))
+        .collect()
 }
 
 /// Crossings between every pair of neighbouring columns.
@@ -716,7 +764,11 @@ fn all_crossings(columns: &[Vec<usize>], position: &[usize], after: &[Vec<usize>
 fn crossings(upper: &[usize], lower_len: usize, position: &[usize], after: &[Vec<usize>]) -> usize {
     let mut pairs: Vec<(usize, usize)> = upper
         .iter()
-        .flat_map(|&node| after[node].iter().map(move |&next| (position[node], position[next])))
+        .flat_map(|&node| {
+            after[node]
+                .iter()
+                .map(move |&next| (position[node], position[next]))
+        })
         .collect();
     pairs.sort_unstable();
     // Count, for each link, the earlier ones that end below it.
@@ -991,7 +1043,10 @@ mod tests {
             let (x, y, width, height) = grouped.boxes[*group];
             let at = &grouped.placement.nodes[node];
             assert!(at.x >= x && at.x + 120. <= x + width, "{node} in {group}");
-            assert!(at.y >= y + 24. && at.y + 32. <= y + height, "{node} in {group}");
+            assert!(
+                at.y >= y + 24. && at.y + 32. <= y + height,
+                "{node} in {group}"
+            );
         }
         let mut rects: Vec<(f32, f32, f32, f32)> = grouped
             .boxes

@@ -175,6 +175,7 @@ pub fn layout(around: &Neighbourhood, project: &Project, show_columns: bool) -> 
             height,
             level: 0,
             is_center: around.center.as_deref() == Some(node.id.as_str()),
+            folded: None,
         });
     }
 
